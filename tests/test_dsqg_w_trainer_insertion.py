@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TRAINER = ROOT / "train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py"
 
 
-def load_trainer(monkeypatch, *, dsqg_w: bool):
+def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False):
     monkeypatch.setenv("DWARF_DISABLE_BNB", "1")
     monkeypatch.setenv("DWARF_LIGER", "0")
     monkeypatch.setenv("DWARF_TORCH_COMPILE", "0")
@@ -19,8 +19,14 @@ def load_trainer(monkeypatch, *, dsqg_w: bool):
         monkeypatch.setenv("DWARF_DSQG_W", "1")
         monkeypatch.setenv("DWARF_DSQG_W_MAX_CANDIDATES", "16")
         monkeypatch.setenv("DWARF_DSQG_W_BOTTLENECK", "64")
+        if question:
+            monkeypatch.setenv("DWARF_DSQG_W_QUESTION", "1")
+            monkeypatch.setenv("DWARF_DSQG_W_K_QUESTION", "4")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_QUESTION", raising=False)
     else:
         monkeypatch.delenv("DWARF_DSQG_W", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_QUESTION", raising=False)
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "kernels"))
     try:
@@ -101,7 +107,7 @@ def test_dsqg_w_forward_hidden_applies_recomposer_before_final_norm(monkeypatch)
     idx = torch.randint(0, 128, (1, 8), dtype=torch.long)
     calls = []
 
-    def fake_apply(x):
+    def fake_apply(x, **kwargs):
         calls.append(x.shape)
         return x
 
@@ -109,3 +115,43 @@ def test_dsqg_w_forward_hidden_applies_recomposer_before_final_norm(monkeypatch)
     _ = model.forward_hidden(idx)
 
     assert calls == [torch.Size([1, 8, mod.EMBEDDING_DIM])]
+
+
+def test_dsqg_w_question_candidate_indices_are_threaded_into_provider(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True)
+    model = make_model(mod)
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM)
+    question_indices = torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)
+
+    assert mod.DSQG_W_QUESTION_ENABLED is True
+    assert model.dsqg_w_config.k_question == 4
+
+    out = model._apply_dsqg_w_recomposer(x, question_indices=question_indices)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert (out - x).abs().max().item() < 1e-2
+    telemetry = model.dsqg_w_last_telemetry
+    assert telemetry["dsqg_w_candidate_fraction_question"].item() > 0.0
+    assert telemetry["dsqg_w_question_mass"].item() > 0.0
+    assert telemetry["dsqg_w_candidate_fraction_hisa_evidence"].item() == 0.0
+    assert telemetry["dsqg_w_candidate_fraction_l3_skip"].item() == 0.0
+
+
+def test_forward_accepts_optional_dsqg_w_question_indices(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True)
+    model = make_model(mod)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in model.blocks])
+    model.norm = torch.nn.Identity()
+    idx = torch.randint(0, 128, (1, 8), dtype=torch.long)
+    question_indices = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    seen = []
+
+    def fake_apply(x, **kwargs):
+        seen.append(kwargs.get("question_indices"))
+        return x
+
+    model._apply_dsqg_w_recomposer = fake_apply  # type: ignore[method-assign]
+    _ = model(idx, dsqg_w_question_indices=question_indices)
+
+    assert seen == [question_indices]

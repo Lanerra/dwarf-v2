@@ -77,6 +77,7 @@ def main() -> int:
     vocab_size = int(os.environ.get("DWARF_DSQG_W_AUDIT_VOCAB", "128"))
     ffn_dim = int(os.environ.get("DWARF_DSQG_W_AUDIT_FFN", "64"))
     device = torch.device(os.environ.get("DWARF_DSQG_W_AUDIT_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu"))
+    question_enabled = os.getenv("DWARF_DSQG_W_QUESTION", "0") == "1"
 
     base_mod = load_trainer(dsqg_w=False, suffix="base")
     w_mod = load_trainer(dsqg_w=True, suffix="dsqgw")
@@ -86,11 +87,18 @@ def main() -> int:
 
     torch.manual_seed(seed + 1)
     idx = torch.randint(0, vocab_size, (batch, seq_len), device=device, dtype=torch.long)
+    question_indices = None
+    if question_enabled:
+        k_question = int(os.environ.get("DWARF_DSQG_W_K_QUESTION", "4"))
+        # Synthetic audit cue indices: a fixed causal prefix visible to later
+        # answer positions. This exercises QUESTION metadata plumbing without
+        # adding tokenizer/prompt parsing assumptions to the model.
+        question_indices = torch.arange(k_question, device=device, dtype=torch.long).repeat(batch, 1)
 
     with torch.no_grad():
         base_trunk = base._forward_trunk(idx)
         w_trunk = with_w._forward_trunk(idx)
-        w_recomposed = with_w._apply_dsqg_w_recomposer(w_trunk)
+        w_recomposed = with_w._apply_dsqg_w_recomposer(w_trunk, question_indices=question_indices)
         base_logits = base.out(base.norm(base_trunk))
         w_logits = with_w.out(with_w.norm(w_recomposed))
         base_logp = F.log_softmax(base_logits.float(), dim=-1)
@@ -114,7 +122,9 @@ def main() -> int:
             "dsqg_w_max_candidates": with_w.dsqg_w_config.max_candidates,
             "dsqg_w_bottleneck": with_w.dsqg_w_config.bottleneck,
             "dsqg_w_gate_init": with_w.dsqg_w_config.gate_init,
-            "candidate_path": "LOCAL_LONG_NULL_ONLY",
+            "dsqg_w_question_enabled": question_enabled,
+            "dsqg_w_k_question": with_w.dsqg_w_config.k_question,
+            "candidate_path": "LOCAL_LONG_QUESTION_NULL" if question_enabled else "LOCAL_LONG_NULL_ONLY",
         },
         "trunk_delta": tensor_stats(w_trunk - base_trunk),
         "recomposer_hidden_delta": tensor_stats(w_recomposed - w_trunk),
