@@ -124,6 +124,19 @@ def prepare_model_for_frozen_dsqg_w_objective(model) -> dict[str, int]:
     }
 
 
+def make_dsqg_w_optimizer(model, *, lr: float = 1e-4, weight_decay: float = 0.0) -> torch.optim.Optimizer:
+    if not getattr(model, "dsqg_w_enabled", False) or getattr(model, "dsqg_w", None) is None:
+        raise ValueError("DSQG-W must be enabled before constructing its optimizer")
+    named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    non_dsqg = [name for name, _ in named_params if not name.startswith("dsqg_w.")]
+    if non_dsqg:
+        raise ValueError(f"frozen objective optimizer saw non-DSQG-W trainable params: {non_dsqg}")
+    params = [param for _, param in named_params]
+    if not params:
+        raise ValueError("no trainable DSQG-W parameters found")
+    return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+
+
 def _scalar_telemetry(telemetry: dict[str, Any]) -> dict[str, float]:
     out: dict[str, float] = {}
     for key, value in telemetry.items():
@@ -168,6 +181,69 @@ def compute_frozen_dsqg_w_objective(model, batch: FrozenDSQGWBatch) -> FrozenObj
     return FrozenObjectiveResult(loss=loss, logits=logits, telemetry=telemetry)
 
 
+def _param_snapshot(model) -> dict[str, torch.Tensor]:
+    return {name: param.detach().clone() for name, param in model.named_parameters()}
+
+
+def _changed_names(before: dict[str, torch.Tensor], model, *, prefix: str | None) -> list[str]:
+    changed: list[str] = []
+    for name, param in model.named_parameters():
+        if prefix is not None and not name.startswith(prefix):
+            continue
+        if prefix is None and name.startswith("dsqg_w."):
+            continue
+        old = before.get(name)
+        if old is not None and not torch.equal(old, param.detach()):
+            changed.append(name)
+    return changed
+
+
+def run_one_frozen_dsqg_w_step(
+    model,
+    batch: FrozenDSQGWBatch,
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, Any]:
+    before = _param_snapshot(model)
+    optimizer.zero_grad(set_to_none=True)
+    result = compute_frozen_dsqg_w_objective(model, batch)
+    result.loss.backward()
+    grad_names = [
+        name
+        for name, param in model.named_parameters()
+        if param.grad is not None and param.grad.detach().abs().sum().item() > 0.0
+    ]
+    grad_scope_ok = bool(grad_names) and all(name.startswith("dsqg_w.") for name in grad_names)
+    optimizer.step()
+    changed_dsqg_w = _changed_names(before, model, prefix="dsqg_w.")
+    changed_frozen = _changed_names(before, model, prefix=None)
+
+    telemetry = dict(result.telemetry)
+    telemetry.update(
+        {
+            "dsqg_w_step_lr": float(optimizer.param_groups[0]["lr"]),
+            "dsqg_w_step_grad_param_count": float(len(grad_names)),
+            "dsqg_w_step_changed_param_count": float(len(changed_dsqg_w)),
+        }
+    )
+    with torch.no_grad():
+        post = compute_frozen_dsqg_w_objective(model, batch)
+    telemetry["dsqg_w_objective_answer_ce_after_step"] = float(post.loss.detach().float().cpu().item())
+
+    return {
+        "step": 1,
+        "loss_before_step": float(result.loss.detach().float().cpu().item()),
+        "loss_after_step": float(post.loss.detach().float().cpu().item()),
+        "grad_param_names": grad_names,
+        "grad_scope_ok": grad_scope_ok,
+        "changed_dsqg_w_param_names": changed_dsqg_w,
+        "changed_dsqg_w_param_count": len(changed_dsqg_w),
+        "changed_frozen_param_names": changed_frozen,
+        "changed_frozen_param_count": len(changed_frozen),
+        "telemetry": telemetry,
+        "pass": bool(grad_scope_ok and len(changed_dsqg_w) > 0 and len(changed_frozen) == 0),
+    }
+
+
 def make_synthetic_batch(*, batch: int = 1, seq_len: int = 16, vocab_size: int = 128, seed: int = 20260628) -> FrozenDSQGWBatch:
     torch.manual_seed(seed)
     input_ids = torch.randint(0, vocab_size, (batch, seq_len), dtype=torch.long)
@@ -187,7 +263,7 @@ def make_synthetic_batch(*, batch: int = 1, seq_len: int = 16, vocab_size: int =
     )
 
 
-def run_smoke_objective(*, enable: bool | None = None, seed: int = 20260628) -> dict[str, Any]:
+def run_smoke_objective(*, enable: bool | None = None, seed: int = 20260628, step: bool = False) -> dict[str, Any]:
     if enable is None:
         enable = os.getenv("DWARF_DSQG_W_FROZEN_OBJECTIVE", "0") == "1"
     if not enable:
@@ -204,6 +280,19 @@ def run_smoke_objective(*, enable: bool | None = None, seed: int = 20260628) -> 
     counts = prepare_model_for_frozen_dsqg_w_objective(model)
     model.train()
     batch = make_synthetic_batch(batch=1, seq_len=16, vocab_size=128, seed=seed + 1)
+    if step:
+        optimizer = make_dsqg_w_optimizer(model, lr=float(os.environ.get("DWARF_DSQG_W_FROZEN_LR", "0.001")))
+        report = run_one_frozen_dsqg_w_step(model, batch, optimizer)
+        report.update(
+            {
+                "enabled": True,
+                "skipped": False,
+                "objective": "frozen_trunk_answer_only_ce_step",
+            }
+        )
+        report["telemetry"].update({key: float(value) for key, value in counts.items()})
+        return report
+
     result = compute_frozen_dsqg_w_objective(model, batch)
     result.loss.backward()
 
@@ -230,10 +319,11 @@ def run_smoke_objective(*, enable: bool | None = None, seed: int = 20260628) -> 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Disabled-by-default DSQG-W frozen-trunk answer-only CE smoke")
     parser.add_argument("--enable", action="store_true", help="Run the objective smoke. Otherwise report the disabled default.")
+    parser.add_argument("--step", action="store_true", help="Run one DSQG-W-only optimizer step after the objective smoke.")
     parser.add_argument("--seed", type=int, default=20260628)
     args = parser.parse_args()
 
-    report = run_smoke_objective(enable=args.enable, seed=args.seed)
+    report = run_smoke_objective(enable=args.enable, seed=args.seed, step=args.step)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["pass"] else 2
 

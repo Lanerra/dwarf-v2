@@ -92,3 +92,49 @@ def test_compute_objective_rejects_disabled_dsqg_w_model() -> None:
 
     with pytest.raises(ValueError, match="DSQG-W must be enabled"):
         mod.compute_frozen_dsqg_w_objective(model, batch)
+
+
+def test_single_optimizer_step_updates_only_dsqg_w_parameters() -> None:
+    mod = load_objective_module()
+    trainer = mod.load_trainer(enable_objective=True, suffix="step_test")
+    model = mod.make_tiny_model(trainer, vocab_size=128, ffn_dim=64, seq_len=16)
+    mod.prepare_model_for_frozen_dsqg_w_objective(model)
+    optimizer = mod.make_dsqg_w_optimizer(model, lr=1e-3)
+    batch = tiny_batch(mod)
+
+    before = {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if name.startswith("dsqg_w.") or name in {"embedding.weight", "norm.weight"}
+    }
+    before_embedding = model.embedding.weight.detach().clone()
+    before_out = model.out.weight.detach().clone()
+
+    report = mod.run_one_frozen_dsqg_w_step(model, batch, optimizer)
+
+    assert report["pass"] is True
+    assert report["step"] == 1
+    assert report["grad_scope_ok"] is True
+    assert report["changed_dsqg_w_param_count"] > 0
+    assert report["changed_frozen_param_count"] == 0
+    assert report["telemetry"]["dsqg_w_step_lr"] == pytest.approx(1e-3)
+    assert report["telemetry"]["dsqg_w_objective_answer_tokens"] == pytest.approx(1.0)
+
+    changed_dsqg_w = [
+        name
+        for name, old in before.items()
+        if name.startswith("dsqg_w.") and not torch.equal(old, dict(model.named_parameters())[name].detach())
+    ]
+    assert changed_dsqg_w
+    torch.testing.assert_close(before_embedding, model.embedding.weight.detach())
+    torch.testing.assert_close(before_out, model.out.weight.detach())
+
+
+def test_step_smoke_is_disabled_by_default() -> None:
+    mod = load_objective_module()
+
+    report = mod.run_smoke_objective(enable=False, step=True)
+
+    assert report["enabled"] is False
+    assert report["skipped"] is True
+    assert report["pass"] is True
