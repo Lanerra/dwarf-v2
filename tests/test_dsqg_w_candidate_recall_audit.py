@@ -103,3 +103,32 @@ def test_synthetic_audit_reports_candidate_telemetry_and_perfect_recall() -> Non
     assert report["candidate_telemetry"]["dsqg_w_candidate_fraction_hisa_evidence"] > 0.0
     assert report["candidate_telemetry"]["dsqg_w_candidate_fraction_l3_skip"] > 0.0
     assert report["candidate_telemetry"]["dsqg_w_valid_candidate_count"] <= 24
+
+
+def test_load_jsonl_records_and_run_dataset_audit(tmp_path: Path) -> None:
+    mod = load_audit_module()
+    path = tmp_path / "lexical_gap.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                '{"id":"hit","tokens":["Fact:","animal","is","dog","Question:","juvenile","term?","Answer:","puppy"],"answer_positions":[8],"gold_evidence_indices":[3],"question_indices":[4,5,6,7],"hisa_evidence_indices":[3,2,1],"l3_skip_indices":[4,5]}',
+                '{"id":"miss","tokens":["Fact:","metal","is","copper","Extra","words","before","the","Question:","symbol?","Answer:","Cu"],"answer_positions":[10],"gold_evidence_indices":[3],"question_indices":[8,9,10],"hisa_evidence_indices":[1,2],"l3_skip_indices":[8,9]}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    records = mod.load_jsonl_records(path)
+    report = mod.run_jsonl_audit(records, d=16, n_heads=4, max_candidates=24, seed=123, min_recall=0.5)
+
+    assert [record["id"] for record in records] == ["hit", "miss"]
+    assert report["config"]["dataset_examples"] == 2
+    assert report["metrics"]["dsqg_w_gold_evidence_candidate_count"] == 2
+    assert report["metrics"]["dsqg_w_gold_evidence_candidate_hit_count"] == 1
+    assert report["metrics"]["dsqg_w_gold_evidence_candidate_recall"] == pytest.approx(0.5)
+    assert report["metrics"]["dsqg_w_gold_evidence_candidate_recall_by_type"]["HISA_EVIDENCE"] == pytest.approx(0.5)
+    assert report["candidate_telemetry"]["dsqg_w_candidate_fraction_question"] > 0.0
+    assert report["candidate_telemetry"]["dsqg_w_candidate_fraction_hisa_evidence"] > 0.0
+    assert report["examples"][0]["recall"] == pytest.approx(1.0)
+    assert report["examples"][1]["recall"] == pytest.approx(0.0)
