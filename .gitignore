@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime outputs
+logs/
+checkpoints/
+results/
+runs/
+wandb/
+*.log
+*.ncu-rep
+*.qdstrm
+
+# Large local artifacts: keep present for local trainer runs, but do not commit.
+datasets/*.pt
+datasets/*.pth
+datasets/*.npy
+datasets/*.npz
+checkpoints/*.pt
+checkpoints/*.pth
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

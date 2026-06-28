@@ -1,0 +1,546 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from enum import IntEnum
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class CandidateType(IntEnum):
+    NULL = 0
+    LOCAL = 1
+    QUESTION = 2
+    HISA_EVIDENCE = 3
+    LONG_OFFSET = 4
+    CHUNK_REP = 5
+    L3_SKIP = 6
+
+
+class CandidateSource(IntEnum):
+    NULL = 0
+    FINAL = 1
+    L3 = 2
+    HISA = 3
+    SUMMARY = 4
+    QUESTION_CACHE = 5
+
+
+# Lower is better.  This matches the DWARF v2 proposal: semantic evidence/cues
+# replace duplicate local/long routes instead of letting them inflate mass.
+_CANDIDATE_PRIORITY: dict[int, int] = {
+    int(CandidateType.HISA_EVIDENCE): 0,
+    int(CandidateType.QUESTION): 1,
+    int(CandidateType.CHUNK_REP): 2,
+    int(CandidateType.L3_SKIP): 3,
+    int(CandidateType.LONG_OFFSET): 4,
+    int(CandidateType.LOCAL): 5,
+    int(CandidateType.NULL): 6,
+}
+
+
+@dataclass(frozen=True)
+class DSQGWConfig:
+    d: int
+    n_heads: int
+    n_types: int = len(CandidateType)
+    n_sources: int = len(CandidateSource)
+    bottleneck: int = 256
+    max_candidates: int = 32
+    gate_init: float = -5.0
+    local_offsets: tuple[int, ...] = (1, 2, 4, 8)
+    long_offsets: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024, 2048)
+    k_question: int = 4
+    k_hisa_evidence: int = 8
+    k_chunk: int = 4
+    k_l3_skip: int = 4
+    null_fallback: bool = True
+    local_type_id: int = int(CandidateType.LOCAL)
+
+    def __post_init__(self) -> None:
+        if self.d <= 0:
+            raise ValueError("d must be positive")
+        if self.n_heads <= 0 or self.d % self.n_heads != 0:
+            raise ValueError("d must be divisible by n_heads")
+        if self.max_candidates <= 0:
+            raise ValueError("max_candidates must be positive")
+        if self.n_types < len(CandidateType):
+            raise ValueError("n_types must cover all CandidateType values")
+        if self.n_sources < len(CandidateSource):
+            raise ValueError("n_sources must cover all CandidateSource values")
+
+
+@dataclass(frozen=True)
+class Candidate:
+    token_index: int
+    source_layer: int
+    candidate_type: int
+    offset: int | None
+    valid: bool = True
+
+
+@dataclass(frozen=True)
+class CandidateBatch:
+    cand_states: torch.Tensor
+    cand_types: torch.Tensor
+    cand_sources: torch.Tensor
+    cand_mask: torch.Tensor
+    cand_token_indices: torch.Tensor
+    valid_candidate_count: torch.Tensor
+    telemetry: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+class CandidateProvider:
+    """Bounded causal heterogeneous candidate construction for DSQG-W.
+
+    This is intentionally diagnostic and explicit, not fused.  It constructs only
+    O(B*T*J) candidate tensors and rejects future-token routes.  The default MVP
+    supports LOCAL, QUESTION, HISA_EVIDENCE/L3_SKIP, LONG_OFFSET, CHUNK_REP, and
+    NULL fallback candidates.
+    """
+
+    def __init__(self, config: DSQGWConfig):
+        self.config = config
+
+    def build(
+        self,
+        final_states: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        question_indices: torch.Tensor | list[list[int]] | None = None,
+        hisa_evidence_indices: torch.Tensor | None = None,
+        chunk_rep_indices: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+        l3_skip_indices: torch.Tensor | None = None,
+    ) -> CandidateBatch:
+        if final_states.ndim != 3:
+            raise ValueError("final_states must have shape [B, T, D]")
+        bsz, seq_len, d = final_states.shape
+        if d != self.config.d:
+            raise ValueError(f"final_states last dim {d} does not match config.d {self.config.d}")
+        if l3_states is not None and l3_states.shape != final_states.shape:
+            raise ValueError("l3_states must match final_states shape")
+        if chunk_rep_states is not None and chunk_rep_states.shape != final_states.shape:
+            raise ValueError("chunk_rep_states must match final_states shape")
+
+        device = final_states.device
+        source_states: dict[int, torch.Tensor] = {
+            int(CandidateSource.FINAL): final_states,
+            int(CandidateSource.QUESTION_CACHE): final_states,
+            int(CandidateSource.L3): l3_states if l3_states is not None else final_states,
+            int(CandidateSource.HISA): l3_states if l3_states is not None else final_states,
+            int(CandidateSource.SUMMARY): chunk_rep_states if chunk_rep_states is not None else final_states,
+            int(CandidateSource.NULL): torch.zeros_like(final_states),
+        }
+
+        j_max = self.config.max_candidates
+        cand_states = final_states.new_zeros((bsz, seq_len, j_max, d))
+        cand_types = torch.full((bsz, seq_len, j_max), int(CandidateType.NULL), device=device, dtype=torch.long)
+        cand_sources = torch.full((bsz, seq_len, j_max), int(CandidateSource.NULL), device=device, dtype=torch.long)
+        cand_mask = torch.zeros((bsz, seq_len, j_max), device=device, dtype=torch.bool)
+        cand_token_indices = torch.full((bsz, seq_len, j_max), -1, device=device, dtype=torch.long)
+        valid_count = torch.zeros((bsz, seq_len), device=device, dtype=torch.long)
+
+        raw_count = 0
+        invalid_count = 0
+        duplicate_count = 0
+
+        for b in range(bsz):
+            for t in range(seq_len):
+                dedup: dict[tuple[int, int], Candidate] = {}
+
+                def consider(token_index: int, source: int, ctype: int, offset: int | None = None) -> None:
+                    nonlocal raw_count, invalid_count, duplicate_count
+                    raw_count += 1
+                    valid = 0 <= int(token_index) <= t
+                    if not valid:
+                        invalid_count += 1
+                        return
+                    cand = Candidate(int(token_index), int(source), int(ctype), None if offset is None else int(offset), True)
+                    key = (cand.token_index, cand.source_layer)
+                    prev = dedup.get(key)
+                    if prev is not None:
+                        duplicate_count += 1
+                        if _CANDIDATE_PRIORITY[cand.candidate_type] < _CANDIDATE_PRIORITY[prev.candidate_type]:
+                            dedup[key] = cand
+                    else:
+                        dedup[key] = cand
+
+                for offset in self.config.local_offsets:
+                    consider(t - int(offset), int(CandidateSource.FINAL), int(CandidateType.LOCAL), int(offset))
+
+                for q_idx in self._indices_for_position(question_indices, b, t, self.config.k_question):
+                    # QUESTION intentionally uses FINAL source so cue/local duplicates
+                    # are de-duplicated by token/layer with QUESTION priority.
+                    consider(q_idx, int(CandidateSource.FINAL), int(CandidateType.QUESTION), None)
+
+                for h_idx in self._indices_for_position(hisa_evidence_indices, b, t, self.config.k_hisa_evidence):
+                    consider(h_idx, int(CandidateSource.L3), int(CandidateType.HISA_EVIDENCE), None)
+
+                for offset in self.config.long_offsets:
+                    consider(t - int(offset), int(CandidateSource.FINAL), int(CandidateType.LONG_OFFSET), int(offset))
+
+                for c_idx in self._indices_for_position(chunk_rep_indices, b, t, self.config.k_chunk):
+                    consider(c_idx, int(CandidateSource.SUMMARY), int(CandidateType.CHUNK_REP), None)
+
+                for l3_idx in self._indices_for_position(l3_skip_indices, b, t, self.config.k_l3_skip):
+                    consider(l3_idx, int(CandidateSource.L3), int(CandidateType.L3_SKIP), None)
+
+                if not dedup and self.config.null_fallback:
+                    consider(t, int(CandidateSource.NULL), int(CandidateType.NULL), None)
+
+                ordered = sorted(
+                    dedup.values(),
+                    key=lambda c: (_CANDIDATE_PRIORITY[c.candidate_type], c.token_index, c.source_layer),
+                )[:j_max]
+                valid_count[b, t] = len(ordered)
+                for j, cand in enumerate(ordered):
+                    cand_mask[b, t, j] = True
+                    cand_types[b, t, j] = cand.candidate_type
+                    cand_sources[b, t, j] = cand.source_layer
+                    cand_token_indices[b, t, j] = cand.token_index
+                    cand_states[b, t, j] = source_states[cand.source_layer][b, cand.token_index]
+
+        if not cand_mask.any(dim=-1).all():
+            raise RuntimeError("CandidateProvider produced an all-invalid DSQG-W candidate row")
+
+        denom = max(raw_count, 1)
+        telemetry = {
+            "dsqg_w_candidate_duplicate_rate": final_states.new_tensor(float(duplicate_count) / float(denom)),
+            "dsqg_w_candidate_invalid_rate": final_states.new_tensor(float(invalid_count) / float(denom)),
+            "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+        }
+        for ctype in CandidateType:
+            mask = (cand_types == int(ctype)) & cand_mask
+            telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / cand_mask.float().sum().clamp_min(1.0)
+
+        return CandidateBatch(
+            cand_states=cand_states,
+            cand_types=cand_types,
+            cand_sources=cand_sources,
+            cand_mask=cand_mask,
+            cand_token_indices=cand_token_indices,
+            valid_candidate_count=valid_count,
+            telemetry=telemetry,
+        )
+
+    @staticmethod
+    def _indices_for_position(
+        indices: torch.Tensor | list[list[int]] | None,
+        batch_index: int,
+        query_position: int,
+        limit: int,
+    ) -> list[int]:
+        if indices is None or limit <= 0:
+            return []
+        if isinstance(indices, torch.Tensor):
+            if indices.ndim == 1:
+                vals = indices.detach().cpu().tolist()
+            elif indices.ndim == 2:
+                vals = indices[batch_index].detach().cpu().tolist()
+            elif indices.ndim == 3:
+                vals = indices[batch_index, query_position].detach().cpu().tolist()
+            else:
+                raise ValueError("candidate index tensors must be rank 1, 2, or 3")
+        else:
+            vals = indices[batch_index]
+        out: list[int] = []
+        for val in vals:
+            idx = int(val)
+            if idx < 0:
+                continue
+            if idx <= query_position:
+                out.append(idx)
+            if len(out) >= limit:
+                break
+        return out
+
+
+class DSQGWBlock(nn.Module):
+    """Diagnostic DSQG-W semantic-width recomposer.
+
+    Inputs:
+      x:            [B, T, D]
+      cand_states:  [B, T, J, D]
+      cand_types:   [B, T, J]
+      cand_sources: [B, T, J]
+      cand_mask:    [B, T, J] bool
+    """
+
+    def __init__(
+        self,
+        d: int,
+        n_heads: int,
+        n_types: int,
+        n_sources: int,
+        bottleneck: int,
+        max_candidates: int,
+        local_type_id: int,
+        gate_init: float = -5.0,
+    ) -> None:
+        super().__init__()
+        if d % n_heads != 0:
+            raise ValueError("d must be divisible by n_heads")
+        self.d = int(d)
+        self.n_heads = int(n_heads)
+        self.dh = int(d // n_heads)
+        self.n_types = int(n_types)
+        self.n_sources = int(n_sources)
+        self.max_candidates = int(max_candidates)
+        self.local_type_id = int(local_type_id)
+
+        self.norm_x = nn.LayerNorm(d)
+        self.norm_c = nn.LayerNorm(d)
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.k_proj = nn.Linear(d, d, bias=False)
+        self.v_proj = nn.Linear(d, d, bias=False)
+        self.role_key = nn.Embedding(n_types, d)
+        self.source_key = nn.Embedding(n_sources, d)
+        self.type_bias = nn.Parameter(torch.zeros(n_types, n_heads))
+        self.source_bias = nn.Parameter(torch.zeros(n_sources, n_heads))
+        self.read_mix = nn.Linear((n_types + 1) * d, d, bias=False)
+        self.norm_z = nn.LayerNorm(4 * d)
+        self.fuse = nn.Sequential(
+            nn.Linear(4 * d, bottleneck),
+            nn.GELU(),
+            nn.Linear(bottleneck, d),
+        )
+        self.gate = nn.Parameter(torch.full((d,), float(gate_init)))
+        nn.init.normal_(self.fuse[-1].weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.fuse[-1].bias)
+
+    @classmethod
+    def from_config(cls, config: DSQGWConfig) -> "DSQGWBlock":
+        return cls(
+            d=config.d,
+            n_heads=config.n_heads,
+            n_types=config.n_types,
+            n_sources=config.n_sources,
+            bottleneck=config.bottleneck,
+            max_candidates=config.max_candidates,
+            local_type_id=config.local_type_id,
+            gate_init=config.gate_init,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cand_states: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        return_routing: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bsz, seq_len, d = x.shape
+        b2, t2, j_count, d2 = cand_states.shape
+        if (bsz, seq_len, d) != (b2, t2, d2):
+            raise ValueError("x and cand_states shape mismatch")
+        if d != self.d:
+            raise ValueError(f"x last dim {d} does not match block d {self.d}")
+        if j_count > self.max_candidates:
+            raise ValueError("candidate count exceeds DSQG-W max_candidates")
+        if not cand_mask.any(dim=-1).all():
+            raise ValueError("DSQG-W received an all-invalid candidate row")
+
+        h = self.n_heads
+        dh = self.dh
+        x_n = self.norm_x(x)
+        c_n = self.norm_c(cand_states)
+
+        q = self.q_proj(x_n).reshape(bsz, seq_len, h, dh)
+        k = self.k_proj(c_n).reshape(bsz, seq_len, j_count, h, dh)
+        v = self.v_proj(c_n).reshape(bsz, seq_len, j_count, h, dh)
+        role = self.role_key(cand_types).reshape(bsz, seq_len, j_count, h, dh)
+        source = self.source_key(cand_sources).reshape(bsz, seq_len, j_count, h, dh)
+        k_eff = k + role + source
+
+        scores = (q[:, :, None, :, :] * k_eff).sum(dim=-1) / math.sqrt(float(dh))
+        scores = scores + self.type_bias[cand_types]
+        scores = scores + self.source_bias[cand_sources]
+        scores = scores.masked_fill(~cand_mask[:, :, :, None], torch.finfo(scores.dtype).min)
+        probs = F.softmax(scores, dim=2)
+
+        r_all_h = (probs[..., None] * v).sum(dim=2)
+        r_all = r_all_h.reshape(bsz, seq_len, d)
+
+        typed_reads = []
+        typed_read_norms = []
+        for type_id in range(self.n_types):
+            type_mask = ((cand_types == type_id) & cand_mask)[:, :, :, None, None]
+            p_type = probs[..., None].masked_fill(~type_mask, 0.0)
+            r_type_h = (p_type * v).sum(dim=2)
+            r_type = r_type_h.reshape(bsz, seq_len, d)
+            typed_reads.append(r_type)
+            typed_read_norms.append(r_type.norm(dim=-1).mean())
+
+        r_cat = torch.cat([r_all] + typed_reads, dim=-1)
+        read = self.read_mix(r_cat)
+        z = torch.cat([x, read, x * read, read - x], dim=-1)
+        delta = self.fuse(self.norm_z(z))
+        gate = torch.sigmoid(self.gate).reshape(1, 1, d)
+        x_out = x + gate * delta
+
+        p_mean = probs.mean(dim=-1)
+        p_safe = p_mean.clamp_min(1e-8)
+        entropy = -(p_safe * p_safe.log()).sum(dim=-1).mean()
+        valid_counts = cand_mask.sum(dim=-1).float()
+        delta_norm = delta.norm(dim=-1).mean()
+        x_norm = x.norm(dim=-1).mean()
+        read_norm = read.norm(dim=-1).mean()
+
+        telemetry: dict[str, torch.Tensor] = {
+            "dsqg_w_entropy": entropy.detach(),
+            "dsqg_w_valid_candidate_count": valid_counts.mean().detach(),
+            "dsqg_w_gate_mean": gate.mean().detach(),
+            "dsqg_w_gate_min": gate.min().detach(),
+            "dsqg_w_gate_max": gate.max().detach(),
+            "dsqg_w_delta_norm": delta_norm.detach(),
+            "dsqg_w_x_norm": x_norm.detach(),
+            "dsqg_w_delta_to_x_ratio": (delta_norm / x_norm.clamp_min(1e-8)).detach(),
+            "dsqg_w_read_norm": read_norm.detach(),
+            "dsqg_w_typed_read_norms": torch.stack(typed_read_norms).detach(),
+            "read_mix_weight_norm": self.read_mix.weight.norm().detach(),
+        }
+        for ctype in CandidateType:
+            mask = (cand_types == int(ctype)) & cand_mask
+            mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
+            telemetry[f"dsqg_w_{ctype.name.lower()}_mass"] = mass.detach()
+        telemetry["dsqg_w_local_mass"] = telemetry[f"dsqg_w_{CandidateType.LOCAL.name.lower()}_mass"]
+        telemetry["dsqg_w_question_mass"] = telemetry[f"dsqg_w_{CandidateType.QUESTION.name.lower()}_mass"]
+        telemetry["dsqg_w_hisa_evidence_mass"] = telemetry[f"dsqg_w_{CandidateType.HISA_EVIDENCE.name.lower()}_mass"]
+        telemetry["dsqg_w_long_offset_mass"] = telemetry[f"dsqg_w_{CandidateType.LONG_OFFSET.name.lower()}_mass"]
+        telemetry["dsqg_w_chunk_rep_mass"] = telemetry[f"dsqg_w_{CandidateType.CHUNK_REP.name.lower()}_mass"]
+        telemetry["dsqg_w_null_mass"] = telemetry[f"dsqg_w_{CandidateType.NULL.name.lower()}_mass"]
+        for source in CandidateSource:
+            mask = (cand_sources == int(source)) & cand_mask
+            mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
+            telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
+        telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
+        telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
+
+        if return_routing:
+            telemetry["dsqg_w_probs"] = probs
+        return x_out, telemetry
+
+
+def answer_masked_loss(logits: torch.Tensor, labels: torch.Tensor, answer_mask: torch.Tensor) -> torch.Tensor:
+    if logits.ndim != 3 or labels.shape != logits.shape[:2] or answer_mask.shape != labels.shape:
+        raise ValueError("expected logits [B,T,V], labels [B,T], answer_mask [B,T]")
+    selected = answer_mask.bool()
+    if not selected.any():
+        raise ValueError("answer_mask selects no positions")
+    return F.cross_entropy(logits[selected], labels[selected])
+
+
+def conditional_copy_unlikelihood_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    answer_mask: torch.Tensor,
+    bad_copy_token_mask: torch.Tensor,
+    *,
+    margin: float = 0.0,
+) -> torch.Tensor:
+    """Margin anti-copy loss for lexical-gap answer positions.
+
+    bad_copy_token_mask is [B,T,V] and should be true only for source/evidence
+    copy competitors that are not valid gold answer tokens.  Gold-token entries
+    are ignored defensively here as well.
+    """
+    if bad_copy_token_mask.shape != logits.shape:
+        raise ValueError("bad_copy_token_mask must match logits shape [B,T,V]")
+    if labels.shape != logits.shape[:2] or answer_mask.shape != labels.shape:
+        raise ValueError("labels and answer_mask must have shape [B,T]")
+    mask = bad_copy_token_mask.bool().clone()
+    mask.scatter_(2, labels.unsqueeze(-1), False)
+    position_mask = answer_mask.bool() & mask.any(dim=-1)
+    if not position_mask.any():
+        return logits.sum() * 0.0
+    bad_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min).amax(dim=-1)
+    gold_logits = logits.gather(2, labels.unsqueeze(-1)).squeeze(-1)
+    return F.softplus(bad_logits[position_mask] - gold_logits[position_mask] + float(margin)).mean()
+
+
+def _mean_head_probs(probs: torch.Tensor) -> torch.Tensor:
+    if probs.ndim == 4:
+        return probs.mean(dim=-1)
+    if probs.ndim == 3:
+        return probs
+    raise ValueError("probs must have shape [B,T,J] or [B,T,J,H]")
+
+
+def local_mass_cap_loss(
+    probs: torch.Tensor,
+    cand_types: torch.Tensor,
+    cand_mask: torch.Tensor,
+    *,
+    answer_mask: torch.Tensor | None = None,
+    cap: float = 0.35,
+    local_type_id: int = int(CandidateType.LOCAL),
+) -> torch.Tensor:
+    p_mean = _mean_head_probs(probs)
+    local_mask = (cand_types == int(local_type_id)) & cand_mask.bool()
+    local_mass = p_mean.masked_fill(~local_mask, 0.0).sum(dim=-1)
+    if answer_mask is not None:
+        selected = answer_mask.bool()
+        if not selected.any():
+            return probs.sum() * 0.0
+        local_mass = local_mass[selected]
+    return F.relu(local_mass - float(cap)).square().mean()
+
+
+def entropy_floor_loss(
+    probs: torch.Tensor,
+    *,
+    answer_mask: torch.Tensor | None = None,
+    floor: float = 1.25,
+) -> torch.Tensor:
+    p_mean = _mean_head_probs(probs)
+    p_safe = p_mean.clamp_min(1e-8)
+    entropy = -(p_safe * p_safe.log()).sum(dim=-1)
+    if answer_mask is not None:
+        selected = answer_mask.bool()
+        if not selected.any():
+            return probs.sum() * 0.0
+        entropy = entropy[selected]
+    return F.relu(float(floor) - entropy).square().mean()
+
+
+def candidate_recall(
+    cand_token_indices: torch.Tensor,
+    cand_types: torch.Tensor,
+    cand_mask: torch.Tensor,
+    gold_evidence_indices: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute candidate recall overall and by type for evidence-token audits.
+
+    gold_evidence_indices is [B,T,K] or [B,K].  Values <0 are ignored.  Recall is
+    the fraction of query rows with at least one valid gold evidence token present.
+    """
+    if gold_evidence_indices.ndim == 2:
+        gold = gold_evidence_indices[:, None, :].expand(-1, cand_token_indices.shape[1], -1)
+    elif gold_evidence_indices.ndim == 3:
+        gold = gold_evidence_indices
+    else:
+        raise ValueError("gold_evidence_indices must be [B,K] or [B,T,K]")
+    gold = gold.to(device=cand_token_indices.device)
+    gold_valid = gold >= 0
+    if not gold_valid.any():
+        zero = cand_token_indices.float().sum() * 0.0
+        return {"dsqg_w_gold_evidence_candidate_recall": zero.detach()}
+    present = ((cand_token_indices[:, :, :, None] == gold[:, :, None, :]) & cand_mask[:, :, :, None] & gold_valid[:, :, None, :]).any(dim=(2, 3))
+    has_gold = gold_valid.any(dim=-1)
+    denom = has_gold.float().sum().clamp_min(1.0)
+    out: dict[str, torch.Tensor] = {
+        "dsqg_w_gold_evidence_candidate_recall": (present & has_gold).float().sum() / denom,
+    }
+    for ctype in CandidateType:
+        type_present = (
+            (cand_token_indices[:, :, :, None] == gold[:, :, None, :])
+            & cand_mask[:, :, :, None]
+            & (cand_types[:, :, :, None] == int(ctype))
+            & gold_valid[:, :, None, :]
+        ).any(dim=(2, 3))
+        out[f"dsqg_w_gold_evidence_candidate_recall_{ctype.name.lower()}"] = (type_present & has_gold).float().sum() / denom
+    return out
