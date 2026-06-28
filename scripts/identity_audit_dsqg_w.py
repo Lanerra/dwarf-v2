@@ -78,6 +78,7 @@ def main() -> int:
     ffn_dim = int(os.environ.get("DWARF_DSQG_W_AUDIT_FFN", "64"))
     device = torch.device(os.environ.get("DWARF_DSQG_W_AUDIT_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu"))
     question_enabled = os.getenv("DWARF_DSQG_W_QUESTION", "0") == "1"
+    hisa_l3_enabled = os.getenv("DWARF_DSQG_W_HISA_L3", "0") == "1"
 
     base_mod = load_trainer(dsqg_w=False, suffix="base")
     w_mod = load_trainer(dsqg_w=True, suffix="dsqgw")
@@ -94,11 +95,28 @@ def main() -> int:
         # answer positions. This exercises QUESTION metadata plumbing without
         # adding tokenizer/prompt parsing assumptions to the model.
         question_indices = torch.arange(k_question, device=device, dtype=torch.long).repeat(batch, 1)
+    hisa_evidence_indices = None
+    l3_skip_indices = None
+    if hisa_l3_enabled:
+        k_hisa = int(os.environ.get("DWARF_DSQG_W_K_HISA_EVIDENCE", "8"))
+        k_l3 = int(os.environ.get("DWARF_DSQG_W_K_L3_SKIP", "4"))
+        hisa_evidence_indices = torch.arange(k_hisa, device=device, dtype=torch.long).repeat(batch, 1)
+        l3_skip_indices = torch.arange(k_hisa, k_hisa + k_l3, device=device, dtype=torch.long).clamp_max(seq_len - 1).repeat(batch, 1)
 
     with torch.no_grad():
         base_trunk = base._forward_trunk(idx)
-        w_trunk = with_w._forward_trunk(idx)
-        w_recomposed = with_w._apply_dsqg_w_recomposer(w_trunk, question_indices=question_indices)
+        if hisa_l3_enabled:
+            w_trunk, l3_state = with_w._forward_trunk(idx, collect_l3_state=True)
+        else:
+            w_trunk = with_w._forward_trunk(idx)
+            l3_state = None
+        w_recomposed = with_w._apply_dsqg_w_recomposer(
+            w_trunk,
+            question_indices=question_indices,
+            l3_states=l3_state,
+            hisa_evidence_indices=hisa_evidence_indices,
+            l3_skip_indices=l3_skip_indices,
+        )
         base_logits = base.out(base.norm(base_trunk))
         w_logits = with_w.out(with_w.norm(w_recomposed))
         base_logp = F.log_softmax(base_logits.float(), dim=-1)
@@ -124,7 +142,15 @@ def main() -> int:
             "dsqg_w_gate_init": with_w.dsqg_w_config.gate_init,
             "dsqg_w_question_enabled": question_enabled,
             "dsqg_w_k_question": with_w.dsqg_w_config.k_question,
-            "candidate_path": "LOCAL_LONG_QUESTION_NULL" if question_enabled else "LOCAL_LONG_NULL_ONLY",
+            "dsqg_w_hisa_l3_enabled": hisa_l3_enabled,
+            "dsqg_w_k_hisa_evidence": with_w.dsqg_w_config.k_hisa_evidence,
+            "dsqg_w_k_l3_skip": with_w.dsqg_w_config.k_l3_skip,
+            "candidate_path": "_".join(
+                ["LOCAL", "LONG"]
+                + (["QUESTION"] if question_enabled else [])
+                + (["HISA_EVIDENCE", "L3_SKIP"] if hisa_l3_enabled else [])
+                + ["NULL"]
+            ),
         },
         "trunk_delta": tensor_stats(w_trunk - base_trunk),
         "recomposer_hidden_delta": tensor_stats(w_recomposed - w_trunk),

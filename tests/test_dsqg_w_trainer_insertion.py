@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TRAINER = ROOT / "train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py"
 
 
-def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False):
+def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: bool = False):
     monkeypatch.setenv("DWARF_DISABLE_BNB", "1")
     monkeypatch.setenv("DWARF_LIGER", "0")
     monkeypatch.setenv("DWARF_TORCH_COMPILE", "0")
@@ -24,9 +24,16 @@ def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False):
             monkeypatch.setenv("DWARF_DSQG_W_K_QUESTION", "4")
         else:
             monkeypatch.delenv("DWARF_DSQG_W_QUESTION", raising=False)
+        if hisa_l3:
+            monkeypatch.setenv("DWARF_DSQG_W_HISA_L3", "1")
+            monkeypatch.setenv("DWARF_DSQG_W_K_HISA_EVIDENCE", "4")
+            monkeypatch.setenv("DWARF_DSQG_W_K_L3_SKIP", "2")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_HISA_L3", raising=False)
     else:
         monkeypatch.delenv("DWARF_DSQG_W", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_QUESTION", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_HISA_L3", raising=False)
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "kernels"))
     try:
@@ -155,3 +162,60 @@ def test_forward_accepts_optional_dsqg_w_question_indices(monkeypatch) -> None:
     _ = model(idx, dsqg_w_question_indices=question_indices)
 
     assert seen == [question_indices]
+
+
+def test_dsqg_w_hisa_l3_candidate_indices_read_from_l3_states(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True, hisa_l3=True)
+    model = make_model(mod)
+    final_states = torch.randn(2, 8, mod.EMBEDDING_DIM)
+    l3_states = final_states + 0.25
+    hisa_indices = torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)
+    l3_skip_indices = torch.tensor([[0, 4], [1, 5]], dtype=torch.long)
+
+    assert mod.DSQG_W_HISA_L3_ENABLED is True
+    assert model.dsqg_w_config.k_hisa_evidence == 4
+    assert model.dsqg_w_config.k_l3_skip == 2
+
+    out = model._apply_dsqg_w_recomposer(
+        final_states,
+        l3_states=l3_states,
+        hisa_evidence_indices=hisa_indices,
+        l3_skip_indices=l3_skip_indices,
+    )
+
+    assert out.shape == final_states.shape
+    assert torch.isfinite(out).all()
+    assert (out - final_states).abs().max().item() < 1e-2
+    telemetry = model.dsqg_w_last_telemetry
+    assert telemetry["dsqg_w_candidate_fraction_hisa_evidence"].item() > 0.0
+    assert telemetry["dsqg_w_candidate_fraction_l3_skip"].item() > 0.0
+    assert telemetry["dsqg_w_hisa_evidence_mass"].item() > 0.0
+    assert telemetry["dsqg_w_l3_skip_mass"].item() > 0.0
+    assert telemetry["dsqg_w_l3_source_mass"].item() > 0.0
+
+
+def test_forward_accepts_optional_dsqg_w_hisa_l3_indices(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, hisa_l3=True)
+    model = make_model(mod)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in model.blocks])
+    model.norm = torch.nn.Identity()
+    idx = torch.randint(0, 128, (1, 8), dtype=torch.long)
+    hisa_indices = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+    l3_skip_indices = torch.tensor([[0, 4]], dtype=torch.long)
+    seen = []
+
+    def fake_apply(x, **kwargs):
+        seen.append((kwargs.get("l3_states"), kwargs.get("hisa_evidence_indices"), kwargs.get("l3_skip_indices")))
+        return x
+
+    model._apply_dsqg_w_recomposer = fake_apply  # type: ignore[method-assign]
+    _ = model(
+        idx,
+        dsqg_w_hisa_evidence_indices=hisa_indices,
+        dsqg_w_l3_skip_indices=l3_skip_indices,
+    )
+
+    l3_states, seen_hisa, seen_l3_skip = seen[0]
+    assert l3_states is not None
+    assert seen_hisa is hisa_indices
+    assert seen_l3_skip is l3_skip_indices

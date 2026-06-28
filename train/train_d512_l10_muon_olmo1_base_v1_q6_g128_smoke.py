@@ -350,6 +350,19 @@ DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2,
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
 DSQG_W_QUESTION_ENABLED = os.getenv('DWARF_DSQG_W_QUESTION', '0') == '1'
 DSQG_W_K_QUESTION = int(os.environ.get('DWARF_DSQG_W_K_QUESTION', '4')) if DSQG_W_QUESTION_ENABLED else 0
+DSQG_W_HISA_L3_ENABLED = os.getenv('DWARF_DSQG_W_HISA_L3', '0') == '1'
+DSQG_W_K_HISA_EVIDENCE = int(os.environ.get('DWARF_DSQG_W_K_HISA_EVIDENCE', '8')) if DSQG_W_HISA_L3_ENABLED else 0
+DSQG_W_K_L3_SKIP = int(os.environ.get('DWARF_DSQG_W_K_L3_SKIP', '4')) if DSQG_W_HISA_L3_ENABLED else 0
+
+
+def _dsqg_w_candidate_path_label():
+    parts = ['LOCAL', 'LONG']
+    if DSQG_W_QUESTION_ENABLED:
+        parts.append('QUESTION')
+    if DSQG_W_HISA_L3_ENABLED:
+        parts.extend(['HISA_EVIDENCE', 'L3_SKIP'])
+    parts.append('NULL')
+    return '_'.join(parts)
 
 
 def _parse_q6_layer_spec(spec):
@@ -2926,9 +2939,9 @@ class TriadicJ96Dsr(nn.Module):
                 # QUESTION/cue candidates are opt-in so the identity path can
                 # remain LOCAL/LONG/NULL until explicitly audited.
                 k_question=DSQG_W_K_QUESTION,
-                k_hisa_evidence=0,
+                k_hisa_evidence=DSQG_W_K_HISA_EVIDENCE,
                 k_chunk=0,
-                k_l3_skip=0,
+                k_l3_skip=DSQG_W_K_L3_SKIP,
             )
             self.dsqg_w_candidate_provider = CandidateProvider(self.dsqg_w_config)
             self.dsqg_w = DSQGWBlock.from_config(self.dsqg_w_config)
@@ -2973,22 +2986,41 @@ class TriadicJ96Dsr(nn.Module):
                                                 _sac_policy_fn))
         return grad_ckpt(block, x, use_reentrant=False)
 
-    def _forward_trunk(self, idx):
+    def _forward_trunk(self, idx, *, collect_l3_state=False):
         x = self.drop(self.embedding(idx))
+        l3_state = None
         for i, block in enumerate(self.blocks):
             if self.training and self._should_checkpoint_block(i):
                 x = self._ckpt(block, x)
             else:
                 x = block(x)
+            if collect_l3_state and i == self.dsr_layer:
+                l3_state = x
+        if collect_l3_state:
+            return x, l3_state if l3_state is not None else x
         return x
 
-    def _apply_dsqg_w_recomposer(self, x, *, question_indices=None):
+    def _apply_dsqg_w_recomposer(
+        self,
+        x,
+        *,
+        question_indices=None,
+        l3_states=None,
+        hisa_evidence_indices=None,
+        l3_skip_indices=None,
+    ):
         if not self.dsqg_w_enabled:
             self.dsqg_w_last_telemetry = {}
             return x
         if self.dsqg_w is None or self.dsqg_w_candidate_provider is None:
             raise RuntimeError('DSQG-W is enabled but its block/provider was not initialized')
-        candidates = self.dsqg_w_candidate_provider.build(x, question_indices=question_indices)
+        candidates = self.dsqg_w_candidate_provider.build(
+            x,
+            l3_states=l3_states,
+            question_indices=question_indices,
+            hisa_evidence_indices=hisa_evidence_indices,
+            l3_skip_indices=l3_skip_indices,
+        )
         x_out, telemetry = self.dsqg_w(
             x,
             candidates.cand_states,
@@ -3001,17 +3033,47 @@ class TriadicJ96Dsr(nn.Module):
         self.dsqg_w_last_telemetry = merged_telemetry
         return x_out
 
-    def forward(self, idx, *, dsqg_w_question_indices=None):
+    def forward(
+        self,
+        idx,
+        *,
+        dsqg_w_question_indices=None,
+        dsqg_w_hisa_evidence_indices=None,
+        dsqg_w_l3_skip_indices=None,
+    ):
+        if self.dsqg_w_enabled:
+            trunk_out, l3_state = self._forward_trunk(idx, collect_l3_state=True)
+        else:
+            trunk_out = self._forward_trunk(idx)
+            l3_state = None
         x = self._apply_dsqg_w_recomposer(
-            self._forward_trunk(idx),
+            trunk_out,
             question_indices=dsqg_w_question_indices,
+            l3_states=l3_state,
+            hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+            l3_skip_indices=dsqg_w_l3_skip_indices,
         )
         return self.out(self.norm(x))
 
-    def forward_hidden(self, idx, *, dsqg_w_question_indices=None):
+    def forward_hidden(
+        self,
+        idx,
+        *,
+        dsqg_w_question_indices=None,
+        dsqg_w_hisa_evidence_indices=None,
+        dsqg_w_l3_skip_indices=None,
+    ):
+        if self.dsqg_w_enabled:
+            trunk_out, l3_state = self._forward_trunk(idx, collect_l3_state=True)
+        else:
+            trunk_out = self._forward_trunk(idx)
+            l3_state = None
         x = self._apply_dsqg_w_recomposer(
-            self._forward_trunk(idx),
+            trunk_out,
             question_indices=dsqg_w_question_indices,
+            l3_states=l3_state,
+            hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+            l3_skip_indices=dsqg_w_l3_skip_indices,
         )
         return self.norm(x)
 
@@ -3068,7 +3130,7 @@ class TriadicJ96Dsr(nn.Module):
             elif isinstance(block, DSRBlock):
                 parts.append(f'L{i}:DSR-V15HISA(C={block.attn.num_chunks},k={block.attn.top_k_chunks},HISA_m={block.attn.hisa_top_m_tokens})')
         if self.dsqg_w_enabled and self.dsqg_w_config is not None:
-            path = 'local+long+question+null' if self.dsqg_w_config.k_question > 0 else 'local+long+null'
+            path = _dsqg_w_candidate_path_label().lower().replace('_', '+')
             parts.append(f'FINAL:DSQG-W(J<={self.dsqg_w_config.max_candidates},{path})')
         return '  '.join(parts)
 
@@ -3175,8 +3237,10 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'long_offsets': list(DSQG_W_LONG_OFFSETS),
                 'question_enabled': DSQG_W_QUESTION_ENABLED,
                 'k_question': DSQG_W_K_QUESTION,
-                'candidate_path': 'LOCAL_LONG_QUESTION_NULL' if DSQG_W_QUESTION_ENABLED else 'LOCAL_LONG_NULL_ONLY',
-                'hisa_l3_enabled': False,
+                'hisa_l3_enabled': DSQG_W_HISA_L3_ENABLED,
+                'k_hisa_evidence': DSQG_W_K_HISA_EVIDENCE,
+                'k_l3_skip': DSQG_W_K_L3_SKIP,
+                'candidate_path': _dsqg_w_candidate_path_label(),
             },
             'params': n_params,
             'layer_layout': [(label, len(offsets) if offsets is not None else 0, has_if)
@@ -3600,7 +3664,7 @@ def train():
     else:
         print('  q6_g128 smoke path: disabled')
     if DSQG_W_ENABLED:
-        candidate_path = 'LOCAL/LONG/QUESTION/NULL' if DSQG_W_QUESTION_ENABLED else 'LOCAL/LONG/NULL'
+        candidate_path = _dsqg_w_candidate_path_label().replace('_', '/')
         print(f'  DSQG-W final recomposer: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
               f'candidates={candidate_path}')
