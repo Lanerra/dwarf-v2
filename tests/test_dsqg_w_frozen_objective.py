@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -220,3 +221,64 @@ def test_real_tokenizer_lexical_gap_overfit_smoke_reduces_loss() -> None:
     assert report["loss_final"] < report["loss_initial"]
     assert report["max_changed_frozen_param_count"] == 0
     assert report["min_changed_dsqg_w_param_count"] > 0
+
+
+def test_dsqg_w_only_checkpoint_roundtrip_reproduces_tokenized_loss(tmp_path: Path) -> None:
+    mod = load_objective_module()
+    seed = 20260628
+    records = mod.load_lexical_gap_records(LEXICAL_GAP_JSONL)
+    tokenizer = mod.load_tokenizer(OLMO_TOKENIZER)
+    batch, meta = mod.build_tokenized_lexical_gap_batch(records, tokenizer)
+    trainer = mod.load_trainer(enable_objective=True, suffix="checkpoint_roundtrip")
+
+    torch.manual_seed(seed)
+    model = mod.make_tiny_model(
+        trainer,
+        vocab_size=meta["tokenizer_vocab_size"],
+        ffn_dim=64,
+        seq_len=batch.input_ids.shape[1],
+    )
+    mod.prepare_model_for_frozen_dsqg_w_objective(model)
+    optimizer = mod.make_dsqg_w_optimizer(model, lr=1e-3)
+    for _ in range(3):
+        mod.run_one_frozen_dsqg_w_step(model, batch, optimizer)
+    with torch.no_grad():
+        saved_loss = float(mod.compute_frozen_dsqg_w_objective(model, batch).loss.detach().cpu().item())
+
+    save_report = mod.save_dsqg_w_checkpoint(
+        model,
+        tmp_path / "roundtrip",
+        metadata={
+            "seed": seed,
+            "jsonl_path": str(LEXICAL_GAP_JSONL),
+            "tokenizer_path": str(OLMO_TOKENIZER),
+            "tokenizer_vocab_size": meta["tokenizer_vocab_size"],
+            "seq_len": batch.input_ids.shape[1],
+            "loss_final": saved_loss,
+            "candidate_settings": {"max_candidates": 16, "k_question": 4, "k_hisa_evidence": 4, "k_l3_skip": 2},
+        },
+    )
+
+    state_payload = torch.load(save_report["state_path"], map_location="cpu", weights_only=True)
+    assert set(state_payload) == {"dsqg_w_state_dict"}
+    assert state_payload["dsqg_w_state_dict"]
+    sidecar = json.loads(Path(save_report["metadata_path"]).read_text())
+    assert sidecar["contains"] == "model.dsqg_w.state_dict"
+    assert sidecar["metadata"]["tokenizer_path"] == str(OLMO_TOKENIZER)
+    assert sidecar["metadata"]["candidate_settings"]["max_candidates"] == 16
+    assert sidecar["git_commit"]
+
+    torch.manual_seed(seed)
+    fresh_model = mod.make_tiny_model(
+        trainer,
+        vocab_size=meta["tokenizer_vocab_size"],
+        ffn_dim=64,
+        seq_len=batch.input_ids.shape[1],
+    )
+    mod.prepare_model_for_frozen_dsqg_w_objective(fresh_model)
+    load_report = mod.load_dsqg_w_checkpoint(fresh_model, save_report["state_path"])
+    assert load_report["missing_keys"] == []
+    assert load_report["unexpected_keys"] == []
+    with torch.no_grad():
+        loaded_loss = float(mod.compute_frozen_dsqg_w_objective(fresh_model, batch).loss.detach().cpu().item())
+    assert loaded_loss == pytest.approx(saved_loss)

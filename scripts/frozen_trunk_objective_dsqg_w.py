@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -262,6 +263,76 @@ def run_one_frozen_dsqg_w_step(
     }
 
 
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _jsonable(value: Any) -> Any:
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return float(value.detach().cpu().item())
+        return value.detach().cpu().tolist()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _candidate_settings() -> dict[str, int]:
+    return {
+        "max_candidates": int(os.environ.get("DWARF_DSQG_W_MAX_CANDIDATES", "16")),
+        "k_question": int(os.environ.get("DWARF_DSQG_W_K_QUESTION", "4")),
+        "k_hisa_evidence": int(os.environ.get("DWARF_DSQG_W_K_HISA_EVIDENCE", "4")),
+        "k_l3_skip": int(os.environ.get("DWARF_DSQG_W_K_L3_SKIP", "2")),
+    }
+
+
+def save_dsqg_w_checkpoint(model, output_dir: Path | str, *, metadata: dict[str, Any] | None = None) -> dict[str, str]:
+    if not getattr(model, "dsqg_w_enabled", False) or getattr(model, "dsqg_w", None) is None:
+        raise ValueError("DSQG-W must be enabled before saving its checkpoint")
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state_path = out_dir / "dsqg_w_state.pt"
+    metadata_path = out_dir / "dsqg_w_metadata.json"
+    state_dict = {key: value.detach().cpu() for key, value in model.dsqg_w.state_dict().items()}
+    torch.save({"dsqg_w_state_dict": state_dict}, state_path)
+    sidecar = {
+        "contains": "model.dsqg_w.state_dict",
+        "state_path": str(state_path),
+        "metadata": _jsonable(metadata or {}),
+        "git_commit": _git_commit(),
+    }
+    metadata_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "state_path": str(state_path),
+        "metadata_path": str(metadata_path),
+        "git_commit": sidecar["git_commit"],
+    }
+
+
+def load_dsqg_w_checkpoint(model, state_path: Path | str) -> dict[str, list[str]]:
+    if not getattr(model, "dsqg_w_enabled", False) or getattr(model, "dsqg_w", None) is None:
+        raise ValueError("DSQG-W must be enabled before loading its checkpoint")
+    payload = torch.load(state_path, map_location=_model_device(model), weights_only=True)
+    state_dict = payload["dsqg_w_state_dict"]
+    incompatible = model.dsqg_w.load_state_dict(state_dict, strict=False)
+    return {
+        "missing_keys": list(incompatible.missing_keys),
+        "unexpected_keys": list(incompatible.unexpected_keys),
+    }
+
+
 def make_synthetic_batch(*, batch: int = 1, seq_len: int = 16, vocab_size: int = 128, seed: int = 20260628) -> FrozenDSQGWBatch:
     torch.manual_seed(seed)
     input_ids = torch.randint(0, vocab_size, (batch, seq_len), dtype=torch.long)
@@ -445,6 +516,7 @@ def run_lexical_gap_overfit_smoke(
     *,
     jsonl_path: Path | str,
     tokenizer_path: Path | str | None = None,
+    checkpoint_dir: Path | str | None = None,
     steps: int = 8,
     lr: float = 1e-3,
     seed: int = 20260628,
@@ -501,7 +573,7 @@ def run_lexical_gap_overfit_smoke(
             "dsqg_w_overfit_changed_frozen_param_count": float(len(changed_frozen_final)),
         }
     )
-    return {
+    report = {
         "enabled": True,
         "skipped": False,
         "objective": "frozen_trunk_answer_only_ce_overfit_smoke",
@@ -524,6 +596,25 @@ def run_lexical_gap_overfit_smoke(
         "telemetry": telemetry,
         "pass": bool(loss_final < loss_initial and min_changed_dsqg_w > 0 and max_changed_frozen == 0),
     }
+    if checkpoint_dir is not None:
+        report["checkpoint"] = save_dsqg_w_checkpoint(
+            model,
+            checkpoint_dir,
+            metadata={
+                "seed": seed,
+                "jsonl_path": str(jsonl_path),
+                "tokenizer_path": str(tokenizer_path) if tokenizer_path is not None else None,
+                "tokenizer_vocab_size": batch_meta.get("tokenizer_vocab_size"),
+                "vocab_size": report["vocab_size"],
+                "seq_len": int(batch.input_ids.shape[1]),
+                "steps": int(steps),
+                "lr": float(lr),
+                "losses_before_step": losses,
+                "loss_final": loss_final,
+                "candidate_settings": _candidate_settings(),
+            },
+        )
+    return report
 
 
 def run_smoke_objective(*, enable: bool | None = None, seed: int = 20260628, step: bool = False) -> dict[str, Any]:
@@ -585,6 +676,7 @@ def main() -> int:
     parser.add_argument("--step", action="store_true", help="Run one DSQG-W-only optimizer step after the objective smoke.")
     parser.add_argument("--overfit-jsonl", type=Path, default=None, help="Run a tiny multi-step JSONL overfit smoke when --enable is also set.")
     parser.add_argument("--tokenizer", type=Path, default=None, help="Optional tokenizer JSON for real-token-ID lexical-gap overfit smoke.")
+    parser.add_argument("--save-dir", type=Path, default=None, help="Optional output directory for DSQG-W-only checkpoint artifacts.")
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=20260628)
@@ -602,6 +694,7 @@ def main() -> int:
             report = run_lexical_gap_overfit_smoke(
                 jsonl_path=args.overfit_jsonl,
                 tokenizer_path=args.tokenizer,
+                checkpoint_dir=args.save_dir,
                 steps=args.steps,
                 lr=args.lr,
                 seed=args.seed,
