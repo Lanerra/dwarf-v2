@@ -9,6 +9,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/frozen_trunk_objective_dsqg_w.py"
 LEXICAL_GAP_JSONL = ROOT / "audits/dsqg_w_lexical_gap_mini.jsonl"
+OLMO_TOKENIZER = ROOT / "tokenizers/olmo1_gpt_neox_dolma_v1_5_tokenizer.json"
 
 
 def load_objective_module():
@@ -177,5 +178,45 @@ def test_multistep_lexical_gap_smoke_reduces_loss_and_keeps_trunk_frozen() -> No
     assert report["answer_tokens"] == pytest.approx(3.0)
     assert report["loss_final"] < report["loss_initial"]
     assert report["loss_delta"] < 0.0
+    assert report["max_changed_frozen_param_count"] == 0
+    assert report["min_changed_dsqg_w_param_count"] > 0
+
+
+def test_build_real_tokenizer_lexical_gap_batch_maps_answer_and_candidates() -> None:
+    mod = load_objective_module()
+
+    records = mod.load_lexical_gap_records(LEXICAL_GAP_JSONL)
+    tokenizer = mod.load_tokenizer(OLMO_TOKENIZER)
+    batch, meta = mod.build_tokenized_lexical_gap_batch(records, tokenizer)
+
+    assert meta["tokenizer_path"] == str(OLMO_TOKENIZER)
+    assert meta["tokenizer_vocab_size"] > 1000
+    assert batch.input_ids.shape == batch.labels.shape == batch.answer_mask.shape
+    assert batch.input_ids.shape[0] == 3
+    assert int(batch.answer_mask.sum().item()) >= 3
+    assert batch.input_ids.max().item() < meta["tokenizer_vocab_size"]
+    assert batch.question_indices.shape[0] == 3
+    assert batch.hisa_evidence_indices.shape[0] == 3
+    assert batch.l3_skip_indices.shape[0] == 3
+    assert (batch.question_indices >= 0).any().item()
+    assert (batch.hisa_evidence_indices >= 0).any().item()
+    assert (batch.l3_skip_indices >= 0).any().item()
+
+
+def test_real_tokenizer_lexical_gap_overfit_smoke_reduces_loss() -> None:
+    mod = load_objective_module()
+
+    report = mod.run_lexical_gap_overfit_smoke(
+        jsonl_path=LEXICAL_GAP_JSONL,
+        tokenizer_path=OLMO_TOKENIZER,
+        steps=3,
+        lr=1e-3,
+        seed=20260628,
+    )
+
+    assert report["pass"] is True
+    assert report["tokenized"] is True
+    assert report["tokenizer_vocab_size"] > 1000
+    assert report["loss_final"] < report["loss_initial"]
     assert report["max_changed_frozen_param_count"] == 0
     assert report["min_changed_dsqg_w_param_count"] > 0

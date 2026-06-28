@@ -43,6 +43,24 @@ class FrozenObjectiveResult:
         self.telemetry = telemetry
 
 
+class LoadedTokenizer:
+    def __init__(self, path: Path | str) -> None:
+        from tokenizers import Tokenizer
+
+        self.path = str(path)
+        self.tokenizer = Tokenizer.from_file(self.path)
+
+    def encode(self, text: str):
+        return self.tokenizer.encode(text)
+
+    def get_vocab_size(self) -> int:
+        return int(self.tokenizer.get_vocab_size())
+
+
+def load_tokenizer(path: Path | str) -> LoadedTokenizer:
+    return LoadedTokenizer(path)
+
+
 def _set_common_env() -> None:
     os.environ["DWARF_DISABLE_BNB"] = "1"
     os.environ["DWARF_LIGER"] = "0"
@@ -325,20 +343,126 @@ def build_lexical_gap_batch(records: list[dict[str, Any]]) -> tuple[FrozenDSQGWB
     )
 
 
+def _record_token_char_spans(record: dict[str, Any]) -> list[tuple[int, int]]:
+    prompt = record["prompt"]
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for token in record["tokens"]:
+        start = prompt.find(token, cursor)
+        if start < 0:
+            raise ValueError(f"could not align token {token!r} in record {record.get('id', '<unknown>')!r}")
+        end = start + len(token)
+        spans.append((start, end))
+        cursor = end
+    return spans
+
+
+def _first_encoded_token_overlapping(offsets: list[tuple[int, int]], span: tuple[int, int]) -> int:
+    span_start, span_end = span
+    for idx, (tok_start, tok_end) in enumerate(offsets):
+        if tok_end <= tok_start:
+            continue
+        if tok_start < span_end and tok_end > span_start:
+            return idx
+    return -1
+
+
+def _encoded_tokens_overlapping(offsets: list[tuple[int, int]], span: tuple[int, int]) -> list[int]:
+    span_start, span_end = span
+    return [
+        idx
+        for idx, (tok_start, tok_end) in enumerate(offsets)
+        if tok_end > tok_start and tok_start < span_end and tok_end > span_start
+    ]
+
+
+def _map_word_positions_to_encoded_indices(record: dict[str, Any], offsets: list[tuple[int, int]], key: str) -> list[int]:
+    spans = _record_token_char_spans(record)
+    mapped: list[int] = []
+    for pos in record[key]:
+        pos = int(pos)
+        mapped.append(_first_encoded_token_overlapping(offsets, spans[pos]) if 0 <= pos < len(spans) else -1)
+    return mapped
+
+
+def build_tokenized_lexical_gap_batch(
+    records: list[dict[str, Any]],
+    tokenizer: LoadedTokenizer,
+) -> tuple[FrozenDSQGWBatch, dict[str, Any]]:
+    encodings = [tokenizer.encode(record["prompt"]) for record in records]
+    max_len = max(len(encoding.ids) for encoding in encodings)
+    input_ids = torch.zeros((len(records), max_len), dtype=torch.long)
+    labels = torch.zeros_like(input_ids)
+    answer_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    q_rows: list[list[int]] = []
+    h_rows: list[list[int]] = []
+    l3_rows: list[list[int]] = []
+    for row, (record, encoding) in enumerate(zip(records, encodings)):
+        ids = torch.tensor(encoding.ids, dtype=torch.long)
+        input_ids[row, : ids.numel()] = ids
+        labels[row, : ids.numel()] = ids
+        offsets = [(int(start), int(end)) for start, end in encoding.offsets]
+        spans = _record_token_char_spans(record)
+        for pos in record["answer_positions"]:
+            pos = int(pos)
+            if 0 <= pos < len(spans):
+                for tok_idx in _encoded_tokens_overlapping(offsets, spans[pos]):
+                    answer_mask[row, tok_idx] = True
+        q_rows.append(_map_word_positions_to_encoded_indices(record, offsets, "question_indices"))
+        h_rows.append(_map_word_positions_to_encoded_indices(record, offsets, "hisa_evidence_indices"))
+        l3_rows.append(_map_word_positions_to_encoded_indices(record, offsets, "l3_skip_indices"))
+
+    def pad_rows(rows: list[list[int]]) -> torch.Tensor:
+        width = max(len(row) for row in rows)
+        out = torch.full((len(rows), width), -1, dtype=torch.long)
+        for row_idx, row_values in enumerate(rows):
+            if row_values:
+                out[row_idx, : len(row_values)] = torch.tensor(row_values, dtype=torch.long)
+        return out
+
+    if not answer_mask.any():
+        raise ValueError("tokenized lexical-gap batch produced no answer tokens")
+    return (
+        FrozenDSQGWBatch(
+            input_ids=input_ids,
+            labels=labels,
+            answer_mask=answer_mask,
+            question_indices=pad_rows(q_rows),
+            hisa_evidence_indices=pad_rows(h_rows),
+            l3_skip_indices=pad_rows(l3_rows),
+        ),
+        {
+            "tokenized": True,
+            "tokenizer_path": tokenizer.path,
+            "tokenizer_vocab_size": tokenizer.get_vocab_size(),
+            "max_seq_len": int(max_len),
+            "answer_tokens": float(answer_mask.sum().item()),
+        },
+    )
+
+
 def run_lexical_gap_overfit_smoke(
     *,
     jsonl_path: Path | str,
+    tokenizer_path: Path | str | None = None,
     steps: int = 8,
     lr: float = 1e-3,
     seed: int = 20260628,
 ) -> dict[str, Any]:
     records = load_lexical_gap_records(jsonl_path)
-    batch, vocab = build_lexical_gap_batch(records)
+    if tokenizer_path is None:
+        batch, vocab = build_lexical_gap_batch(records)
+        batch_meta: dict[str, Any] = {"tokenized": False, "vocab_size": len(vocab)}
+        model_vocab_size = max(128, len(vocab))
+    else:
+        tokenizer = load_tokenizer(tokenizer_path)
+        batch, batch_meta = build_tokenized_lexical_gap_batch(records, tokenizer)
+        model_vocab_size = int(batch_meta["tokenizer_vocab_size"])
     trainer = load_trainer(enable_objective=True, suffix="lexical_gap_overfit")
     torch.manual_seed(seed)
     model = make_tiny_model(
         trainer,
-        vocab_size=max(128, len(vocab)),
+        vocab_size=model_vocab_size,
         ffn_dim=64,
         seq_len=batch.input_ids.shape[1],
     )
@@ -363,6 +487,9 @@ def run_lexical_gap_overfit_smoke(
     max_changed_frozen = max(int(report["changed_frozen_param_count"]) for report in step_reports + [{"changed_frozen_param_count": len(changed_frozen_final)}])
     telemetry = dict(final_result.telemetry)
     telemetry.update({key: float(value) for key, value in counts.items()})
+    for key, value in batch_meta.items():
+        if isinstance(value, (int, float, bool)):
+            telemetry[f"dsqg_w_overfit_{key}"] = float(value)
     telemetry.update(
         {
             "dsqg_w_overfit_lr": float(lr),
@@ -380,7 +507,10 @@ def run_lexical_gap_overfit_smoke(
         "objective": "frozen_trunk_answer_only_ce_overfit_smoke",
         "dataset": str(jsonl_path),
         "dataset_examples": len(records),
-        "vocab_size": len(vocab),
+        "tokenized": bool(batch_meta.get("tokenized", False)),
+        "tokenizer_path": batch_meta.get("tokenizer_path"),
+        "tokenizer_vocab_size": batch_meta.get("tokenizer_vocab_size"),
+        "vocab_size": int(batch_meta.get("tokenizer_vocab_size", batch_meta.get("vocab_size", model_vocab_size))),
         "steps": int(steps),
         "losses_before_step": losses,
         "loss_initial": loss_initial,
@@ -454,6 +584,7 @@ def main() -> int:
     parser.add_argument("--enable", action="store_true", help="Run the objective smoke. Otherwise report the disabled default.")
     parser.add_argument("--step", action="store_true", help="Run one DSQG-W-only optimizer step after the objective smoke.")
     parser.add_argument("--overfit-jsonl", type=Path, default=None, help="Run a tiny multi-step JSONL overfit smoke when --enable is also set.")
+    parser.add_argument("--tokenizer", type=Path, default=None, help="Optional tokenizer JSON for real-token-ID lexical-gap overfit smoke.")
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=20260628)
@@ -470,6 +601,7 @@ def main() -> int:
         else:
             report = run_lexical_gap_overfit_smoke(
                 jsonl_path=args.overfit_jsonl,
+                tokenizer_path=args.tokenizer,
                 steps=args.steps,
                 lr=args.lr,
                 seed=args.seed,
