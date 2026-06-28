@@ -263,6 +263,139 @@ def make_synthetic_batch(*, batch: int = 1, seq_len: int = 16, vocab_size: int =
     )
 
 
+def load_lexical_gap_records(path: Path | str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            record = json.loads(stripped)
+            for key in ["tokens", "answer_positions", "question_indices", "hisa_evidence_indices", "l3_skip_indices"]:
+                if key not in record:
+                    raise ValueError(f"{path}:{line_no} missing required key {key!r}")
+            records.append(record)
+    if not records:
+        raise ValueError(f"{path} contained no records")
+    return records
+
+
+def _build_vocab(records: list[dict[str, Any]]) -> dict[str, int]:
+    vocab = {"<pad>": 0}
+    for record in records:
+        for token in record["tokens"]:
+            if token not in vocab:
+                vocab[token] = len(vocab)
+    return vocab
+
+
+def _pad_index_rows(records: list[dict[str, Any]], key: str, width: int | None = None) -> torch.Tensor:
+    if width is None:
+        width = max(len(record[key]) for record in records)
+    out = torch.full((len(records), width), -1, dtype=torch.long)
+    for row, record in enumerate(records):
+        values = [int(value) for value in record[key]][:width]
+        if values:
+            out[row, : len(values)] = torch.tensor(values, dtype=torch.long)
+    return out
+
+
+def build_lexical_gap_batch(records: list[dict[str, Any]]) -> tuple[FrozenDSQGWBatch, dict[str, int]]:
+    vocab = _build_vocab(records)
+    max_len = max(len(record["tokens"]) for record in records)
+    input_ids = torch.zeros((len(records), max_len), dtype=torch.long)
+    labels = torch.zeros_like(input_ids)
+    answer_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    for row, record in enumerate(records):
+        ids = torch.tensor([vocab[token] for token in record["tokens"]], dtype=torch.long)
+        input_ids[row, : ids.numel()] = ids
+        labels[row, : ids.numel()] = ids
+        for pos in record["answer_positions"]:
+            answer_mask[row, int(pos)] = True
+    return (
+        FrozenDSQGWBatch(
+            input_ids=input_ids,
+            labels=labels,
+            answer_mask=answer_mask,
+            question_indices=_pad_index_rows(records, "question_indices"),
+            hisa_evidence_indices=_pad_index_rows(records, "hisa_evidence_indices"),
+            l3_skip_indices=_pad_index_rows(records, "l3_skip_indices"),
+        ),
+        vocab,
+    )
+
+
+def run_lexical_gap_overfit_smoke(
+    *,
+    jsonl_path: Path | str,
+    steps: int = 8,
+    lr: float = 1e-3,
+    seed: int = 20260628,
+) -> dict[str, Any]:
+    records = load_lexical_gap_records(jsonl_path)
+    batch, vocab = build_lexical_gap_batch(records)
+    trainer = load_trainer(enable_objective=True, suffix="lexical_gap_overfit")
+    torch.manual_seed(seed)
+    model = make_tiny_model(
+        trainer,
+        vocab_size=max(128, len(vocab)),
+        ffn_dim=64,
+        seq_len=batch.input_ids.shape[1],
+    )
+    counts = prepare_model_for_frozen_dsqg_w_objective(model)
+    model.train()
+    optimizer = make_dsqg_w_optimizer(model, lr=lr)
+    initial = _param_snapshot(model)
+
+    losses: list[float] = []
+    step_reports: list[dict[str, Any]] = []
+    for _ in range(int(steps)):
+        report = run_one_frozen_dsqg_w_step(model, batch, optimizer)
+        step_reports.append(report)
+        losses.append(float(report["loss_before_step"]))
+    with torch.no_grad():
+        final_result = compute_frozen_dsqg_w_objective(model, batch)
+    loss_final = float(final_result.loss.detach().float().cpu().item())
+    loss_initial = float(losses[0])
+    changed_frozen_final = _changed_names(initial, model, prefix=None)
+    changed_dsqg_w_final = _changed_names(initial, model, prefix="dsqg_w.")
+    min_changed_dsqg_w = min(int(report["changed_dsqg_w_param_count"]) for report in step_reports)
+    max_changed_frozen = max(int(report["changed_frozen_param_count"]) for report in step_reports + [{"changed_frozen_param_count": len(changed_frozen_final)}])
+    telemetry = dict(final_result.telemetry)
+    telemetry.update({key: float(value) for key, value in counts.items()})
+    telemetry.update(
+        {
+            "dsqg_w_overfit_lr": float(lr),
+            "dsqg_w_overfit_steps": float(steps),
+            "dsqg_w_overfit_loss_initial": loss_initial,
+            "dsqg_w_overfit_loss_final": loss_final,
+            "dsqg_w_overfit_loss_delta": loss_final - loss_initial,
+            "dsqg_w_overfit_changed_dsqg_w_param_count": float(len(changed_dsqg_w_final)),
+            "dsqg_w_overfit_changed_frozen_param_count": float(len(changed_frozen_final)),
+        }
+    )
+    return {
+        "enabled": True,
+        "skipped": False,
+        "objective": "frozen_trunk_answer_only_ce_overfit_smoke",
+        "dataset": str(jsonl_path),
+        "dataset_examples": len(records),
+        "vocab_size": len(vocab),
+        "steps": int(steps),
+        "losses_before_step": losses,
+        "loss_initial": loss_initial,
+        "loss_final": loss_final,
+        "loss_delta": loss_final - loss_initial,
+        "answer_tokens": float(batch.answer_mask.sum().item()),
+        "min_changed_dsqg_w_param_count": min_changed_dsqg_w,
+        "changed_dsqg_w_param_count_final": len(changed_dsqg_w_final),
+        "max_changed_frozen_param_count": max_changed_frozen,
+        "changed_frozen_param_names_final": changed_frozen_final,
+        "telemetry": telemetry,
+        "pass": bool(loss_final < loss_initial and min_changed_dsqg_w > 0 and max_changed_frozen == 0),
+    }
+
+
 def run_smoke_objective(*, enable: bool | None = None, seed: int = 20260628, step: bool = False) -> dict[str, Any]:
     if enable is None:
         enable = os.getenv("DWARF_DSQG_W_FROZEN_OBJECTIVE", "0") == "1"
@@ -320,10 +453,29 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Disabled-by-default DSQG-W frozen-trunk answer-only CE smoke")
     parser.add_argument("--enable", action="store_true", help="Run the objective smoke. Otherwise report the disabled default.")
     parser.add_argument("--step", action="store_true", help="Run one DSQG-W-only optimizer step after the objective smoke.")
+    parser.add_argument("--overfit-jsonl", type=Path, default=None, help="Run a tiny multi-step JSONL overfit smoke when --enable is also set.")
+    parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=20260628)
     args = parser.parse_args()
 
-    report = run_smoke_objective(enable=args.enable, seed=args.seed, step=args.step)
+    if args.overfit_jsonl is not None:
+        if not args.enable:
+            report = {
+                "enabled": False,
+                "skipped": True,
+                "reason": "pass --enable to run the DSQG-W lexical-gap overfit smoke",
+                "pass": True,
+            }
+        else:
+            report = run_lexical_gap_overfit_smoke(
+                jsonl_path=args.overfit_jsonl,
+                steps=args.steps,
+                lr=args.lr,
+                seed=args.seed,
+            )
+    else:
+        report = run_smoke_objective(enable=args.enable, seed=args.seed, step=args.step)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["pass"] else 2
 

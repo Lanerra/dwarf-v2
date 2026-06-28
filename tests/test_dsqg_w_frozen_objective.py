@@ -8,6 +8,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/frozen_trunk_objective_dsqg_w.py"
+LEXICAL_GAP_JSONL = ROOT / "audits/dsqg_w_lexical_gap_mini.jsonl"
 
 
 def load_objective_module():
@@ -138,3 +139,43 @@ def test_step_smoke_is_disabled_by_default() -> None:
     assert report["enabled"] is False
     assert report["skipped"] is True
     assert report["pass"] is True
+
+
+def test_build_lexical_gap_batch_from_jsonl_records() -> None:
+    mod = load_objective_module()
+
+    records = mod.load_lexical_gap_records(LEXICAL_GAP_JSONL)
+    batch, vocab = mod.build_lexical_gap_batch(records)
+
+    assert len(records) == 3
+    assert batch.input_ids.shape == batch.labels.shape == batch.answer_mask.shape
+    assert batch.input_ids.shape[0] == 3
+    assert int(batch.answer_mask.sum().item()) == 3
+    assert batch.question_indices.shape == (3, 4)
+    assert batch.hisa_evidence_indices.shape == (3, 4)
+    assert batch.l3_skip_indices.shape == (3, 3)
+    assert vocab["Cu"] == int(batch.labels[0, 19].item())
+    assert vocab["puppy"] == int(batch.labels[1, 19].item())
+    assert vocab["yellow"] == int(batch.labels[2, 19].item())
+
+
+def test_multistep_lexical_gap_smoke_reduces_loss_and_keeps_trunk_frozen() -> None:
+    mod = load_objective_module()
+
+    report = mod.run_lexical_gap_overfit_smoke(
+        jsonl_path=LEXICAL_GAP_JSONL,
+        steps=4,
+        lr=1e-3,
+        seed=20260628,
+    )
+
+    assert report["pass"] is True
+    assert report["enabled"] is True
+    assert report["objective"] == "frozen_trunk_answer_only_ce_overfit_smoke"
+    assert report["steps"] == 4
+    assert report["dataset_examples"] == 3
+    assert report["answer_tokens"] == pytest.approx(3.0)
+    assert report["loss_final"] < report["loss_initial"]
+    assert report["loss_delta"] < 0.0
+    assert report["max_changed_frozen_param_count"] == 0
+    assert report["min_changed_dsqg_w_param_count"] > 0
