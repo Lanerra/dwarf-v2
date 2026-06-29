@@ -305,10 +305,76 @@ def test_width_pair_transfer_loss_rewards_question_evidence_lateral_mass() -> No
     loss = width_pair_transfer_loss(probs, cand_types, cand_mask)
     loss.backward()
 
-    assert loss.item() == pytest.approx(-torch.log(torch.tensor(0.65)).item(), rel=1e-5)
+    expected = -0.5 * (torch.log(torch.tensor(0.70)) + torch.log(torch.tensor(0.60)))
+    assert loss.item() == pytest.approx(expected.item(), rel=1e-5)
     assert probs.grad is not None
     assert probs.grad[0, 0, 0, 1].item() < 0.0
     assert probs.grad[0, 0, 1, 0].item() < 0.0
+    # Balanced geometric pressure penalizes the weaker reverse direction more strongly.
+    assert abs(probs.grad[0, 0, 1, 0].item()) > abs(probs.grad[0, 0, 0, 1].item())
+
+
+def test_width_pair_transfer_loss_penalizes_one_way_collapse() -> None:
+    cand_types = torch.tensor([[[
+        int(CandidateType.QUESTION),
+        int(CandidateType.HISA_EVIDENCE),
+        int(CandidateType.LOCAL),
+    ]]])
+    cand_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+    balanced = torch.tensor([[[
+        [0.20, 0.45, 0.35],
+        [0.45, 0.20, 0.35],
+        [0.20, 0.20, 0.60],
+    ]]])
+    collapsed = torch.tensor([[[
+        [0.01, 0.89, 0.10],
+        [0.01, 0.89, 0.10],
+        [0.20, 0.20, 0.60],
+    ]]])
+
+    balanced_loss = width_pair_transfer_loss(balanced, cand_types, cand_mask)
+    collapsed_loss = width_pair_transfer_loss(collapsed, cand_types, cand_mask)
+
+    assert collapsed_loss.item() > balanced_loss.item()
+
+
+def test_width_pair_transfer_loss_adds_entropy_floor_penalty() -> None:
+    cand_types = torch.tensor([[[
+        int(CandidateType.QUESTION),
+        int(CandidateType.HISA_EVIDENCE),
+        int(CandidateType.LOCAL),
+    ]]])
+    cand_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+    high_entropy = torch.tensor([[[
+        [0.275, 0.45, 0.275],
+        [0.45, 0.275, 0.275],
+        [0.30, 0.30, 0.40],
+    ]]])
+    low_entropy = torch.tensor([[[
+        [0.01, 0.45, 0.54],
+        [0.45, 0.01, 0.54],
+        [0.01, 0.01, 0.98],
+    ]]])
+
+    high = width_pair_transfer_loss(
+        high_entropy,
+        cand_types,
+        cand_mask,
+        entropy_floor=1.0,
+        entropy_weight=0.5,
+    )
+    low = width_pair_transfer_loss(
+        low_entropy,
+        cand_types,
+        cand_mask,
+        entropy_floor=1.0,
+        entropy_weight=0.5,
+    )
+    no_floor_high = width_pair_transfer_loss(high_entropy, cand_types, cand_mask)
+    no_floor_low = width_pair_transfer_loss(low_entropy, cand_types, cand_mask)
+
+    assert no_floor_high.item() == pytest.approx(no_floor_low.item(), rel=1e-5)
+    assert low.item() > high.item()
 
 
 def test_dsqg_w_block_is_causal_under_future_token_changes() -> None:

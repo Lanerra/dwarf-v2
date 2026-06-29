@@ -61,6 +61,8 @@ class DSQGWConfig:
     width_bottleneck: int = 64
     width_gate_init: float = -5.0
     width_self_bias_init: float = 0.0
+    width_entropy_floor: float = 0.0
+    width_entropy_weight: float = 0.0
 
     def __post_init__(self) -> None:
         if self.d <= 0:
@@ -75,6 +77,10 @@ class DSQGWConfig:
             raise ValueError("n_sources must cover all CandidateSource values")
         if self.width_bottleneck <= 0:
             raise ValueError("width_bottleneck must be positive")
+        if self.width_entropy_floor < 0.0:
+            raise ValueError("width_entropy_floor must be non-negative")
+        if self.width_entropy_weight < 0.0:
+            raise ValueError("width_entropy_weight must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -504,6 +510,8 @@ def width_pair_transfer_loss(
     cand_mask: torch.Tensor,
     *,
     eps: float = 1e-8,
+    entropy_floor: float = 0.0,
+    entropy_weight: float = 0.0,
 ) -> torch.Tensor:
     """Directional width-transfer loss for QUESTION <-> HISA_EVIDENCE lateral mass."""
     if probs.ndim == 5:
@@ -529,8 +537,16 @@ def width_pair_transfer_loss(
 
     q_to_hisa = direction_mass(CandidateType.QUESTION, CandidateType.HISA_EVIDENCE)
     hisa_to_q = direction_mass(CandidateType.HISA_EVIDENCE, CandidateType.QUESTION)
-    transfer_mass = 0.5 * (q_to_hisa + hisa_to_q)
-    return -torch.log(transfer_mass.clamp_min(float(eps)))
+    transfer_loss = -0.5 * (
+        torch.log(q_to_hisa.clamp_min(float(eps)))
+        + torch.log(hisa_to_q.clamp_min(float(eps)))
+    )
+    if entropy_weight <= 0.0 or entropy_floor <= 0.0:
+        return transfer_loss
+    p_safe = p.clamp_min(float(eps))
+    entropy = -(p_safe * p_safe.log()).sum(dim=-1).masked_select(valid_targets).mean()
+    entropy_penalty = torch.relu(entropy.new_tensor(float(entropy_floor)) - entropy)
+    return transfer_loss + float(entropy_weight) * entropy_penalty
 
 
 class DSQGWWidthCell(nn.Module):
@@ -546,6 +562,8 @@ class DSQGWWidthCell(nn.Module):
         bottleneck: int,
         gate_init: float = -5.0,
         self_bias_init: float = 0.0,
+        entropy_floor: float = 0.0,
+        entropy_weight: float = 0.0,
     ) -> None:
         super().__init__()
         if d % n_heads != 0:
@@ -557,6 +575,8 @@ class DSQGWWidthCell(nn.Module):
             raise ValueError("width bottleneck must be divisible by n_heads")
         self.n_types = int(n_types)
         self.n_sources = int(n_sources)
+        self.entropy_floor = float(entropy_floor)
+        self.entropy_weight = float(entropy_weight)
 
         self.norm_c = nn.LayerNorm(d)
         self.q_proj = nn.Linear(d, self.width_dim, bias=False)
@@ -623,7 +643,9 @@ class DSQGWWidthCell(nn.Module):
             return mass.masked_select(target_mask).mean()
 
         delta_norm = delta.masked_select(cand_mask[..., None]).reshape(-1, d).norm(dim=-1).mean()
-        aux_loss = width_pair_transfer_loss(p_mean, cand_types, cand_mask)
+        transfer_aux_loss = width_pair_transfer_loss(p_mean, cand_types, cand_mask)
+        entropy_penalty = torch.relu(entropy.new_tensor(self.entropy_floor) - entropy)
+        aux_loss = transfer_aux_loss + self.entropy_weight * entropy_penalty
         telemetry = {
             "dsqg_w_width_entropy": entropy.detach(),
             "dsqg_w_width_self_mass": self_mass.detach(),
@@ -633,6 +655,10 @@ class DSQGWWidthCell(nn.Module):
             "dsqg_w_width_delta_norm": delta_norm.detach(),
             "dsqg_w_width_aux_loss": aux_loss,
             "dsqg_w_width_aux_loss_value": aux_loss.detach(),
+            "dsqg_w_width_transfer_aux_loss": transfer_aux_loss.detach(),
+            "dsqg_w_width_entropy_penalty": entropy_penalty.detach(),
+            "dsqg_w_width_entropy_floor": entropy.new_tensor(self.entropy_floor).detach(),
+            "dsqg_w_width_entropy_weight": entropy.new_tensor(self.entropy_weight).detach(),
             "dsqg_w_width_question_to_hisa_evidence_mass": pair_mass(
                 CandidateType.QUESTION, CandidateType.HISA_EVIDENCE
             ).detach(),
@@ -668,6 +694,8 @@ class DSQGWBlock(nn.Module):
         width_bottleneck: int = 64,
         width_gate_init: float = -5.0,
         width_self_bias_init: float = 0.0,
+        width_entropy_floor: float = 0.0,
+        width_entropy_weight: float = 0.0,
     ) -> None:
         super().__init__()
         if d % n_heads != 0:
@@ -688,6 +716,8 @@ class DSQGWBlock(nn.Module):
                 bottleneck=width_bottleneck,
                 gate_init=width_gate_init,
                 self_bias_init=width_self_bias_init,
+                entropy_floor=width_entropy_floor,
+                entropy_weight=width_entropy_weight,
             )
             if use_width_cell
             else None
@@ -728,6 +758,8 @@ class DSQGWBlock(nn.Module):
             width_bottleneck=config.width_bottleneck,
             width_gate_init=config.width_gate_init,
             width_self_bias_init=config.width_self_bias_init,
+            width_entropy_floor=config.width_entropy_floor,
+            width_entropy_weight=config.width_entropy_weight,
         )
 
     def forward(

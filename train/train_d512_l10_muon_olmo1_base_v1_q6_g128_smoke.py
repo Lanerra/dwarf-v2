@@ -350,6 +350,8 @@ DSQG_W_WIDTH_CELL = os.getenv('DWARF_DSQG_W_WIDTH_CELL', '0') == '1'
 DSQG_W_WIDTH_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_WIDTH_BOTTLENECK', '64'))
 DSQG_W_WIDTH_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_WIDTH_GATE_INIT', '-5.0'))
 DSQG_W_WIDTH_AUX_WEIGHT = float(os.environ.get('DWARF_DSQG_W_WIDTH_AUX_WEIGHT', '0.0'))
+DSQG_W_WIDTH_ENTROPY_FLOOR = float(os.environ.get('DWARF_DSQG_W_WIDTH_ENTROPY_FLOOR', '1.5'))
+DSQG_W_WIDTH_ENTROPY_WEIGHT = float(os.environ.get('DWARF_DSQG_W_WIDTH_ENTROPY_WEIGHT', '0.25'))
 DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2, 4, 8))
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
 DSQG_W_QUESTION_ENABLED = os.getenv('DWARF_DSQG_W_QUESTION', '0') == '1'
@@ -3016,6 +3018,8 @@ class TriadicJ96Dsr(nn.Module):
                 use_width_cell=DSQG_W_WIDTH_CELL,
                 width_bottleneck=DSQG_W_WIDTH_BOTTLENECK,
                 width_gate_init=DSQG_W_WIDTH_GATE_INIT,
+                width_entropy_floor=DSQG_W_WIDTH_ENTROPY_FLOOR,
+                width_entropy_weight=DSQG_W_WIDTH_ENTROPY_WEIGHT,
             )
             self.dsqg_w_candidate_provider = CandidateProvider(self.dsqg_w_config)
             for site_key in self.dsqg_w_site_keys:
@@ -3358,6 +3362,8 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'width_bottleneck': DSQG_W_WIDTH_BOTTLENECK,
                 'width_gate_init': DSQG_W_WIDTH_GATE_INIT,
                 'width_aux_weight': DSQG_W_WIDTH_AUX_WEIGHT,
+                'width_entropy_floor': DSQG_W_WIDTH_ENTROPY_FLOOR,
+                'width_entropy_weight': DSQG_W_WIDTH_ENTROPY_WEIGHT,
                 'local_offsets': list(DSQG_W_LOCAL_OFFSETS),
                 'long_offsets': list(DSQG_W_LONG_OFFSETS),
                 'question_enabled': DSQG_W_QUESTION_ENABLED,
@@ -3819,6 +3825,7 @@ def train():
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
               f'width_cell={DSQG_W_WIDTH_CELL} width_bottleneck={DSQG_W_WIDTH_BOTTLENECK} '
               f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} width_aux_weight={DSQG_W_WIDTH_AUX_WEIGHT} '
+              f'width_entropy_floor={DSQG_W_WIDTH_ENTROPY_FLOOR} width_entropy_weight={DSQG_W_WIDTH_ENTROPY_WEIGHT} '
               f'candidates={candidate_path}')
     else:
         print('  DSQG-W recomposer: disabled')
