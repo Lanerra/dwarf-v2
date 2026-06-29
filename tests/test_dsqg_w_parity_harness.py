@@ -47,6 +47,31 @@ def test_parity_harness_reference_backend_matches_itself(tmp_path: Path) -> None
     assert saved["answer_logits_max_abs_diff"] == pytest.approx(0.0)
 
 
+def test_parity_harness_compares_all_configured_dsqg_w_sites(tmp_path: Path) -> None:
+    mod = load_parity_module()
+
+    report = mod.run_parity_harness(
+        tokenizer_path=TOKENIZER,
+        output_dir=tmp_path / "parity_multisite",
+        train_size=8,
+        val_size=4,
+        seed=20260628,
+        candidate_backend="reference",
+        dsqg_w_sites="2,6,final",
+    )
+
+    assert report["pass"] is True
+    assert report["dsqg_w_sites"] == ["layer_2", "layer_6", "final"]
+    assert report["dsqg_w_site_count"] == 3
+    assert report["site_output_max_abs_diff"] == pytest.approx(0.0)
+    assert set(report["site_output_max_abs_diffs"]) == {"layer_2", "layer_6", "final"}
+    assert all(value == pytest.approx(0.0) for value in report["site_output_max_abs_diffs"].values())
+    assert report["reference_site_output_call_counts"] == {"layer_2": 1, "layer_6": 1, "final": 1}
+    assert report["candidate_site_output_call_counts"] == {"layer_2": 1, "layer_6": 1, "final": 1}
+    saved = json.loads(Path(report["report_path"]).read_text())
+    assert saved["site_output_max_abs_diff"] == pytest.approx(0.0)
+
+
 def test_parity_harness_rejects_unknown_candidate_backend(tmp_path: Path) -> None:
     mod = load_parity_module()
 

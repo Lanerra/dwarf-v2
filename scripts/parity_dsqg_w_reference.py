@@ -50,6 +50,74 @@ def _rank_metrics(micro, result, batch, *, prefix: str) -> dict[str, float]:
     return {key: float(value) for key, value in raw.items()}
 
 
+def _register_site_output_hooks(model) -> tuple[dict[str, list[torch.Tensor]], list[Any]]:
+    captures: dict[str, list[torch.Tensor]] = {}
+    handles: list[Any] = []
+    blocks = getattr(model, "dsqg_w_blocks", None)
+    if blocks is None:
+        block = getattr(model, "dsqg_w", None)
+        if block is None:
+            return captures, handles
+        captures["final"] = []
+
+        def final_hook(_module, _inputs, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            if torch.is_tensor(tensor):
+                captures["final"].append(tensor.detach().cpu())
+
+        handles.append(block.register_forward_hook(final_hook))
+        return captures, handles
+
+    for site_key, block in blocks.items():
+        key = str(site_key)
+        captures[key] = []
+
+        def hook(_module, _inputs, output, *, capture_key=key):
+            tensor = output[0] if isinstance(output, tuple) else output
+            if torch.is_tensor(tensor):
+                captures[capture_key].append(tensor.detach().cpu())
+
+        handles.append(block.register_forward_hook(hook))
+    return captures, handles
+
+
+def _compute_with_site_captures(obj, model, batch):
+    captures, handles = _register_site_output_hooks(model)
+    try:
+        result = obj.compute_frozen_dsqg_w_objective(model, batch)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return result, captures
+
+
+def _site_output_diffs(
+    ref_captures: dict[str, list[torch.Tensor]],
+    cand_captures: dict[str, list[torch.Tensor]],
+) -> tuple[float, dict[str, float], dict[str, int], dict[str, int], bool]:
+    site_keys = sorted(set(ref_captures) | set(cand_captures))
+    diffs: dict[str, float] = {}
+    ref_counts = {key: len(ref_captures.get(key, [])) for key in site_keys}
+    cand_counts = {key: len(cand_captures.get(key, [])) for key in site_keys}
+    counts_match = ref_counts == cand_counts
+    for key in site_keys:
+        ref_items = ref_captures.get(key, [])
+        cand_items = cand_captures.get(key, [])
+        if len(ref_items) != len(cand_items):
+            diffs[key] = float("inf")
+            continue
+        per_call: list[float] = []
+        for ref_tensor, cand_tensor in zip(ref_items, cand_items):
+            if tuple(ref_tensor.shape) != tuple(cand_tensor.shape):
+                per_call.append(float("inf"))
+            elif ref_tensor.numel() == 0:
+                per_call.append(0.0)
+            else:
+                per_call.append(_max_abs_diff(ref_tensor, cand_tensor))
+        diffs[key] = max(per_call) if per_call else 0.0
+    return (max(diffs.values()) if diffs else 0.0), diffs, ref_counts, cand_counts, counts_match
+
+
 def _scalar_telemetry_diff(a: dict[str, Any], b: dict[str, Any]) -> tuple[float, dict[str, float]]:
     diffs: dict[str, float] = {}
     for key in sorted(set(a) & set(b)):
@@ -80,6 +148,7 @@ def run_parity_harness(
     val_size: int = 16,
     seed: int = 20260628,
     candidate_backend: str = "reference",
+    dsqg_w_sites: str | None = None,
     atol: float = 0.0,
 ) -> dict[str, Any]:
     if candidate_backend != "reference":
@@ -96,15 +165,16 @@ def run_parity_harness(
     vocab_size = int(val_meta["tokenizer_vocab_size"])
     seq_len = int(val_batch.input_ids.shape[1])
 
-    trainer = obj.load_trainer(enable_objective=True, suffix="parity")
+    trainer = obj.load_trainer(enable_objective=True, suffix="parity", dsqg_w_sites=dsqg_w_sites)
     reference_model = _make_reference_model(obj, trainer, seed=seed, vocab_size=vocab_size, seq_len=seq_len)
     candidate_model = _make_reference_model(obj, trainer, seed=seed, vocab_size=vocab_size, seq_len=seq_len)
     candidate_model.load_state_dict(reference_model.state_dict(), strict=True)
     candidate_model.eval()
+    dsqg_w_site_keys = list(getattr(reference_model, "dsqg_w_site_keys", ("final",)))
 
     with torch.no_grad():
-        ref = obj.compute_frozen_dsqg_w_objective(reference_model, val_batch)
-        cand = obj.compute_frozen_dsqg_w_objective(candidate_model, val_batch)
+        ref, ref_site_outputs = _compute_with_site_captures(obj, reference_model, val_batch)
+        cand, cand_site_outputs = _compute_with_site_captures(obj, candidate_model, val_batch)
 
     answer_diff = _max_abs_diff(_answer_logits(ref.logits, val_batch.answer_mask), _answer_logits(cand.logits, val_batch.answer_mask))
     full_diff = _max_abs_diff(ref.logits, cand.logits)
@@ -115,6 +185,10 @@ def run_parity_harness(
     rank_diffs = {key: abs(ref_rank[key] - cand_rank[key]) for key in sorted(ref_rank)}
     rank_metric_max_abs_diff = max(rank_diffs.values()) if rank_diffs else 0.0
     telemetry_max_abs_diff, telemetry_diffs = _scalar_telemetry_diff(ref.telemetry, cand.telemetry)
+    site_output_max_abs_diff, site_output_diffs, ref_site_counts, cand_site_counts, site_counts_match = _site_output_diffs(
+        ref_site_outputs,
+        cand_site_outputs,
+    )
 
     reference_summary = {
         "loss": float(ref.loss.detach().cpu().item()),
@@ -131,10 +205,14 @@ def run_parity_harness(
             and answer_diff <= float(atol)
             and rank_metric_max_abs_diff <= float(atol)
             and telemetry_max_abs_diff <= float(atol)
+            and site_output_max_abs_diff <= float(atol)
+            and site_counts_match
         ),
         "objective": "dsqg_w_reference_candidate_parity",
         "reference_backend": "reference",
         "candidate_backend": candidate_backend,
+        "dsqg_w_sites": dsqg_w_site_keys,
+        "dsqg_w_site_count": len(dsqg_w_site_keys),
         "tokenizer_path": str(tokenizer_path),
         "tokenizer_vocab_size": vocab_size,
         "train_examples": len(train_records),
@@ -148,6 +226,11 @@ def run_parity_harness(
         "rank_metric_abs_diffs": rank_diffs,
         "scalar_telemetry_max_abs_diff": telemetry_max_abs_diff,
         "scalar_telemetry_abs_diffs": telemetry_diffs,
+        "site_output_max_abs_diff": site_output_max_abs_diff,
+        "site_output_max_abs_diffs": site_output_diffs,
+        "reference_site_output_call_counts": ref_site_counts,
+        "candidate_site_output_call_counts": cand_site_counts,
+        "site_output_call_counts_match": site_counts_match,
         "reference": reference_summary,
         "candidate": candidate_summary,
     }
@@ -166,6 +249,7 @@ def main() -> int:
     parser.add_argument("--val-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=20260628)
     parser.add_argument("--candidate-backend", default="reference")
+    parser.add_argument("--dsqg-w-sites", default=None, help="Comma-separated DSQG-W sites to compare, e.g. final or 2,6,final.")
     parser.add_argument("--atol", type=float, default=0.0)
     args = parser.parse_args()
 
@@ -184,6 +268,7 @@ def main() -> int:
             val_size=args.val_size,
             seed=args.seed,
             candidate_backend=args.candidate_backend,
+            dsqg_w_sites=args.dsqg_w_sites,
             atol=args.atol,
         )
         report["enabled"] = True
