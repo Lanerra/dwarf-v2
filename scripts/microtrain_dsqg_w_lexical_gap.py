@@ -149,12 +149,19 @@ def _loss_and_rank_metrics(obj, model, batch, *, prefix: str) -> tuple[float, di
     return loss, answer_rank_metrics(result.logits, batch.labels, batch.answer_mask, prefix=prefix)
 
 
+def _is_dsqg_w_param_name(name: str) -> bool:
+    return name.startswith("dsqg_w.") or name.startswith("dsqg_w_blocks.")
+
+
 def _changed_names(before: dict[str, torch.Tensor], model, *, prefix: str | None) -> list[str]:
     changed: list[str] = []
     for name, param in model.named_parameters():
-        if prefix is not None and not name.startswith(prefix):
+        if prefix == "dsqg_w.":
+            if not _is_dsqg_w_param_name(name):
+                continue
+        elif prefix is not None and not name.startswith(prefix):
             continue
-        if prefix is None and name.startswith("dsqg_w."):
+        if prefix is None and _is_dsqg_w_param_name(name):
             continue
         old = before.get(name)
         if old is not None and not torch.equal(old, param.detach()):
@@ -175,6 +182,7 @@ def run_microtrain(
     steps: int = 16,
     lr: float = 1e-3,
     seed: int = 20260628,
+    dsqg_w_sites: str | None = None,
 ) -> dict[str, Any]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -189,7 +197,7 @@ def run_microtrain(
     vocab_size = int(train_meta["tokenizer_vocab_size"])
     seq_len = max(int(train_batch.input_ids.shape[1]), int(val_batch.input_ids.shape[1]))
 
-    trainer = obj.load_trainer(enable_objective=True, suffix="microtrain")
+    trainer = obj.load_trainer(enable_objective=True, suffix="microtrain", dsqg_w_sites=dsqg_w_sites)
     torch.manual_seed(seed)
     model = obj.make_tiny_model(trainer, vocab_size=vocab_size, ffn_dim=64, seq_len=seq_len)
     obj.prepare_model_for_frozen_dsqg_w_objective(model)
@@ -225,6 +233,8 @@ def run_microtrain(
             "val_jsonl": str(output / "val.jsonl"),
             "steps": int(steps),
             "lr": float(lr),
+            "dsqg_w_sites": list(getattr(model, "dsqg_w_site_keys", ("final",))),
+            "dsqg_w_site_count": len(getattr(model, "dsqg_w_site_keys", ("final",))),
             "train_loss_initial": train_initial,
             "train_loss_final": train_final,
             "val_loss_initial": val_initial,
@@ -274,6 +284,9 @@ def run_microtrain(
         "val_examples": len(val_records),
         "steps": int(steps),
         "lr": float(lr),
+        "dsqg_w_sites": list(getattr(model, "dsqg_w_site_keys", ("final",))),
+        "dsqg_w_site_count": len(getattr(model, "dsqg_w_site_keys", ("final",))),
+        "dsqg_w_trainable_param_count": sum(param.numel() for name, param in model.named_parameters() if obj.is_dsqg_w_param_name(name)),
         "train_loss_initial": train_initial,
         "train_loss_final": train_final,
         "train_loss_delta": train_final - train_initial,
@@ -311,6 +324,7 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=20260628)
+    parser.add_argument("--dsqg-w-sites", default=None, help="Comma-separated DSQG-W sites, e.g. final, 6,final, or 2,6,final.")
     args = parser.parse_args()
 
     if not args.enable:
@@ -329,6 +343,7 @@ def main() -> int:
             steps=args.steps,
             lr=args.lr,
             seed=args.seed,
+            dsqg_w_sites=args.dsqg_w_sites,
         )
         report["enabled"] = True
         report["skipped"] = False

@@ -58,9 +58,24 @@ def test_prepare_model_freezes_trunk_and_leaves_only_dsqg_w_trainable(monkeypatc
     assert counts["frozen_param_count"] > counts["trainable_param_count"]
     trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
     assert trainable_names
-    assert all(name.startswith("dsqg_w.") for name in trainable_names)
+    assert all(mod.is_dsqg_w_param_name(name) for name in trainable_names)
     assert not model.embedding.weight.requires_grad
     assert not model.out.weight.requires_grad
+
+
+def test_prepare_model_trains_all_configured_dsqg_w_sites(monkeypatch) -> None:
+    monkeypatch.setenv("DWARF_DSQG_W_SITES", "2,final")
+    mod = load_objective_module()
+    trainer = mod.load_trainer(enable_objective=True, suffix="multi_site_freeze_test", dsqg_w_sites="2,final")
+    model = mod.make_tiny_model(trainer, vocab_size=128, ffn_dim=64, seq_len=16)
+
+    mod.prepare_model_for_frozen_dsqg_w_objective(model)
+
+    trainable_names = [name for name, param in model.named_parameters() if param.requires_grad]
+    assert trainable_names
+    assert all(mod.is_dsqg_w_param_name(name) for name in trainable_names)
+    assert any(name.startswith("dsqg_w_blocks.layer_2.") for name in trainable_names)
+    assert any(name.startswith("dsqg_w_blocks.final.") for name in trainable_names)
 
 
 def test_answer_only_ce_objective_backprops_only_dsqg_w_parameters(monkeypatch) -> None:
@@ -82,7 +97,7 @@ def test_answer_only_ce_objective_backprops_only_dsqg_w_parameters(monkeypatch) 
 
     grad_names = {name for name, param in model.named_parameters() if param.grad is not None and param.grad.abs().sum() > 0}
     assert grad_names
-    assert all(name.startswith("dsqg_w.") for name in grad_names)
+    assert all(mod.is_dsqg_w_param_name(name) for name in grad_names)
     assert model.embedding.weight.grad is None
     assert model.out.weight.grad is None
 
@@ -108,7 +123,7 @@ def test_single_optimizer_step_updates_only_dsqg_w_parameters() -> None:
     before = {
         name: param.detach().clone()
         for name, param in model.named_parameters()
-        if name.startswith("dsqg_w.") or name in {"embedding.weight", "norm.weight"}
+        if mod.is_dsqg_w_param_name(name) or name in {"embedding.weight", "norm.weight"}
     }
     before_embedding = model.embedding.weight.detach().clone()
     before_out = model.out.weight.detach().clone()
@@ -126,7 +141,7 @@ def test_single_optimizer_step_updates_only_dsqg_w_parameters() -> None:
     changed_dsqg_w = [
         name
         for name, old in before.items()
-        if name.startswith("dsqg_w.") and not torch.equal(old, dict(model.named_parameters())[name].detach())
+        if mod.is_dsqg_w_param_name(name) and not torch.equal(old, dict(model.named_parameters())[name].detach())
     ]
     assert changed_dsqg_w
     torch.testing.assert_close(before_embedding, model.embedding.weight.detach())

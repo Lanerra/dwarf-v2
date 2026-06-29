@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TRAINER = ROOT / "train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py"
 
 
-def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: bool = False):
+def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: bool = False, sites: str | None = None):
     monkeypatch.setenv("DWARF_DISABLE_BNB", "1")
     monkeypatch.setenv("DWARF_LIGER", "0")
     monkeypatch.setenv("DWARF_TORCH_COMPILE", "0")
@@ -19,6 +19,10 @@ def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: 
         monkeypatch.setenv("DWARF_DSQG_W", "1")
         monkeypatch.setenv("DWARF_DSQG_W_MAX_CANDIDATES", "16")
         monkeypatch.setenv("DWARF_DSQG_W_BOTTLENECK", "64")
+        if sites is not None:
+            monkeypatch.setenv("DWARF_DSQG_W_SITES", sites)
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_SITES", raising=False)
         if question:
             monkeypatch.setenv("DWARF_DSQG_W_QUESTION", "1")
             monkeypatch.setenv("DWARF_DSQG_W_K_QUESTION", "4")
@@ -32,6 +36,7 @@ def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: 
             monkeypatch.delenv("DWARF_DSQG_W_HISA_L3", raising=False)
     else:
         monkeypatch.delenv("DWARF_DSQG_W", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_SITES", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_QUESTION", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_HISA_L3", raising=False)
     sys.path.insert(0, str(ROOT))
@@ -219,3 +224,26 @@ def test_forward_accepts_optional_dsqg_w_hisa_l3_indices(monkeypatch) -> None:
     assert l3_states is not None
     assert seen_hisa is hisa_indices
     assert seen_l3_skip is l3_skip_indices
+
+
+def test_dsqg_w_sites_apply_layer_and_final_recomposers_in_order(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True, sites="2,final")
+    model = make_model(mod)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in model.blocks])
+    model.norm = torch.nn.Identity()
+    idx = torch.randint(0, 128, (1, 8), dtype=torch.long)
+    calls = []
+
+    assert mod.DSQG_W_SITE_SPECS == (2, "final")
+    assert model.dsqg_w_site_keys == ("layer_2", "final")
+    assert set(model.dsqg_w_blocks.keys()) == {"layer_2", "final"}
+    assert model.dsqg_w is model.dsqg_w_blocks["final"]
+
+    def fake_apply(x, **kwargs):
+        calls.append(kwargs.get("site_key"))
+        return x
+
+    model._apply_dsqg_w_recomposer = fake_apply  # type: ignore[method-assign]
+    _ = model.forward_hidden(idx)
+
+    assert calls == ["layer_2", "final"]

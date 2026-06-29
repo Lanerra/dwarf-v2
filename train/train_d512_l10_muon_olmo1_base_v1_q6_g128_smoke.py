@@ -355,6 +355,37 @@ DSQG_W_K_HISA_EVIDENCE = int(os.environ.get('DWARF_DSQG_W_K_HISA_EVIDENCE', '8')
 DSQG_W_K_L3_SKIP = int(os.environ.get('DWARF_DSQG_W_K_L3_SKIP', '4')) if DSQG_W_HISA_L3_ENABLED else 0
 
 
+def _parse_dsqg_w_site_specs(raw: str | None):
+    spec = 'final' if raw is None or str(raw).strip() == '' else str(raw).strip()
+    out = []
+    seen = set()
+    for part in spec.split(','):
+        item = part.strip().lower()
+        if not item:
+            continue
+        if item in ('final', 'f'):
+            value = 'final'
+        else:
+            if item.startswith('layer_'):
+                item = item[len('layer_'):]
+            value = int(item)
+            if value < 0 or value >= NUM_LAYERS:
+                raise ValueError(f'DWARF_DSQG_W_SITES layer index {value} outside [0, {NUM_LAYERS - 1}]')
+        if value not in seen:
+            out.append(value)
+            seen.add(value)
+    if not out:
+        raise ValueError('DWARF_DSQG_W_SITES did not contain any site entries')
+    return tuple(out)
+
+
+DSQG_W_SITE_SPECS = _parse_dsqg_w_site_specs(os.getenv('DWARF_DSQG_W_SITES'))
+
+
+def _dsqg_w_site_key(site):
+    return 'final' if site == 'final' else f'layer_{int(site)}'
+
+
 def _dsqg_w_candidate_path_label():
     parts = ['LOCAL', 'LONG']
     if DSQG_W_QUESTION_ENABLED:
@@ -2925,6 +2956,15 @@ class TriadicJ96Dsr(nn.Module):
         self.dsqg_w_config = None
         self.dsqg_w_candidate_provider = None
         self.dsqg_w = None
+        self.dsqg_w_blocks = nn.ModuleDict()
+        self.dsqg_w_site_specs = tuple(DSQG_W_SITE_SPECS)
+        self.dsqg_w_site_keys = tuple(_dsqg_w_site_key(site) for site in self.dsqg_w_site_specs)
+        self.dsqg_w_layer_site_map = {
+            int(site): _dsqg_w_site_key(site)
+            for site in self.dsqg_w_site_specs
+            if site != 'final'
+        }
+        self.dsqg_w_has_final_site = 'final' in self.dsqg_w_site_specs
         self.dsqg_w_last_telemetry = {}
         self._init_weights(scale_embed_init_val)
         if self.dsqg_w_enabled:
@@ -2944,7 +2984,12 @@ class TriadicJ96Dsr(nn.Module):
                 k_l3_skip=DSQG_W_K_L3_SKIP,
             )
             self.dsqg_w_candidate_provider = CandidateProvider(self.dsqg_w_config)
-            self.dsqg_w = DSQGWBlock.from_config(self.dsqg_w_config)
+            for site_key in self.dsqg_w_site_keys:
+                self.dsqg_w_blocks[site_key] = DSQGWBlock.from_config(self.dsqg_w_config)
+            if self.dsqg_w_has_final_site:
+                self.dsqg_w = self.dsqg_w_blocks['final']
+            elif self.dsqg_w_site_keys:
+                self.dsqg_w = self.dsqg_w_blocks[self.dsqg_w_site_keys[0]]
 
     def _init_weights(self, scale_embed_init_val):
         for m in self.modules():
@@ -2986,7 +3031,15 @@ class TriadicJ96Dsr(nn.Module):
                                                 _sac_policy_fn))
         return grad_ckpt(block, x, use_reentrant=False)
 
-    def _forward_trunk(self, idx, *, collect_l3_state=False):
+    def _forward_trunk(
+        self,
+        idx,
+        *,
+        collect_l3_state=False,
+        dsqg_w_question_indices=None,
+        dsqg_w_hisa_evidence_indices=None,
+        dsqg_w_l3_skip_indices=None,
+    ):
         x = self.drop(self.embedding(idx))
         l3_state = None
         for i, block in enumerate(self.blocks):
@@ -2996,6 +3049,15 @@ class TriadicJ96Dsr(nn.Module):
                 x = block(x)
             if collect_l3_state and i == self.dsr_layer:
                 l3_state = x
+            if self.dsqg_w_enabled and i in self.dsqg_w_layer_site_map:
+                x = self._apply_dsqg_w_recomposer(
+                    x,
+                    site_key=self.dsqg_w_layer_site_map[i],
+                    question_indices=dsqg_w_question_indices,
+                    l3_states=l3_state,
+                    hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                    l3_skip_indices=dsqg_w_l3_skip_indices,
+                )
         if collect_l3_state:
             return x, l3_state if l3_state is not None else x
         return x
@@ -3004,6 +3066,7 @@ class TriadicJ96Dsr(nn.Module):
         self,
         x,
         *,
+        site_key='final',
         question_indices=None,
         l3_states=None,
         hisa_evidence_indices=None,
@@ -3014,6 +3077,9 @@ class TriadicJ96Dsr(nn.Module):
             return x
         if self.dsqg_w is None or self.dsqg_w_candidate_provider is None:
             raise RuntimeError('DSQG-W is enabled but its block/provider was not initialized')
+        if site_key not in self.dsqg_w_blocks:
+            return x
+        block = self.dsqg_w_blocks[site_key]
         candidates = self.dsqg_w_candidate_provider.build(
             x,
             l3_states=l3_states,
@@ -3021,7 +3087,7 @@ class TriadicJ96Dsr(nn.Module):
             hisa_evidence_indices=hisa_evidence_indices,
             l3_skip_indices=l3_skip_indices,
         )
-        x_out, telemetry = self.dsqg_w(
+        x_out, telemetry = block(
             x,
             candidates.cand_states,
             candidates.cand_types,
@@ -3030,6 +3096,7 @@ class TriadicJ96Dsr(nn.Module):
         )
         merged_telemetry = dict(candidates.telemetry)
         merged_telemetry.update(telemetry)
+        merged_telemetry['dsqg_w_site_key'] = site_key
         self.dsqg_w_last_telemetry = merged_telemetry
         return x_out
 
@@ -3042,17 +3109,26 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_l3_skip_indices=None,
     ):
         if self.dsqg_w_enabled:
-            trunk_out, l3_state = self._forward_trunk(idx, collect_l3_state=True)
+            trunk_out, l3_state = self._forward_trunk(
+                idx,
+                collect_l3_state=True,
+                dsqg_w_question_indices=dsqg_w_question_indices,
+                dsqg_w_hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                dsqg_w_l3_skip_indices=dsqg_w_l3_skip_indices,
+            )
         else:
             trunk_out = self._forward_trunk(idx)
             l3_state = None
-        x = self._apply_dsqg_w_recomposer(
-            trunk_out,
-            question_indices=dsqg_w_question_indices,
-            l3_states=l3_state,
-            hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
-            l3_skip_indices=dsqg_w_l3_skip_indices,
-        )
+        x = trunk_out
+        if self.dsqg_w_enabled and self.dsqg_w_has_final_site:
+            x = self._apply_dsqg_w_recomposer(
+                trunk_out,
+                site_key='final',
+                question_indices=dsqg_w_question_indices,
+                l3_states=l3_state,
+                hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                l3_skip_indices=dsqg_w_l3_skip_indices,
+            )
         return self.out(self.norm(x))
 
     def forward_hidden(
@@ -3064,17 +3140,26 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_l3_skip_indices=None,
     ):
         if self.dsqg_w_enabled:
-            trunk_out, l3_state = self._forward_trunk(idx, collect_l3_state=True)
+            trunk_out, l3_state = self._forward_trunk(
+                idx,
+                collect_l3_state=True,
+                dsqg_w_question_indices=dsqg_w_question_indices,
+                dsqg_w_hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                dsqg_w_l3_skip_indices=dsqg_w_l3_skip_indices,
+            )
         else:
             trunk_out = self._forward_trunk(idx)
             l3_state = None
-        x = self._apply_dsqg_w_recomposer(
-            trunk_out,
-            question_indices=dsqg_w_question_indices,
-            l3_states=l3_state,
-            hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
-            l3_skip_indices=dsqg_w_l3_skip_indices,
-        )
+        x = trunk_out
+        if self.dsqg_w_enabled and self.dsqg_w_has_final_site:
+            x = self._apply_dsqg_w_recomposer(
+                trunk_out,
+                site_key='final',
+                question_indices=dsqg_w_question_indices,
+                l3_states=l3_state,
+                hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                l3_skip_indices=dsqg_w_l3_skip_indices,
+            )
         return self.norm(x)
 
     def param_count(self):

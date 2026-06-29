@@ -69,7 +69,7 @@ def _set_common_env() -> None:
     os.environ["DWARF_Q6_G128"] = "0"
 
 
-def load_trainer(*, enable_objective: bool, suffix: str):
+def load_trainer(*, enable_objective: bool, suffix: str, dsqg_w_sites: str | None = None):
     _set_common_env()
     if enable_objective:
         os.environ["DWARF_DSQG_W"] = "1"
@@ -80,8 +80,12 @@ def load_trainer(*, enable_objective: bool, suffix: str):
         os.environ["DWARF_DSQG_W_K_QUESTION"] = os.environ.get("DWARF_DSQG_W_K_QUESTION", "4")
         os.environ["DWARF_DSQG_W_K_HISA_EVIDENCE"] = os.environ.get("DWARF_DSQG_W_K_HISA_EVIDENCE", "4")
         os.environ["DWARF_DSQG_W_K_L3_SKIP"] = os.environ.get("DWARF_DSQG_W_K_L3_SKIP", "2")
+        if dsqg_w_sites is not None:
+            os.environ["DWARF_DSQG_W_SITES"] = str(dsqg_w_sites)
+        else:
+            os.environ.pop("DWARF_DSQG_W_SITES", None)
     else:
-        for key in ["DWARF_DSQG_W", "DWARF_DSQG_W_QUESTION", "DWARF_DSQG_W_HISA_L3"]:
+        for key in ["DWARF_DSQG_W", "DWARF_DSQG_W_QUESTION", "DWARF_DSQG_W_HISA_L3", "DWARF_DSQG_W_SITES"]:
             os.environ.pop(key, None)
 
     sys.path.insert(0, str(ROOT))
@@ -132,8 +136,13 @@ def prepare_model_for_frozen_dsqg_w_objective(model) -> dict[str, int]:
 
     for param in model.parameters():
         param.requires_grad_(False)
-    for param in model.dsqg_w.parameters():
-        param.requires_grad_(True)
+    modules = getattr(model, "dsqg_w_blocks", None)
+    if modules is not None and len(modules) > 0:
+        for param in modules.parameters():
+            param.requires_grad_(True)
+    else:
+        for param in model.dsqg_w.parameters():
+            param.requires_grad_(True)
 
     trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
     frozen = sum(param.numel() for param in model.parameters() if not param.requires_grad)
@@ -143,11 +152,15 @@ def prepare_model_for_frozen_dsqg_w_objective(model) -> dict[str, int]:
     }
 
 
+def is_dsqg_w_param_name(name: str) -> bool:
+    return name.startswith("dsqg_w.") or name.startswith("dsqg_w_blocks.")
+
+
 def make_dsqg_w_optimizer(model, *, lr: float = 1e-4, weight_decay: float = 0.0) -> torch.optim.Optimizer:
     if not getattr(model, "dsqg_w_enabled", False) or getattr(model, "dsqg_w", None) is None:
         raise ValueError("DSQG-W must be enabled before constructing its optimizer")
     named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
-    non_dsqg = [name for name, _ in named_params if not name.startswith("dsqg_w.")]
+    non_dsqg = [name for name, _ in named_params if not is_dsqg_w_param_name(name)]
     if non_dsqg:
         raise ValueError(f"frozen objective optimizer saw non-DSQG-W trainable params: {non_dsqg}")
     params = [param for _, param in named_params]
@@ -207,9 +220,12 @@ def _param_snapshot(model) -> dict[str, torch.Tensor]:
 def _changed_names(before: dict[str, torch.Tensor], model, *, prefix: str | None) -> list[str]:
     changed: list[str] = []
     for name, param in model.named_parameters():
-        if prefix is not None and not name.startswith(prefix):
+        if prefix == "dsqg_w.":
+            if not is_dsqg_w_param_name(name):
+                continue
+        elif prefix is not None and not name.startswith(prefix):
             continue
-        if prefix is None and name.startswith("dsqg_w."):
+        if prefix is None and is_dsqg_w_param_name(name):
             continue
         old = before.get(name)
         if old is not None and not torch.equal(old, param.detach()):
@@ -231,7 +247,7 @@ def run_one_frozen_dsqg_w_step(
         for name, param in model.named_parameters()
         if param.grad is not None and param.grad.detach().abs().sum().item() > 0.0
     ]
-    grad_scope_ok = bool(grad_names) and all(name.startswith("dsqg_w.") for name in grad_names)
+    grad_scope_ok = bool(grad_names) and all(is_dsqg_w_param_name(name) for name in grad_names)
     optimizer.step()
     changed_dsqg_w = _changed_names(before, model, prefix="dsqg_w.")
     changed_frozen = _changed_names(before, model, prefix=None)
@@ -298,6 +314,13 @@ def _candidate_settings() -> dict[str, int]:
     }
 
 
+def _dsqg_w_checkpoint_module(model):
+    blocks = getattr(model, "dsqg_w_blocks", None)
+    if blocks is not None and len(blocks) > 1:
+        return blocks, "model.dsqg_w_blocks.state_dict"
+    return model.dsqg_w, "model.dsqg_w.state_dict"
+
+
 def save_dsqg_w_checkpoint(model, output_dir: Path | str, *, metadata: dict[str, Any] | None = None) -> dict[str, str]:
     if not getattr(model, "dsqg_w_enabled", False) or getattr(model, "dsqg_w", None) is None:
         raise ValueError("DSQG-W must be enabled before saving its checkpoint")
@@ -305,10 +328,11 @@ def save_dsqg_w_checkpoint(model, output_dir: Path | str, *, metadata: dict[str,
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "dsqg_w_state.pt"
     metadata_path = out_dir / "dsqg_w_metadata.json"
-    state_dict = {key: value.detach().cpu() for key, value in model.dsqg_w.state_dict().items()}
+    module, contains = _dsqg_w_checkpoint_module(model)
+    state_dict = {key: value.detach().cpu() for key, value in module.state_dict().items()}
     torch.save({"dsqg_w_state_dict": state_dict}, state_path)
     sidecar = {
-        "contains": "model.dsqg_w.state_dict",
+        "contains": contains,
         "state_path": str(state_path),
         "metadata": _jsonable(metadata or {}),
         "git_commit": _git_commit(),
@@ -326,7 +350,11 @@ def load_dsqg_w_checkpoint(model, state_path: Path | str) -> dict[str, list[str]
         raise ValueError("DSQG-W must be enabled before loading its checkpoint")
     payload = torch.load(state_path, map_location=_model_device(model), weights_only=True)
     state_dict = payload["dsqg_w_state_dict"]
-    incompatible = model.dsqg_w.load_state_dict(state_dict, strict=False)
+    blocks = getattr(model, "dsqg_w_blocks", None)
+    if blocks is not None and len(blocks) > 1:
+        incompatible = blocks.load_state_dict(state_dict, strict=False)
+    else:
+        incompatible = model.dsqg_w.load_state_dict(state_dict, strict=False)
     return {
         "missing_keys": list(incompatible.missing_keys),
         "unexpected_keys": list(incompatible.unexpected_keys),
@@ -655,7 +683,7 @@ def run_smoke_objective(*, enable: bool | None = None, seed: int = 20260628, ste
         for name, param in model.named_parameters()
         if param.grad is not None and param.grad.detach().abs().sum().item() > 0.0
     ]
-    grad_scope_ok = bool(grad_names) and all(name.startswith("dsqg_w.") for name in grad_names)
+    grad_scope_ok = bool(grad_names) and all(is_dsqg_w_param_name(name) for name in grad_names)
     telemetry = dict(result.telemetry)
     telemetry.update({key: float(value) for key, value in counts.items()})
     return {
