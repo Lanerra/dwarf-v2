@@ -3216,6 +3216,8 @@ class TriadicJ96Dsr(nn.Module):
                 parts.append(f'L{i}:DSR-V15HISA(C={block.attn.num_chunks},k={block.attn.top_k_chunks},HISA_m={block.attn.hisa_top_m_tokens})')
         if self.dsqg_w_enabled and self.dsqg_w_config is not None:
             path = _dsqg_w_candidate_path_label().lower().replace('_', '+')
+            site_text = ','.join(self.dsqg_w_site_keys)
+            parts.append(f'DSQG-W-sites={site_text}')
             parts.append(f'FINAL:DSQG-W(J<={self.dsqg_w_config.max_candidates},{path})')
         return '  '.join(parts)
 
@@ -3750,11 +3752,12 @@ def train():
         print('  q6_g128 smoke path: disabled')
     if DSQG_W_ENABLED:
         candidate_path = _dsqg_w_candidate_path_label().replace('_', '/')
-        print(f'  DSQG-W final recomposer: enabled J<={DSQG_W_MAX_CANDIDATES} '
+        site_text = ','.join(_dsqg_w_site_key(site) for site in DSQG_W_SITE_SPECS)
+        print(f'  DSQG-W recomposer sites={site_text}: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
               f'candidates={candidate_path}')
     else:
-        print('  DSQG-W final recomposer: disabled')
+        print('  DSQG-W recomposer: disabled')
     print('  DSR:  V15HISA')
     print(f"  HISA Stage-2 selector: rep_r={os.getenv('HISA_STAGE2_REP_R', os.getenv('DWARF_HISA_STAGE2_REP_R', '0'))} (0=rowmax baseline)")
     if USE_LIGER_CE:

@@ -226,6 +226,18 @@ def test_forward_accepts_optional_dsqg_w_hisa_l3_indices(monkeypatch) -> None:
     assert seen_l3_skip is l3_skip_indices
 
 
+def test_layer_summary_includes_configured_dsqg_w_sites(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True, hisa_l3=True, sites="2,6,final")
+    model = make_model(mod)
+
+    summary = model.layer_summary()
+
+    assert "DSQG-W-sites=layer_2,layer_6,final" in summary
+    assert "L2:DSQG-C" in summary
+    assert "L6:DSQG-C" in summary
+    assert "FINAL:DSQG-W" in summary
+
+
 def test_dsqg_w_sites_apply_layer_and_final_recomposers_in_order(monkeypatch) -> None:
     mod = load_trainer(monkeypatch, dsqg_w=True, question=True, sites="2,final")
     model = make_model(mod)
