@@ -180,6 +180,111 @@ def test_dsqg_w_block_shape_no_nan_identityish_init_and_required_telemetry() -> 
         assert key in telemetry
 
 
+def test_dsqg_w_width_cell_disabled_preserves_legacy_block_output() -> None:
+    torch.manual_seed(41)
+    x = make_hidden(batch=1, seq=6, d=16)
+    base_cfg = DSQGWConfig(d=16, n_heads=4, max_candidates=8, bottleneck=32, gate_init=-5.0)
+    width_disabled_cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=8,
+        bottleneck=32,
+        gate_init=-5.0,
+        use_width_cell=False,
+    )
+    provider = CandidateProvider(base_cfg)
+    cands = provider.build(
+        x,
+        question_indices=torch.tensor([[0, 2, 4]]),
+        hisa_evidence_indices=torch.tensor([[[0, 0], [0, 0], [0, 1], [0, 2], [1, 3], [2, 4]]]),
+    )
+    legacy = DSQGWBlock.from_config(base_cfg).eval()
+    disabled = DSQGWBlock.from_config(width_disabled_cfg).eval()
+    disabled.load_state_dict(legacy.state_dict())
+
+    out_legacy, telemetry_legacy = legacy(
+        x, cands.cand_states, cands.cand_types, cands.cand_sources, cands.cand_mask
+    )
+    out_disabled, telemetry_disabled = disabled(
+        x, cands.cand_states, cands.cand_types, cands.cand_sources, cands.cand_mask
+    )
+
+    torch.testing.assert_close(out_disabled, out_legacy, atol=0.0, rtol=0.0)
+    assert "dsqg_w_width_gate_mean" not in telemetry_legacy
+    assert "dsqg_w_width_gate_mean" not in telemetry_disabled
+
+
+def test_dsqg_w_width_cell_is_near_identity_when_closed_and_reports_width_telemetry() -> None:
+    torch.manual_seed(43)
+    x = make_hidden(batch=1, seq=7, d=16)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=10,
+        bottleneck=32,
+        gate_init=-5.0,
+        use_width_cell=True,
+        width_bottleneck=8,
+        width_gate_init=-12.0,
+    )
+    provider = CandidateProvider(cfg)
+    cands = provider.build(
+        x,
+        question_indices=torch.tensor([[0, 2, 5]]),
+        hisa_evidence_indices=torch.tensor([[[0, 0], [0, 0], [0, 1], [0, 2], [1, 3], [2, 4], [3, 5]]]),
+        l3_skip_indices=torch.tensor([[[0], [0], [1], [2], [3], [4], [5]]]),
+    )
+    block = DSQGWBlock.from_config(cfg).eval()
+
+    out, telemetry = block(x, cands.cand_states, cands.cand_types, cands.cand_sources, cands.cand_mask)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert telemetry["dsqg_w_width_gate_mean"].item() < 1e-4
+    assert telemetry["dsqg_w_width_entropy"].item() > 0.0
+    assert telemetry["dsqg_w_width_delta_norm"].item() >= 0.0
+
+
+def test_dsqg_w_width_cell_pair_bias_can_directionally_route_question_to_evidence() -> None:
+    torch.manual_seed(47)
+    x = make_hidden(batch=1, seq=5, d=16)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=6,
+        bottleneck=32,
+        gate_init=-5.0,
+        use_width_cell=True,
+        width_bottleneck=8,
+        width_gate_init=6.0,
+    )
+    provider = CandidateProvider(cfg)
+    cands = provider.build(
+        x,
+        question_indices=torch.tensor([[0, 2]]),
+        hisa_evidence_indices=torch.tensor([[[0], [0], [1], [2], [3]]]),
+    )
+    block = DSQGWBlock.from_config(cfg).eval()
+    assert block.width_cell is not None
+
+    with torch.no_grad():
+        block.width_cell.type_pair_bias.zero_()
+        block.width_cell.type_pair_bias[
+            int(CandidateType.QUESTION), int(CandidateType.HISA_EVIDENCE)
+        ].fill_(8.0)
+
+    _, telemetry = block(
+        x,
+        cands.cand_states,
+        cands.cand_types,
+        cands.cand_sources,
+        cands.cand_mask,
+    )
+
+    assert telemetry["dsqg_w_width_question_to_hisa_evidence_mass"].item() > 0.70
+    assert telemetry["dsqg_w_width_self_mass"].item() < 0.60
+
+
 def test_dsqg_w_block_is_causal_under_future_token_changes() -> None:
     torch.manual_seed(29)
     x_a = make_hidden(batch=1, seq=10, d=16)

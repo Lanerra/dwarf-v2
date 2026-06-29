@@ -57,6 +57,10 @@ class DSQGWConfig:
     k_l3_skip: int = 4
     null_fallback: bool = True
     local_type_id: int = int(CandidateType.LOCAL)
+    use_width_cell: bool = False
+    width_bottleneck: int = 64
+    width_gate_init: float = -5.0
+    width_self_bias_init: float = 0.0
 
     def __post_init__(self) -> None:
         if self.d <= 0:
@@ -69,6 +73,8 @@ class DSQGWConfig:
             raise ValueError("n_types must cover all CandidateType values")
         if self.n_sources < len(CandidateSource):
             raise ValueError("n_sources must cover all CandidateSource values")
+        if self.width_bottleneck <= 0:
+            raise ValueError("width_bottleneck must be positive")
 
 
 @dataclass(frozen=True)
@@ -492,6 +498,113 @@ class CandidateProvider:
         return out
 
 
+class DSQGWWidthCell(nn.Module):
+    """Bounded candidate-to-candidate semantic transfer over the DSQG-W width axis."""
+
+    def __init__(
+        self,
+        *,
+        d: int,
+        n_heads: int,
+        n_types: int,
+        n_sources: int,
+        bottleneck: int,
+        gate_init: float = -5.0,
+        self_bias_init: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if d % n_heads != 0:
+            raise ValueError("d must be divisible by n_heads")
+        self.d = int(d)
+        self.n_heads = int(n_heads)
+        self.width_dim = int(bottleneck)
+        if self.width_dim % self.n_heads != 0:
+            raise ValueError("width bottleneck must be divisible by n_heads")
+        self.n_types = int(n_types)
+        self.n_sources = int(n_sources)
+
+        self.norm_c = nn.LayerNorm(d)
+        self.q_proj = nn.Linear(d, self.width_dim, bias=False)
+        self.k_proj = nn.Linear(d, self.width_dim, bias=False)
+        self.v_proj = nn.Linear(d, self.width_dim, bias=False)
+        self.lateral_up = nn.Linear(self.width_dim, d, bias=False)
+        self.type_pair_bias = nn.Parameter(torch.zeros(n_types, n_types))
+        self.source_pair_bias = nn.Parameter(torch.zeros(n_sources, n_sources))
+        self.self_bias = nn.Parameter(torch.tensor(float(self_bias_init)))
+        self.gate = nn.Parameter(torch.full((d,), float(gate_init)))
+
+    def forward(
+        self,
+        cand_states: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bsz, seq_len, j_count, d = cand_states.shape
+        if d != self.d:
+            raise ValueError(f"cand_states last dim {d} does not match width-cell d {self.d}")
+        if cand_types.shape != (bsz, seq_len, j_count) or cand_sources.shape != cand_types.shape:
+            raise ValueError("candidate type/source tensors must have shape [B,T,J]")
+        if cand_mask.shape != cand_types.shape:
+            raise ValueError("candidate mask must have shape [B,T,J]")
+        if not cand_mask.any(dim=-1).all():
+            raise ValueError("DSQG-W width cell received an all-invalid candidate row")
+
+        c_n = self.norm_c(cand_states)
+        q = self.q_proj(c_n)
+        k = self.k_proj(c_n)
+        v = self.v_proj(c_n)
+
+        scores = (q[:, :, :, None, :] * k[:, :, None, :, :]).sum(dim=-1) / math.sqrt(float(self.width_dim))
+        scores = scores + self.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
+        scores = scores + self.source_pair_bias[cand_sources[:, :, :, None], cand_sources[:, :, None, :]]
+        eye = torch.eye(j_count, device=cand_states.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
+        scores = scores + eye.to(scores.dtype) * self.self_bias
+
+        valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
+        scores = scores.masked_fill(~valid_pair, torch.finfo(scores.dtype).min)
+        probs = F.softmax(scores, dim=3)
+        probs = probs.masked_fill(~valid_pair, 0.0)
+
+        lateral = (probs[..., None] * v[:, :, None, :, :]).sum(dim=3)
+        delta = self.lateral_up(lateral)
+        gate = torch.sigmoid(self.gate).reshape(1, 1, 1, d)
+        out = cand_states + gate * delta * cand_mask[..., None].to(delta.dtype)
+
+        p_mean = probs
+        valid_targets = cand_mask.bool()
+        p_safe = p_mean.clamp_min(1e-8)
+        entropy_per_target = -(p_safe * p_safe.log()).sum(dim=-1)
+        entropy = entropy_per_target.masked_select(valid_targets).mean()
+        diag = torch.eye(j_count, device=cand_states.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
+        self_mass = p_mean.masked_fill(~diag, 0.0).sum(dim=-1).masked_select(valid_targets).mean()
+
+        def pair_mass(target_type: CandidateType, source_type: CandidateType) -> torch.Tensor:
+            target_mask = (cand_types == int(target_type)) & valid_targets
+            source_mask = (cand_types == int(source_type)) & cand_mask
+            if not target_mask.any():
+                return cand_states.new_tensor(0.0)
+            mass = p_mean.masked_fill(~source_mask[:, :, None, :], 0.0).sum(dim=-1)
+            return mass.masked_select(target_mask).mean()
+
+        delta_norm = delta.masked_select(cand_mask[..., None]).reshape(-1, d).norm(dim=-1).mean()
+        telemetry = {
+            "dsqg_w_width_entropy": entropy.detach(),
+            "dsqg_w_width_self_mass": self_mass.detach(),
+            "dsqg_w_width_gate_mean": gate.mean().detach(),
+            "dsqg_w_width_gate_min": gate.min().detach(),
+            "dsqg_w_width_gate_max": gate.max().detach(),
+            "dsqg_w_width_delta_norm": delta_norm.detach(),
+            "dsqg_w_width_question_to_hisa_evidence_mass": pair_mass(
+                CandidateType.QUESTION, CandidateType.HISA_EVIDENCE
+            ).detach(),
+            "dsqg_w_width_hisa_evidence_to_question_mass": pair_mass(
+                CandidateType.HISA_EVIDENCE, CandidateType.QUESTION
+            ).detach(),
+        }
+        return out, telemetry
+
+
 class DSQGWBlock(nn.Module):
     """Diagnostic DSQG-W semantic-width recomposer.
 
@@ -513,6 +626,10 @@ class DSQGWBlock(nn.Module):
         max_candidates: int,
         local_type_id: int,
         gate_init: float = -5.0,
+        use_width_cell: bool = False,
+        width_bottleneck: int = 64,
+        width_gate_init: float = -5.0,
+        width_self_bias_init: float = 0.0,
     ) -> None:
         super().__init__()
         if d % n_heads != 0:
@@ -524,6 +641,19 @@ class DSQGWBlock(nn.Module):
         self.n_sources = int(n_sources)
         self.max_candidates = int(max_candidates)
         self.local_type_id = int(local_type_id)
+        self.width_cell = (
+            DSQGWWidthCell(
+                d=d,
+                n_heads=n_heads,
+                n_types=n_types,
+                n_sources=n_sources,
+                bottleneck=width_bottleneck,
+                gate_init=width_gate_init,
+                self_bias_init=width_self_bias_init,
+            )
+            if use_width_cell
+            else None
+        )
 
         self.norm_x = nn.LayerNorm(d)
         self.norm_c = nn.LayerNorm(d)
@@ -556,6 +686,10 @@ class DSQGWBlock(nn.Module):
             max_candidates=config.max_candidates,
             local_type_id=config.local_type_id,
             gate_init=config.gate_init,
+            use_width_cell=config.use_width_cell,
+            width_bottleneck=config.width_bottleneck,
+            width_gate_init=config.width_gate_init,
+            width_self_bias_init=config.width_self_bias_init,
         )
 
     def forward(
@@ -578,6 +712,10 @@ class DSQGWBlock(nn.Module):
             raise ValueError("candidate count exceeds DSQG-W max_candidates")
         if not cand_mask.any(dim=-1).all():
             raise ValueError("DSQG-W received an all-invalid candidate row")
+
+        width_telemetry: dict[str, torch.Tensor] = {}
+        if self.width_cell is not None:
+            cand_states, width_telemetry = self.width_cell(cand_states, cand_types, cand_sources, cand_mask)
 
         h = self.n_heads
         dh = self.dh
@@ -654,6 +792,7 @@ class DSQGWBlock(nn.Module):
             telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
         telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
         telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
+        telemetry.update(width_telemetry)
 
         if return_routing:
             telemetry["dsqg_w_probs"] = probs

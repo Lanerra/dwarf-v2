@@ -53,3 +53,16 @@ def test_build_comparison_reports_deltas_and_selects_winner() -> None:
     assert report["w_minus_d_answer_ce"] == pytest.approx(-0.5)
     assert report["w_minus_d_mrr"] == pytest.approx(0.05)
     assert report["w_minus_d_mean_rank"] == pytest.approx(-20.0)
+
+
+def test_set_eval_env_can_enable_dsqg_w_width_cell(monkeypatch) -> None:
+    mod = load_eval_module()
+
+    mod._set_eval_env(dsqg_w=True, sites="2,6,final", width_cell=True, width_bottleneck=32, width_gate_init=-5.0)
+
+    import os
+
+    assert os.environ["DWARF_DSQG_W"] == "1"
+    assert os.environ["DWARF_DSQG_W_WIDTH_CELL"] == "1"
+    assert os.environ["DWARF_DSQG_W_WIDTH_BOTTLENECK"] == "32"
+    assert os.environ["DWARF_DSQG_W_WIDTH_GATE_INIT"] == "-5.0"

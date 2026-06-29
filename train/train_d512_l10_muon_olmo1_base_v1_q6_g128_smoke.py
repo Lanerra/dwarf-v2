@@ -346,6 +346,9 @@ DSQG_W_ENABLED = os.getenv('DWARF_DSQG_W', '0') == '1'
 DSQG_W_MAX_CANDIDATES = int(os.environ.get('DWARF_DSQG_W_MAX_CANDIDATES', '32'))
 DSQG_W_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_BOTTLENECK', '256'))
 DSQG_W_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_GATE_INIT', '-5.0'))
+DSQG_W_WIDTH_CELL = os.getenv('DWARF_DSQG_W_WIDTH_CELL', '0') == '1'
+DSQG_W_WIDTH_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_WIDTH_BOTTLENECK', '64'))
+DSQG_W_WIDTH_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_WIDTH_GATE_INIT', '-5.0'))
 DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2, 4, 8))
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
 DSQG_W_QUESTION_ENABLED = os.getenv('DWARF_DSQG_W_QUESTION', '0') == '1'
@@ -2982,6 +2985,9 @@ class TriadicJ96Dsr(nn.Module):
                 k_hisa_evidence=DSQG_W_K_HISA_EVIDENCE,
                 k_chunk=0,
                 k_l3_skip=DSQG_W_K_L3_SKIP,
+                use_width_cell=DSQG_W_WIDTH_CELL,
+                width_bottleneck=DSQG_W_WIDTH_BOTTLENECK,
+                width_gate_init=DSQG_W_WIDTH_GATE_INIT,
             )
             self.dsqg_w_candidate_provider = CandidateProvider(self.dsqg_w_config)
             for site_key in self.dsqg_w_site_keys:
@@ -3320,6 +3326,9 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'max_candidates': DSQG_W_MAX_CANDIDATES,
                 'bottleneck': DSQG_W_BOTTLENECK,
                 'gate_init': DSQG_W_GATE_INIT,
+                'width_cell': DSQG_W_WIDTH_CELL,
+                'width_bottleneck': DSQG_W_WIDTH_BOTTLENECK,
+                'width_gate_init': DSQG_W_WIDTH_GATE_INIT,
                 'local_offsets': list(DSQG_W_LOCAL_OFFSETS),
                 'long_offsets': list(DSQG_W_LONG_OFFSETS),
                 'question_enabled': DSQG_W_QUESTION_ENABLED,
@@ -3755,7 +3764,8 @@ def train():
         site_text = ','.join(_dsqg_w_site_key(site) for site in DSQG_W_SITE_SPECS)
         print(f'  DSQG-W recomposer sites={site_text}: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
-              f'candidates={candidate_path}')
+              f'width_cell={DSQG_W_WIDTH_CELL} width_bottleneck={DSQG_W_WIDTH_BOTTLENECK} '
+              f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} candidates={candidate_path}')
     else:
         print('  DSQG-W recomposer: disabled')
     print('  DSR:  V15HISA')

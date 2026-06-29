@@ -36,6 +36,9 @@ def build_run_config(
     sites: str = "2,6,final",
     max_candidates: int = 16,
     bottleneck: int = 64,
+    width_cell: bool = False,
+    width_bottleneck: int = 64,
+    width_gate_init: float = -5.0,
     lr: float | None = None,
     dataset: Path | str = DEFAULT_DATASET,
     tokenizer: Path | str = DEFAULT_TOKENIZER,
@@ -65,6 +68,9 @@ def build_run_config(
         "DWARF_DSQG_W_SITES": str(sites),
         "DWARF_DSQG_W_MAX_CANDIDATES": str(int(max_candidates)),
         "DWARF_DSQG_W_BOTTLENECK": str(int(bottleneck)),
+        "DWARF_DSQG_W_WIDTH_CELL": "1" if width_cell else "0",
+        "DWARF_DSQG_W_WIDTH_BOTTLENECK": str(int(width_bottleneck)),
+        "DWARF_DSQG_W_WIDTH_GATE_INIT": str(float(width_gate_init)),
         "DWARF_DSQG_W_QUESTION": "1",
         "DWARF_DSQG_W_HISA_L3": "1",
         "DWARF_DSQG_W_K_QUESTION": "4",
@@ -147,6 +153,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sites", default="2,6,final")
     parser.add_argument("--max-candidates", type=int, default=16)
     parser.add_argument("--bottleneck", type=int, default=64)
+    parser.add_argument("--width-cell", action="store_true", help="Enable the opt-in DSQG-W candidate lateral width cell.")
+    parser.add_argument("--width-bottleneck", type=int, default=64)
+    parser.add_argument("--width-gate-init", type=float, default=-5.0)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
@@ -173,6 +182,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         sites=args.sites,
         max_candidates=args.max_candidates,
         bottleneck=args.bottleneck,
+        width_cell=args.width_cell,
+        width_bottleneck=args.width_bottleneck,
+        width_gate_init=args.width_gate_init,
         lr=args.lr,
         dataset=args.dataset,
         tokenizer=args.tokenizer,

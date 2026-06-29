@@ -37,6 +37,7 @@ def test_full_run_launcher_builds_winning_layout_env(tmp_path: Path) -> None:
     assert env["DWARF_DSQG_W_SITES"] == "2,6,final"
     assert env["DWARF_DSQG_W_MAX_CANDIDATES"] == "16"
     assert env["DWARF_DSQG_W_BOTTLENECK"] == "64"
+    assert env["DWARF_DSQG_W_WIDTH_CELL"] == "0"
     assert env["DWARF_DSQG_W_QUESTION"] == "1"
     assert env["DWARF_DSQG_W_HISA_L3"] == "1"
     assert env["DWARF_MAX_ACC_STEPS"] == "3"
@@ -46,6 +47,23 @@ def test_full_run_launcher_builds_winning_layout_env(tmp_path: Path) -> None:
     assert env["DWARF_GA"] == "1"
     assert env["DWARF_CKPT_BASE_NAME"].endswith("unit")
     assert Path(env["DWARF_CHECKPOINT_DIR"]).name == "checkpoints"
+
+
+def test_full_run_launcher_can_enable_width_cell_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "width_run",
+        run_name="width_unit",
+        width_cell=True,
+        width_bottleneck=12,
+        width_gate_init=-3.5,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W_WIDTH_CELL"] == "1"
+    assert env["DWARF_DSQG_W_WIDTH_BOTTLENECK"] == "12"
+    assert env["DWARF_DSQG_W_WIDTH_GATE_INIT"] == "-3.5"
 
 
 def test_full_run_launcher_dry_run_writes_config_without_executing(tmp_path: Path) -> None:

@@ -37,7 +37,14 @@ def load_microtrain_module():
     return _load_module(MICROTRAIN, "microtrain_dsqg_w_lexical_gap_for_checkpoint_eval")
 
 
-def _set_eval_env(*, dsqg_w: bool, sites: str = "2,6,final") -> None:
+def _set_eval_env(
+    *,
+    dsqg_w: bool,
+    sites: str = "2,6,final",
+    width_cell: bool = False,
+    width_bottleneck: int = 64,
+    width_gate_init: float = -5.0,
+) -> None:
     os.environ["DWARF_DISABLE_BNB"] = "1"
     os.environ["DWARF_LIGER"] = "0"
     os.environ["DWARF_TORCH_COMPILE"] = "0"
@@ -50,6 +57,9 @@ def _set_eval_env(*, dsqg_w: bool, sites: str = "2,6,final") -> None:
         os.environ["DWARF_DSQG_W_SITES"] = str(sites)
         os.environ["DWARF_DSQG_W_MAX_CANDIDATES"] = "16"
         os.environ["DWARF_DSQG_W_BOTTLENECK"] = "64"
+        os.environ["DWARF_DSQG_W_WIDTH_CELL"] = "1" if width_cell else "0"
+        os.environ["DWARF_DSQG_W_WIDTH_BOTTLENECK"] = str(int(width_bottleneck))
+        os.environ["DWARF_DSQG_W_WIDTH_GATE_INIT"] = str(float(width_gate_init))
         os.environ["DWARF_DSQG_W_QUESTION"] = "1"
         os.environ["DWARF_DSQG_W_HISA_L3"] = "1"
         os.environ["DWARF_DSQG_W_K_QUESTION"] = "4"
@@ -59,14 +69,31 @@ def _set_eval_env(*, dsqg_w: bool, sites: str = "2,6,final") -> None:
         for key in [
             "DWARF_DSQG_W",
             "DWARF_DSQG_W_SITES",
+            "DWARF_DSQG_W_WIDTH_CELL",
+            "DWARF_DSQG_W_WIDTH_BOTTLENECK",
+            "DWARF_DSQG_W_WIDTH_GATE_INIT",
             "DWARF_DSQG_W_QUESTION",
             "DWARF_DSQG_W_HISA_L3",
         ]:
             os.environ.pop(key, None)
 
 
-def load_trainer_module(*, dsqg_w: bool, suffix: str, sites: str = "2,6,final"):
-    _set_eval_env(dsqg_w=dsqg_w, sites=sites)
+def load_trainer_module(
+    *,
+    dsqg_w: bool,
+    suffix: str,
+    sites: str = "2,6,final",
+    width_cell: bool = False,
+    width_bottleneck: int = 64,
+    width_gate_init: float = -5.0,
+):
+    _set_eval_env(
+        dsqg_w=dsqg_w,
+        sites=sites,
+        width_cell=width_cell,
+        width_bottleneck=width_bottleneck,
+        width_gate_init=width_gate_init,
+    )
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "kernels"))
     try:
@@ -190,6 +217,9 @@ def evaluate_checkpoint(
     records: list[dict[str, Any]],
     tokenizer_path: Path | str = DEFAULT_TOKENIZER,
     sites: str = "2,6,final",
+    width_cell: bool = False,
+    width_bottleneck: int = 64,
+    width_gate_init: float = -5.0,
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     if device is None:
@@ -200,7 +230,14 @@ def evaluate_checkpoint(
     tokenizer = obj.load_tokenizer(tokenizer_path)
     batch, batch_meta = obj.build_tokenized_lexical_gap_batch(records, tokenizer)
     labels, answer_predict_mask = make_causal_answer_targets(batch)
-    trainer = load_trainer_module(dsqg_w=dsqg_w, suffix=name.lower().replace(" ", "_"), sites=sites)
+    trainer = load_trainer_module(
+        dsqg_w=dsqg_w,
+        suffix=name.lower().replace(" ", "_"),
+        sites=sites,
+        width_cell=width_cell,
+        width_bottleneck=width_bottleneck,
+        width_gate_init=width_gate_init,
+    )
     model = make_full_model(trainer, device=device)
     load_report = load_full_checkpoint(model, checkpoint_path, device=device)
     model.eval()
@@ -224,6 +261,9 @@ def evaluate_checkpoint(
         "name": name,
         "checkpoint_path": str(checkpoint_path),
         "dsqg_w_enabled": bool(dsqg_w),
+        "dsqg_w_width_cell": bool(width_cell) if dsqg_w else False,
+        "dsqg_w_width_bottleneck": int(width_bottleneck) if dsqg_w and width_cell else None,
+        "dsqg_w_width_gate_init": float(width_gate_init) if dsqg_w and width_cell else None,
         "dsqg_w_sites": list(getattr(model, "dsqg_w_site_keys", ())) if dsqg_w else [],
         "load_report": load_report,
         "examples": len(records),
@@ -274,6 +314,9 @@ def run_comparison(
     val_size: int = 144,
     seed: int = 20260628,
     sites: str = "2,6,final",
+    dsqg_w_width_cell: bool = False,
+    dsqg_w_width_bottleneck: int = 64,
+    dsqg_w_width_gate_init: float = -5.0,
     device: str | None = None,
 ) -> dict[str, Any]:
     micro = load_microtrain_module()
@@ -295,6 +338,9 @@ def run_comparison(
             records=val_records,
             tokenizer_path=tokenizer_path,
             sites=sites,
+            width_cell=dsqg_w_width_cell,
+            width_bottleneck=dsqg_w_width_bottleneck,
+            width_gate_init=dsqg_w_width_gate_init,
             device=device,
         ),
     ]
@@ -303,6 +349,9 @@ def run_comparison(
         "seed": int(seed),
         "val_examples": int(val_size),
         "sites": sites,
+        "dsqg_w_width_cell": bool(dsqg_w_width_cell),
+        "dsqg_w_width_bottleneck": int(dsqg_w_width_bottleneck) if dsqg_w_width_cell else None,
+        "dsqg_w_width_gate_init": float(dsqg_w_width_gate_init) if dsqg_w_width_cell else None,
     })
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -318,6 +367,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--val-size", type=int, default=144)
     parser.add_argument("--seed", type=int, default=20260628)
     parser.add_argument("--sites", default="2,6,final")
+    parser.add_argument("--dsqg-w-width-cell", action="store_true", help="Instantiate the DSQG-W checkpoint with the width cell enabled.")
+    parser.add_argument("--dsqg-w-width-bottleneck", type=int, default=64)
+    parser.add_argument("--dsqg-w-width-gate-init", type=float, default=-5.0)
     parser.add_argument("--device", default=None)
     args = parser.parse_args(argv)
     report = run_comparison(
@@ -328,6 +380,9 @@ def main(argv: list[str] | None = None) -> int:
         val_size=args.val_size,
         seed=args.seed,
         sites=args.sites,
+        dsqg_w_width_cell=args.dsqg_w_width_cell,
+        dsqg_w_width_bottleneck=args.dsqg_w_width_bottleneck,
+        dsqg_w_width_gate_init=args.dsqg_w_width_gate_init,
         device=args.device,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
