@@ -79,6 +79,62 @@ def test_candidate_provider_deduplicates_by_token_and_source_with_semantic_prior
     assert batch.telemetry["dsqg_w_candidate_duplicate_rate"].item() > 0.0
 
 
+def test_candidate_provider_fast_path_matches_reference_candidate_layout() -> None:
+    x = make_hidden(batch=2, seq=11, d=16)
+    l3 = x + 0.125
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=10,
+        bottleneck=32,
+        local_offsets=(1, 2, 4),
+        long_offsets=(4, 8),
+        k_question=3,
+        k_hisa_evidence=2,
+        k_chunk=0,
+        k_l3_skip=2,
+    )
+    provider = CandidateProvider(cfg)
+    question = torch.tensor([[0, 3, 7], [1, 4, 9]])
+    positions = torch.arange(x.shape[1])
+    hisa = torch.stack([
+        torch.stack([(positions - 1).clamp_min(0), (positions - 3).clamp_min(0)], dim=-1),
+        torch.stack([(positions - 2).clamp_min(0), (positions - 5).clamp_min(0)], dim=-1),
+    ], dim=0)
+    l3_skip = torch.stack([
+        torch.stack([(positions - 6).clamp_min(0), (positions - 8).clamp_min(0)], dim=-1),
+        torch.stack([(positions - 4).clamp_min(0), (positions - 7).clamp_min(0)], dim=-1),
+    ], dim=0)
+
+    reference = provider._build_reference(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        l3_skip_indices=l3_skip,
+    )
+    fast = provider.build(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        l3_skip_indices=l3_skip,
+    )
+
+    torch.testing.assert_close(fast.cand_states, reference.cand_states)
+    torch.testing.assert_close(fast.cand_types, reference.cand_types)
+    torch.testing.assert_close(fast.cand_sources, reference.cand_sources)
+    torch.testing.assert_close(fast.cand_mask, reference.cand_mask)
+    torch.testing.assert_close(fast.cand_token_indices, reference.cand_token_indices)
+    torch.testing.assert_close(fast.valid_candidate_count, reference.valid_candidate_count)
+
+
+def test_candidate_provider_build_uses_vectorized_fast_path_not_batch_token_python_loop() -> None:
+    source = inspect.getsource(CandidateProvider.build)
+    assert "for b in range" not in source
+    assert "for t in range" not in source
+
+
 def test_dsqg_w_block_shape_no_nan_identityish_init_and_required_telemetry() -> None:
     torch.manual_seed(23)
     x = make_hidden(seq=7)

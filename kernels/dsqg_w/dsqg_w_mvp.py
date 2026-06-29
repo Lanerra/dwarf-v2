@@ -114,6 +114,241 @@ class CandidateProvider:
         chunk_rep_states: torch.Tensor | None = None,
         l3_skip_indices: torch.Tensor | None = None,
     ) -> CandidateBatch:
+        if not self._can_use_vectorized(
+            question_indices=question_indices,
+            hisa_evidence_indices=hisa_evidence_indices,
+            chunk_rep_indices=chunk_rep_indices,
+            l3_skip_indices=l3_skip_indices,
+        ):
+            return self._build_reference(
+                final_states,
+                l3_states=l3_states,
+                question_indices=question_indices,
+                hisa_evidence_indices=hisa_evidence_indices,
+                chunk_rep_indices=chunk_rep_indices,
+                chunk_rep_states=chunk_rep_states,
+                l3_skip_indices=l3_skip_indices,
+            )
+        return self._build_vectorized(
+            final_states,
+            l3_states=l3_states,
+            question_indices=question_indices,
+            hisa_evidence_indices=hisa_evidence_indices,
+            chunk_rep_indices=chunk_rep_indices,
+            chunk_rep_states=chunk_rep_states,
+            l3_skip_indices=l3_skip_indices,
+        )
+
+    @staticmethod
+    def _can_use_vectorized(**kwargs) -> bool:
+        return all(value is None or isinstance(value, torch.Tensor) for value in kwargs.values())
+
+    def _build_vectorized(
+        self,
+        final_states: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        question_indices: torch.Tensor | None = None,
+        hisa_evidence_indices: torch.Tensor | None = None,
+        chunk_rep_indices: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+        l3_skip_indices: torch.Tensor | None = None,
+    ) -> CandidateBatch:
+        if final_states.ndim != 3:
+            raise ValueError("final_states must have shape [B, T, D]")
+        bsz, seq_len, d = final_states.shape
+        if d != self.config.d:
+            raise ValueError(f"final_states last dim {d} does not match config.d {self.config.d}")
+        if l3_states is not None and l3_states.shape != final_states.shape:
+            raise ValueError("l3_states must match final_states shape")
+        if chunk_rep_states is not None and chunk_rep_states.shape != final_states.shape:
+            raise ValueError("chunk_rep_states must match final_states shape")
+
+        device = final_states.device
+        positions = torch.arange(seq_len, device=device, dtype=torch.long).reshape(1, seq_len, 1).expand(bsz, -1, -1)
+        raw_tokens: list[torch.Tensor] = []
+        raw_types: list[torch.Tensor] = []
+        raw_sources: list[torch.Tensor] = []
+        raw_valids: list[torch.Tensor] = []
+
+        def add(tokens: torch.Tensor, ctype: int, source: int, valid: torch.Tensor | None = None) -> None:
+            tokens = tokens.to(device=device, dtype=torch.long)
+            if tokens.ndim == 2:
+                tokens = tokens.unsqueeze(-1)
+            if tokens.shape[0] == 1 and bsz != 1:
+                tokens = tokens.expand(bsz, -1, -1)
+            if tokens.shape[1] == 1 and seq_len != 1:
+                tokens = tokens.expand(-1, seq_len, -1)
+            if tokens.shape[:2] != (bsz, seq_len):
+                raise ValueError("candidate index tensor must broadcast to [B,T,K]")
+            valid_mask = (tokens >= 0) & (tokens <= positions)
+            if valid is not None:
+                valid_mask = valid_mask & valid.to(device=device, dtype=torch.bool)
+            raw_tokens.append(tokens)
+            raw_types.append(torch.full(tokens.shape, int(ctype), device=device, dtype=torch.long))
+            raw_sources.append(torch.full(tokens.shape, int(source), device=device, dtype=torch.long))
+            raw_valids.append(valid_mask)
+
+        for offset in self.config.local_offsets:
+            add(positions - int(offset), int(CandidateType.LOCAL), int(CandidateSource.FINAL))
+        q_idx = self._normalize_index_tensor(question_indices, bsz, seq_len, self.config.k_question, device)
+        if q_idx is not None:
+            add(q_idx, int(CandidateType.QUESTION), int(CandidateSource.FINAL))
+        h_idx = self._normalize_index_tensor(hisa_evidence_indices, bsz, seq_len, self.config.k_hisa_evidence, device)
+        if h_idx is not None:
+            add(h_idx, int(CandidateType.HISA_EVIDENCE), int(CandidateSource.L3))
+        for offset in self.config.long_offsets:
+            add(positions - int(offset), int(CandidateType.LONG_OFFSET), int(CandidateSource.FINAL))
+        c_idx = self._normalize_index_tensor(chunk_rep_indices, bsz, seq_len, self.config.k_chunk, device)
+        if c_idx is not None:
+            add(c_idx, int(CandidateType.CHUNK_REP), int(CandidateSource.SUMMARY))
+        s_idx = self._normalize_index_tensor(l3_skip_indices, bsz, seq_len, self.config.k_l3_skip, device)
+        if s_idx is not None:
+            add(s_idx, int(CandidateType.L3_SKIP), int(CandidateSource.L3))
+
+        if raw_tokens:
+            tokens = torch.cat(raw_tokens, dim=-1)
+            types = torch.cat(raw_types, dim=-1)
+            sources = torch.cat(raw_sources, dim=-1)
+            valid = torch.cat(raw_valids, dim=-1)
+        else:
+            tokens = positions.new_empty((bsz, seq_len, 0))
+            types = positions.new_empty((bsz, seq_len, 0))
+            sources = positions.new_empty((bsz, seq_len, 0))
+            valid = torch.zeros((bsz, seq_len, 0), device=device, dtype=torch.bool)
+
+        had_valid = valid.any(dim=-1, keepdim=True)
+        if self.config.null_fallback:
+            null_tokens = positions
+            null_valid = ~had_valid
+            tokens = torch.cat([tokens, null_tokens], dim=-1)
+            types = torch.cat([types, torch.full_like(null_tokens, int(CandidateType.NULL))], dim=-1)
+            sources = torch.cat([sources, torch.full_like(null_tokens, int(CandidateSource.NULL))], dim=-1)
+            valid = torch.cat([valid, null_valid], dim=-1)
+
+        if tokens.shape[-1] == 0 or not valid.any(dim=-1).all():
+            raise RuntimeError("CandidateProvider produced an all-invalid DSQG-W candidate row")
+
+        priority_table = torch.full((max(self.config.n_types, len(CandidateType)),), 99, device=device, dtype=torch.long)
+        for ctype, priority_value in _CANDIDATE_PRIORITY.items():
+            priority_table[int(ctype)] = int(priority_value)
+        priority = priority_table[types.clamp_min(0)]
+        raw_count = max(int(tokens.shape[-1]), 1)
+        invalid_count = (~valid).sum()
+
+        same_key = (tokens.unsqueeze(-1) == tokens.unsqueeze(-2)) & (sources.unsqueeze(-1) == sources.unsqueeze(-2))
+        same_key = same_key & valid.unsqueeze(-1) & valid.unsqueeze(-2)
+        r_count = tokens.shape[-1]
+        order = torch.arange(r_count, device=device, dtype=torch.long)
+        priority_j = priority.unsqueeze(-2)
+        min_priority = priority_j.masked_fill(~same_key, 99).amin(dim=-1)
+        earlier_same_key = same_key & (order.reshape(1, 1, 1, r_count) < order.reshape(1, 1, r_count, 1))
+        duplicate_mask = valid & earlier_same_key.any(dim=-1)
+        same_min_priority = earlier_same_key & (priority_j == priority.unsqueeze(-1))
+        keep = valid & (priority == min_priority) & ~same_min_priority.any(dim=-1)
+        duplicate_count = duplicate_mask.sum()
+
+        sort_stride_source = max(self.config.n_sources, len(CandidateSource)) + 1
+        sort_stride_token = (seq_len + 1) * sort_stride_source
+        sort_key = priority * sort_stride_token + tokens.clamp_min(0) * sort_stride_source + sources.clamp_min(0)
+        sort_key = sort_key.masked_fill(~keep, torch.iinfo(torch.long).max)
+        order_idx = sort_key.argsort(dim=-1)
+        j_max = self.config.max_candidates
+        if order_idx.shape[-1] < j_max:
+            pad = order_idx.new_zeros((*order_idx.shape[:-1], j_max - order_idx.shape[-1]))
+            order_idx = torch.cat([order_idx, pad], dim=-1)
+        order_idx = order_idx[..., :j_max]
+
+        cand_token_indices = tokens.gather(-1, order_idx)
+        cand_types = types.gather(-1, order_idx)
+        cand_sources = sources.gather(-1, order_idx)
+        cand_mask = keep.gather(-1, order_idx)
+        valid_count = cand_mask.sum(dim=-1).to(torch.long)
+        cand_token_indices = cand_token_indices.masked_fill(~cand_mask, -1)
+        cand_types = cand_types.masked_fill(~cand_mask, int(CandidateType.NULL))
+        cand_sources = cand_sources.masked_fill(~cand_mask, int(CandidateSource.NULL))
+
+        gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
+        final_gather = self._gather_states(final_states, gather_tokens)
+        l3_base = l3_states if l3_states is not None else final_states
+        l3_gather = self._gather_states(l3_base, gather_tokens)
+        summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
+        summary_gather = self._gather_states(summary_base, gather_tokens)
+        cand_states = torch.zeros((bsz, seq_len, j_max, d), device=device, dtype=final_states.dtype)
+        final_source = (cand_sources == int(CandidateSource.FINAL)) | (cand_sources == int(CandidateSource.QUESTION_CACHE))
+        l3_source = (cand_sources == int(CandidateSource.L3)) | (cand_sources == int(CandidateSource.HISA))
+        summary_source = cand_sources == int(CandidateSource.SUMMARY)
+        cand_states = torch.where(final_source[..., None], final_gather, cand_states)
+        cand_states = torch.where(l3_source[..., None], l3_gather, cand_states)
+        cand_states = torch.where(summary_source[..., None], summary_gather, cand_states)
+        cand_states = cand_states * cand_mask[..., None].to(cand_states.dtype)
+
+        denom = torch.tensor(float(raw_count * bsz * seq_len), device=device, dtype=final_states.dtype).clamp_min(1.0)
+        telemetry = {
+            "dsqg_w_candidate_duplicate_rate": duplicate_count.to(final_states.dtype) / denom,
+            "dsqg_w_candidate_invalid_rate": invalid_count.to(final_states.dtype) / denom,
+            "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+        }
+        mask_denom = cand_mask.float().sum().clamp_min(1.0)
+        for ctype in CandidateType:
+            mask = (cand_types == int(ctype)) & cand_mask
+            telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
+
+        return CandidateBatch(
+            cand_states=cand_states,
+            cand_types=cand_types,
+            cand_sources=cand_sources,
+            cand_mask=cand_mask,
+            cand_token_indices=cand_token_indices,
+            valid_candidate_count=valid_count,
+            telemetry=telemetry,
+        )
+
+    @staticmethod
+    def _normalize_index_tensor(
+        indices: torch.Tensor | None,
+        bsz: int,
+        seq_len: int,
+        limit: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if indices is None or limit <= 0:
+            return None
+        values = indices.to(device=device, dtype=torch.long)
+        if values.ndim == 1:
+            values = values[:limit].reshape(1, 1, -1).expand(bsz, seq_len, -1)
+        elif values.ndim == 2:
+            values = values[:, :limit].reshape(values.shape[0], 1, -1).expand(-1, seq_len, -1)
+        elif values.ndim == 3:
+            values = values[:, :, :limit]
+        else:
+            raise ValueError("candidate index tensors must be rank 1, 2, or 3")
+        if values.shape[0] == 1 and bsz != 1:
+            values = values.expand(bsz, -1, -1)
+        if values.shape[1] == 1 and seq_len != 1:
+            values = values.expand(-1, seq_len, -1)
+        if values.shape[:2] != (bsz, seq_len):
+            raise ValueError("candidate index tensor must broadcast to [B,T,K]")
+        return values
+
+    @staticmethod
+    def _gather_states(states: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, d = states.shape
+        batch_offsets = torch.arange(bsz, device=states.device, dtype=torch.long).reshape(bsz, 1, 1) * seq_len
+        flat_indices = (batch_offsets + token_indices.to(torch.long)).reshape(-1)
+        return states.reshape(bsz * seq_len, d).index_select(0, flat_indices).reshape(*token_indices.shape, d)
+
+    def _build_reference(
+        self,
+        final_states: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        question_indices: torch.Tensor | list[list[int]] | None = None,
+        hisa_evidence_indices: torch.Tensor | None = None,
+        chunk_rep_indices: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+        l3_skip_indices: torch.Tensor | None = None,
+    ) -> CandidateBatch:
         if final_states.ndim != 3:
             raise ValueError("final_states must have shape [B, T, D]")
         bsz, seq_len, d = final_states.shape
