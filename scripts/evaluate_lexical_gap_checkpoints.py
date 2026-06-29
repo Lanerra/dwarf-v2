@@ -43,7 +43,7 @@ def _set_eval_env(
     sites: str = "2,6,final",
     width_cell: bool = False,
     width_bottleneck: int = 64,
-    width_gate_init: float = -5.0,
+    width_gate_init: float = -2.5,
 ) -> None:
     os.environ["DWARF_DISABLE_BNB"] = "1"
     os.environ["DWARF_LIGER"] = "0"
@@ -85,7 +85,7 @@ def load_trainer_module(
     sites: str = "2,6,final",
     width_cell: bool = False,
     width_bottleneck: int = 64,
-    width_gate_init: float = -5.0,
+    width_gate_init: float = -2.5,
 ):
     _set_eval_env(
         dsqg_w=dsqg_w,
@@ -219,7 +219,7 @@ def evaluate_checkpoint(
     sites: str = "2,6,final",
     width_cell: bool = False,
     width_bottleneck: int = 64,
-    width_gate_init: float = -5.0,
+    width_gate_init: float = -2.5,
     device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     if device is None:
@@ -316,7 +316,7 @@ def run_comparison(
     sites: str = "2,6,final",
     dsqg_w_width_cell: bool = False,
     dsqg_w_width_bottleneck: int = 64,
-    dsqg_w_width_gate_init: float = -5.0,
+    dsqg_w_width_gate_init: float = -2.5,
     device: str | None = None,
 ) -> dict[str, Any]:
     micro = load_microtrain_module()
@@ -369,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sites", default="2,6,final")
     parser.add_argument("--dsqg-w-width-cell", action="store_true", help="Instantiate the DSQG-W checkpoint with the width cell enabled.")
     parser.add_argument("--dsqg-w-width-bottleneck", type=int, default=64)
-    parser.add_argument("--dsqg-w-width-gate-init", type=float, default=-5.0)
+    parser.add_argument("--dsqg-w-width-gate-init", type=float, default=-2.5)
     parser.add_argument("--device", default=None)
     args = parser.parse_args(argv)
     report = run_comparison(

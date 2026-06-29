@@ -498,6 +498,41 @@ class CandidateProvider:
         return out
 
 
+def width_pair_transfer_loss(
+    probs: torch.Tensor,
+    cand_types: torch.Tensor,
+    cand_mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Directional width-transfer loss for QUESTION <-> HISA_EVIDENCE lateral mass."""
+    if probs.ndim == 5:
+        p = probs.mean(dim=-1)
+    elif probs.ndim == 4:
+        p = probs
+    else:
+        raise ValueError("probs must have shape [B,T,J,J] or [B,T,J,J,H]")
+    if cand_types.shape != cand_mask.shape or p.shape[:3] != cand_types.shape or p.shape[3] != cand_types.shape[2]:
+        raise ValueError("candidate tensors must align with probs [B,T,J,J]")
+    valid_targets = cand_mask.bool()
+
+    def direction_mass(target_type: CandidateType, source_type: CandidateType) -> torch.Tensor:
+        target_mask = (cand_types == int(target_type)) & valid_targets
+        source_mask = (cand_types == int(source_type)) & cand_mask.bool()
+        if not target_mask.any():
+            return p.sum() * 0.0
+        mass = p.masked_fill(~source_mask[:, :, None, :], 0.0).sum(dim=-1)
+        selected = mass.masked_select(target_mask)
+        if selected.numel() == 0:
+            return p.sum() * 0.0
+        return selected.mean()
+
+    q_to_hisa = direction_mass(CandidateType.QUESTION, CandidateType.HISA_EVIDENCE)
+    hisa_to_q = direction_mass(CandidateType.HISA_EVIDENCE, CandidateType.QUESTION)
+    transfer_mass = 0.5 * (q_to_hisa + hisa_to_q)
+    return -torch.log(transfer_mass.clamp_min(float(eps)))
+
+
 class DSQGWWidthCell(nn.Module):
     """Bounded candidate-to-candidate semantic transfer over the DSQG-W width axis."""
 
@@ -588,6 +623,7 @@ class DSQGWWidthCell(nn.Module):
             return mass.masked_select(target_mask).mean()
 
         delta_norm = delta.masked_select(cand_mask[..., None]).reshape(-1, d).norm(dim=-1).mean()
+        aux_loss = width_pair_transfer_loss(p_mean, cand_types, cand_mask)
         telemetry = {
             "dsqg_w_width_entropy": entropy.detach(),
             "dsqg_w_width_self_mass": self_mass.detach(),
@@ -595,6 +631,8 @@ class DSQGWWidthCell(nn.Module):
             "dsqg_w_width_gate_min": gate.min().detach(),
             "dsqg_w_width_gate_max": gate.max().detach(),
             "dsqg_w_width_delta_norm": delta_norm.detach(),
+            "dsqg_w_width_aux_loss": aux_loss,
+            "dsqg_w_width_aux_loss_value": aux_loss.detach(),
             "dsqg_w_width_question_to_hisa_evidence_mass": pair_mass(
                 CandidateType.QUESTION, CandidateType.HISA_EVIDENCE
             ).detach(),

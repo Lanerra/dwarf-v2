@@ -15,6 +15,7 @@ from kernels.dsqg_w.dsqg_w_mvp import (
     conditional_copy_unlikelihood_loss,
     entropy_floor_loss,
     local_mass_cap_loss,
+    width_pair_transfer_loss,
 )
 
 
@@ -283,6 +284,31 @@ def test_dsqg_w_width_cell_pair_bias_can_directionally_route_question_to_evidenc
 
     assert telemetry["dsqg_w_width_question_to_hisa_evidence_mass"].item() > 0.70
     assert telemetry["dsqg_w_width_self_mass"].item() < 0.60
+
+
+def test_width_pair_transfer_loss_rewards_question_evidence_lateral_mass() -> None:
+    probs = torch.tensor(
+        [[[
+            [0.20, 0.70, 0.10],
+            [0.60, 0.30, 0.10],
+            [0.20, 0.20, 0.60],
+        ]]],
+        requires_grad=True,
+    )
+    cand_types = torch.tensor([[[
+        int(CandidateType.QUESTION),
+        int(CandidateType.HISA_EVIDENCE),
+        int(CandidateType.LOCAL),
+    ]]])
+    cand_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+
+    loss = width_pair_transfer_loss(probs, cand_types, cand_mask)
+    loss.backward()
+
+    assert loss.item() == pytest.approx(-torch.log(torch.tensor(0.65)).item(), rel=1e-5)
+    assert probs.grad is not None
+    assert probs.grad[0, 0, 0, 1].item() < 0.0
+    assert probs.grad[0, 0, 1, 0].item() < 0.0
 
 
 def test_dsqg_w_block_is_causal_under_future_token_changes() -> None:

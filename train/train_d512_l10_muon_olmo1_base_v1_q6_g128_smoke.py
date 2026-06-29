@@ -349,6 +349,7 @@ DSQG_W_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_GATE_INIT', '-5.0'))
 DSQG_W_WIDTH_CELL = os.getenv('DWARF_DSQG_W_WIDTH_CELL', '0') == '1'
 DSQG_W_WIDTH_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_WIDTH_BOTTLENECK', '64'))
 DSQG_W_WIDTH_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_WIDTH_GATE_INIT', '-5.0'))
+DSQG_W_WIDTH_AUX_WEIGHT = float(os.environ.get('DWARF_DSQG_W_WIDTH_AUX_WEIGHT', '0.0'))
 DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2, 4, 8))
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
 DSQG_W_QUESTION_ENABLED = os.getenv('DWARF_DSQG_W_QUESTION', '0') == '1'
@@ -380,6 +381,33 @@ def _parse_dsqg_w_site_specs(raw: str | None):
     if not out:
         raise ValueError('DWARF_DSQG_W_SITES did not contain any site entries')
     return tuple(out)
+
+
+def _dsqg_w_training_candidate_indices(x: torch.Tensor):
+    if not DSQG_W_ENABLED:
+        return None, None, None
+    bsz, seq_len = x.shape
+    device = x.device
+    question_indices = None
+    if DSQG_W_QUESTION_ENABLED and DSQG_W_K_QUESTION > 0:
+        base = torch.linspace(0, max(seq_len - 1, 0), steps=DSQG_W_K_QUESTION, device=device)
+        question_indices = base.round().to(torch.long).clamp_(0, max(seq_len - 1, 0)).unsqueeze(0).expand(bsz, -1).contiguous()
+    positions = torch.arange(seq_len, device=device, dtype=torch.long)
+    hisa_evidence_indices = None
+    l3_skip_indices = None
+    if DSQG_W_HISA_L3_ENABLED and DSQG_W_K_HISA_EVIDENCE > 0:
+        offsets = [1, 8, 32, 128, 256, 512]
+        while len(offsets) < DSQG_W_K_HISA_EVIDENCE:
+            offsets.append(offsets[-1] * 2)
+        rows = [(positions - off).clamp_min(0) for off in offsets[:DSQG_W_K_HISA_EVIDENCE]]
+        hisa_evidence_indices = torch.stack(rows, dim=-1).unsqueeze(0).expand(bsz, -1, -1).contiguous()
+    if DSQG_W_HISA_L3_ENABLED and DSQG_W_K_L3_SKIP > 0:
+        offsets = [16, 64, 256, 1024]
+        while len(offsets) < DSQG_W_K_L3_SKIP:
+            offsets.append(offsets[-1] * 2)
+        rows = [(positions - off).clamp_min(0) for off in offsets[:DSQG_W_K_L3_SKIP]]
+        l3_skip_indices = torch.stack(rows, dim=-1).unsqueeze(0).expand(bsz, -1, -1).contiguous()
+    return question_indices, hisa_evidence_indices, l3_skip_indices
 
 
 DSQG_W_SITE_SPECS = _parse_dsqg_w_site_specs(os.getenv('DWARF_DSQG_W_SITES'))
@@ -3329,6 +3357,7 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'width_cell': DSQG_W_WIDTH_CELL,
                 'width_bottleneck': DSQG_W_WIDTH_BOTTLENECK,
                 'width_gate_init': DSQG_W_WIDTH_GATE_INIT,
+                'width_aux_weight': DSQG_W_WIDTH_AUX_WEIGHT,
                 'local_offsets': list(DSQG_W_LOCAL_OFFSETS),
                 'long_offsets': list(DSQG_W_LONG_OFFSETS),
                 'question_enabled': DSQG_W_QUESTION_ENABLED,
@@ -3624,6 +3653,30 @@ def _streamed_linear_ce_loss(hidden: torch.Tensor,
     return total_loss, n_valid
 
 
+def _dsqg_w_width_aux_loss(*models):
+    if (not DSQG_W_ENABLED) or (not DSQG_W_WIDTH_CELL) or DSQG_W_WIDTH_AUX_WEIGHT <= 0.0:
+        return None
+    for model_ref in models:
+        if model_ref is None:
+            continue
+        telemetry = getattr(model_ref, 'dsqg_w_last_telemetry', {}) or {}
+        aux = telemetry.get('dsqg_w_width_aux_loss')
+        if torch.is_tensor(aux) and aux.requires_grad and aux.numel() == 1:
+            return aux
+    return None
+
+
+def _dsqg_w_width_aux_value(*models):
+    for model_ref in models:
+        if model_ref is None:
+            continue
+        telemetry = getattr(model_ref, 'dsqg_w_last_telemetry', {}) or {}
+        aux = telemetry.get('dsqg_w_width_aux_loss_value', telemetry.get('dsqg_w_width_aux_loss'))
+        if torch.is_tensor(aux) and aux.numel() == 1:
+            return float(aux.detach().item())
+    return None
+
+
 @torch.inference_mode()
 def evaluate(model, data, device, loss_mask=None):
     model.eval()
@@ -3765,7 +3818,8 @@ def train():
         print(f'  DSQG-W recomposer sites={site_text}: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
               f'width_cell={DSQG_W_WIDTH_CELL} width_bottleneck={DSQG_W_WIDTH_BOTTLENECK} '
-              f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} candidates={candidate_path}')
+              f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} width_aux_weight={DSQG_W_WIDTH_AUX_WEIGHT} '
+              f'candidates={candidate_path}')
     else:
         print('  DSQG-W recomposer: disabled')
     print('  DSR:  V15HISA')
@@ -3977,6 +4031,8 @@ def train():
             t0 = time.time()
 
             loss_accum = 0.0
+            width_aux_accum = 0.0
+            width_aux_count = 0
             micro_starts = []
             for ga in range(GRAD_ACCUM):
                 idx_start = (acc_step * GRAD_ACCUM + ga) * BATCH_SIZE
@@ -3999,10 +4055,25 @@ def train():
                     x = x.long()
                 y = batch[:, 1:].to(device, non_blocking=True).long()
                 target_mask = batch_mask[:, 1:].to(device, non_blocking=True)
+                dsqg_w_question_indices, dsqg_w_hisa_evidence_indices, dsqg_w_l3_skip_indices = _dsqg_w_training_candidate_indices(x)
 
                 if USE_LIGER_CE:
                     with _amp_context(device):
-                        hidden = model.forward_hidden(x)
+                        hidden = model.forward_hidden(
+                            x,
+                            dsqg_w_question_indices=dsqg_w_question_indices,
+                            dsqg_w_hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                            dsqg_w_l3_skip_indices=dsqg_w_l3_skip_indices,
+                        )
+                    width_aux = _dsqg_w_width_aux_loss(model_ref, model)
+                    width_aux_value = _dsqg_w_width_aux_value(model_ref, model)
+                    if DSQG_W_WIDTH_AUX_WEIGHT > 0.0 and width_aux_value is None:
+                        raise RuntimeError('DWARF_DSQG_W_WIDTH_AUX_WEIGHT requested but DSQG-W width aux telemetry is unavailable')
+                    if width_aux_value is not None:
+                        width_aux_accum += width_aux_value
+                        width_aux_count += 1
+                    if width_aux is not None:
+                        (width_aux * (DSQG_W_WIDTH_AUX_WEIGHT / float(max(len(micro_starts), 1)))).backward(retain_graph=True)
                     # LigerFusedLinearCrossEntropyLoss.forward(lin_weight, _input, target)
                     loss = liger_ce_fn(
                         model_ref.out.weight,
@@ -4017,7 +4088,21 @@ def train():
                 else:
                     n_rows = y.numel()
                     with _amp_context(device):
-                        hidden = model.forward_hidden(x)
+                        hidden = model.forward_hidden(
+                            x,
+                            dsqg_w_question_indices=dsqg_w_question_indices,
+                            dsqg_w_hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                            dsqg_w_l3_skip_indices=dsqg_w_l3_skip_indices,
+                        )
+                    width_aux = _dsqg_w_width_aux_loss(model_ref, model)
+                    width_aux_value = _dsqg_w_width_aux_value(model_ref, model)
+                    if DSQG_W_WIDTH_AUX_WEIGHT > 0.0 and width_aux_value is None:
+                        raise RuntimeError('DWARF_DSQG_W_WIDTH_AUX_WEIGHT requested but DSQG-W width aux telemetry is unavailable')
+                    if width_aux_value is not None:
+                        width_aux_accum += width_aux_value
+                        width_aux_count += 1
+                    if width_aux is not None:
+                        (width_aux * (DSQG_W_WIDTH_AUX_WEIGHT / float(max(len(micro_starts), 1)))).backward(retain_graph=True)
                     total_loss, _ = _streamed_linear_ce_loss(
                         hidden, y, model_ref.out.weight,
                         chunk_rows=CE_CHUNK,
@@ -4071,11 +4156,13 @@ def train():
                     model_ref.blocks[DSR_LAYER].attn,
                     '_routing_entropy', None)
                 entropy_str = ''
+                if width_aux_count > 0:
+                    entropy_str += f' w_aux={width_aux_accum / float(width_aux_count):.4f}'
                 if routing_entropy is not None:
                     if torch.is_tensor(routing_entropy):
                         routing_entropy = float(routing_entropy.detach().item())
                     if isinstance(routing_entropy, float) and math.isfinite(routing_entropy):
-                        entropy_str = f' routing_ent={routing_entropy:.3f}'
+                        entropy_str += f' routing_ent={routing_entropy:.3f}'
                 stage2_frac = getattr(
                     model_ref.blocks[DSR_LAYER].attn,
                     '_stage2_selected_fraction', None)

@@ -58,12 +58,14 @@ def test_full_run_launcher_can_enable_width_cell_env(tmp_path: Path) -> None:
         width_cell=True,
         width_bottleneck=12,
         width_gate_init=-3.5,
+        width_aux_weight=0.25,
     )
 
     env = cfg["env"]
     assert env["DWARF_DSQG_W_WIDTH_CELL"] == "1"
     assert env["DWARF_DSQG_W_WIDTH_BOTTLENECK"] == "12"
     assert env["DWARF_DSQG_W_WIDTH_GATE_INIT"] == "-3.5"
+    assert env["DWARF_DSQG_W_WIDTH_AUX_WEIGHT"] == "0.25"
 
 
 def test_full_run_launcher_dry_run_writes_config_without_executing(tmp_path: Path) -> None:

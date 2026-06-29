@@ -238,6 +238,21 @@ def test_layer_summary_includes_configured_dsqg_w_sites(monkeypatch) -> None:
     assert "FINAL:DSQG-W" in summary
 
 
+def test_training_candidate_indices_populate_width_semantic_types(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True, hisa_l3=True)
+    x = torch.randint(0, 128, (2, 12), dtype=torch.long)
+
+    question, hisa, l3_skip = mod._dsqg_w_training_candidate_indices(x)
+
+    assert question.shape == (2, 4)
+    assert hisa.shape == (2, 12, 4)
+    assert l3_skip.shape == (2, 12, 2)
+    assert torch.le(question, 11).all()
+    positions = torch.arange(12).view(1, 12, 1)
+    assert torch.le(hisa, positions).all()
+    assert torch.le(l3_skip, positions).all()
+
+
 def test_dsqg_w_sites_apply_layer_and_final_recomposers_in_order(monkeypatch) -> None:
     mod = load_trainer(monkeypatch, dsqg_w=True, question=True, sites="2,final")
     model = make_model(mod)
