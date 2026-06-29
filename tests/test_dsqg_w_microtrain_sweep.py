@@ -56,6 +56,8 @@ def test_sweep_runs_configs_and_ranks_by_validation_delta(tmp_path: Path) -> Non
     assert len(summary["runs"]) == 2
     assert summary["best_by_val_loss_delta"]["val_loss_delta"] == min(run["val_loss_delta"] for run in summary["runs"])
     assert all(run["pass"] for run in summary["runs"])
+    assert all("val_mean_rank_delta" in run for run in summary["runs"])
+    assert all("val_top1_acc_delta" in run for run in summary["runs"])
     assert all(Path(run["report_path"]).exists() for run in summary["runs"])
     assert Path(summary["summary_path"]).exists()
     saved = json.loads(Path(summary["summary_path"]).read_text())
@@ -78,6 +80,24 @@ def test_sweep_reuses_existing_run_reports_without_rerunning(tmp_path: Path, mon
         "val_loss_initial": 10.1,
         "val_loss_final": 10.0,
         "val_loss_delta": -0.1,
+        "train_mean_rank_initial": 100.0,
+        "train_mean_rank_final": 90.0,
+        "train_mean_rank_delta": -10.0,
+        "train_top1_acc_initial": 0.0,
+        "train_top1_acc_final": 0.1,
+        "train_top1_acc_delta": 0.1,
+        "train_top5_acc_initial": 0.0,
+        "train_top5_acc_final": 0.2,
+        "train_top5_acc_delta": 0.2,
+        "val_mean_rank_initial": 120.0,
+        "val_mean_rank_final": 110.0,
+        "val_mean_rank_delta": -10.0,
+        "val_top1_acc_initial": 0.0,
+        "val_top1_acc_final": 0.1,
+        "val_top1_acc_delta": 0.1,
+        "val_top5_acc_initial": 0.0,
+        "val_top5_acc_final": 0.2,
+        "val_top5_acc_delta": 0.2,
         "changed_dsqg_w_param_count": 19,
         "changed_frozen_param_count": 0,
         "checkpoint_roundtrip_loss_delta": 0.0,

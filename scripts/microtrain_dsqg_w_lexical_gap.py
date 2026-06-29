@@ -115,6 +115,40 @@ def _loss(obj, model, batch) -> float:
     return float(result.loss.detach().float().cpu().item())
 
 
+def answer_rank_metrics(logits: torch.Tensor, labels: torch.Tensor, answer_mask: torch.Tensor, *, prefix: str) -> dict[str, float]:
+    labels = labels.to(device=logits.device)
+    answer_mask = answer_mask.to(device=logits.device)
+    masked_logits = logits[answer_mask]
+    masked_labels = labels[answer_mask]
+    if masked_labels.numel() == 0:
+        raise ValueError("answer_mask must select at least one token")
+    target_scores = masked_logits.gather(1, masked_labels.view(-1, 1)).squeeze(1)
+    ranks = (masked_logits > target_scores.view(-1, 1)).sum(dim=1).to(torch.float32) + 1.0
+    sorted_ranks = torch.sort(ranks).values
+    n = int(sorted_ranks.numel())
+    if n % 2 == 1:
+        median_rank = float(sorted_ranks[n // 2].detach().cpu().item())
+    else:
+        median_rank = float(((sorted_ranks[n // 2 - 1] + sorted_ranks[n // 2]) / 2.0).detach().cpu().item())
+    return {
+        f"{prefix}_answer_tokens": float(masked_labels.numel()),
+        f"{prefix}_top1_acc": float((ranks <= 1).to(torch.float32).mean().detach().cpu().item()),
+        f"{prefix}_top5_acc": float((ranks <= 5).to(torch.float32).mean().detach().cpu().item()),
+        f"{prefix}_top10_acc": float((ranks <= 10).to(torch.float32).mean().detach().cpu().item()),
+        f"{prefix}_mean_rank": float(ranks.mean().detach().cpu().item()),
+        f"{prefix}_median_rank": median_rank,
+        f"{prefix}_min_rank": float(ranks.min().detach().cpu().item()),
+        f"{prefix}_max_rank": float(ranks.max().detach().cpu().item()),
+    }
+
+
+def _loss_and_rank_metrics(obj, model, batch, *, prefix: str) -> tuple[float, dict[str, float]]:
+    with torch.no_grad():
+        result = obj.compute_frozen_dsqg_w_objective(model, batch)
+    loss = float(result.loss.detach().float().cpu().item())
+    return loss, answer_rank_metrics(result.logits, batch.labels, batch.answer_mask, prefix=prefix)
+
+
 def _changed_names(before: dict[str, torch.Tensor], model, *, prefix: str | None) -> list[str]:
     changed: list[str] = []
     for name, param in model.named_parameters():
@@ -162,8 +196,8 @@ def run_microtrain(
     optimizer = obj.make_dsqg_w_optimizer(model, lr=lr)
     before = {name: param.detach().clone() for name, param in model.named_parameters()}
 
-    train_initial = _loss(obj, model, train_batch)
-    val_initial = _loss(obj, model, val_batch)
+    train_initial, train_rank_initial = _loss_and_rank_metrics(obj, model, train_batch, prefix="train_initial")
+    val_initial, val_rank_initial = _loss_and_rank_metrics(obj, model, val_batch, prefix="val_initial")
     train_losses_before_step: list[float] = []
     step_reports: list[dict[str, Any]] = []
     model.train()
@@ -173,8 +207,8 @@ def run_microtrain(
         train_losses_before_step.append(float(step_report["loss_before_step"]))
 
     model.eval()
-    train_final = _loss(obj, model, train_batch)
-    val_final = _loss(obj, model, val_batch)
+    train_final, train_rank_final = _loss_and_rank_metrics(obj, model, train_batch, prefix="train_final")
+    val_final, val_rank_final = _loss_and_rank_metrics(obj, model, val_batch, prefix="val_final")
     changed_dsqg_w = _changed_names(before, model, prefix="dsqg_w.")
     changed_frozen = _changed_names(before, model, prefix=None)
 
@@ -207,6 +241,18 @@ def run_microtrain(
     roundtrip_delta = roundtrip_loss - train_final
 
     telemetry = dict(step_reports[-1]["telemetry"]) if step_reports else {}
+    rank_metrics: dict[str, float] = {}
+    rank_metrics.update(train_rank_initial)
+    rank_metrics.update(train_rank_final)
+    rank_metrics.update(val_rank_initial)
+    rank_metrics.update(val_rank_final)
+    for split in ["train", "val"]:
+        for metric in ["top1_acc", "top5_acc", "top10_acc", "mean_rank", "median_rank", "min_rank", "max_rank"]:
+            rank_metrics[f"{split}_{metric}_initial"] = rank_metrics.pop(f"{split}_initial_{metric}")
+            rank_metrics[f"{split}_{metric}_final"] = rank_metrics.pop(f"{split}_final_{metric}")
+            rank_metrics[f"{split}_{metric}_delta"] = rank_metrics[f"{split}_{metric}_final"] - rank_metrics[f"{split}_{metric}_initial"]
+        rank_metrics[f"{split}_answer_tokens_initial"] = rank_metrics.pop(f"{split}_initial_answer_tokens")
+        rank_metrics[f"{split}_answer_tokens_final"] = rank_metrics.pop(f"{split}_final_answer_tokens")
     report = {
         "pass": bool(
             _finite(train_initial)
@@ -234,6 +280,7 @@ def run_microtrain(
         "val_loss_initial": val_initial,
         "val_loss_final": val_final,
         "val_loss_delta": val_final - val_initial,
+        **rank_metrics,
         "train_losses_before_step": train_losses_before_step,
         "train_answer_tokens": float(train_batch.answer_mask.sum().item()),
         "val_answer_tokens": float(val_batch.answer_mask.sum().item()),

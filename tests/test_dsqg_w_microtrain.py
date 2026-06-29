@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/microtrain_dsqg_w_lexical_gap.py"
@@ -39,6 +40,28 @@ def test_generate_lexical_gap_dataset_has_train_val_records() -> None:
         assert record["l3_skip_indices"]
 
 
+def test_answer_rank_metrics_measure_topk_and_rank() -> None:
+    mod = load_microtrain_module()
+    logits = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 4.0, 3.0, 2.0],
+                [4.0, 3.0, 2.0, 1.0, 0.0],
+            ]
+        ]
+    )
+    labels = torch.tensor([[2, 2]], dtype=torch.long)
+    answer_mask = torch.tensor([[True, True]])
+
+    metrics = mod.answer_rank_metrics(logits, labels, answer_mask, prefix="toy")
+
+    assert metrics["toy_answer_tokens"] == 2.0
+    assert metrics["toy_top1_acc"] == pytest.approx(0.5)
+    assert metrics["toy_top5_acc"] == pytest.approx(1.0)
+    assert metrics["toy_mean_rank"] == pytest.approx(2.0)
+    assert metrics["toy_median_rank"] == pytest.approx(2.0)
+
+
 def test_microtrainer_runs_tokenized_train_val_checkpoint_roundtrip(tmp_path: Path) -> None:
     mod = load_microtrain_module()
 
@@ -59,6 +82,16 @@ def test_microtrainer_runs_tokenized_train_val_checkpoint_roundtrip(tmp_path: Pa
     assert report["val_examples"] == 6
     assert report["steps"] == 2
     assert report["train_loss_final"] < report["train_loss_initial"]
+    assert report["train_mean_rank_initial"] > 0.0
+    assert report["train_mean_rank_final"] > 0.0
+    assert "train_mean_rank_delta" in report
+    assert 0.0 <= report["train_top1_acc_initial"] <= 1.0
+    assert 0.0 <= report["train_top1_acc_final"] <= 1.0
+    assert report["val_mean_rank_initial"] > 0.0
+    assert report["val_mean_rank_final"] > 0.0
+    assert "val_mean_rank_delta" in report
+    assert 0.0 <= report["val_top5_acc_initial"] <= 1.0
+    assert 0.0 <= report["val_top5_acc_final"] <= 1.0
     assert report["val_loss_initial"] > 0.0
     assert report["val_loss_final"] > 0.0
     assert report["checkpoint_roundtrip_loss_delta"] == pytest.approx(0.0)
