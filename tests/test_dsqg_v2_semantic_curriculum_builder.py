@@ -31,21 +31,30 @@ def test_semantic_curriculum_artifact_has_shifted_answer_masks_and_manifest(tmp_
     )
 
     dataset_path = Path(report["dataset_path"])
+    same_family_dataset_path = Path(report["same_family_dataset_path"])
     manifest_path = Path(report["manifest_path"])
     audit_path = Path(report["audit_path"])
     assert dataset_path.exists()
+    assert same_family_dataset_path.exists()
     assert manifest_path.exists()
     assert audit_path.exists()
 
     payload = torch.load(dataset_path, weights_only=True)
+    same_family_payload = torch.load(same_family_dataset_path, weights_only=True)
     assert payload["train"].shape == (24, 256)
     assert payload["val"].shape == (12, 256)
+    assert payload["val_same_family"].shape == (12, 256)
     assert payload["train_loss_mask"].shape == payload["train"].shape
     assert payload["val_loss_mask"].shape == payload["val"].shape
+    assert payload["val_same_family_loss_mask"].shape == payload["val_same_family"].shape
     assert payload["train_loss_mask"][:, 1:].any()
     assert not payload["train_loss_mask"][:, 0].any()
     assert payload["train_source_id"].shape == (24,)
     assert payload["val_source_id"].shape == (12,)
+    assert payload["val_same_family_source_id"].shape == (12,)
+    assert same_family_payload["metadata"]["active_val_lane"] == "same_family"
+    assert torch.equal(same_family_payload["val"], payload["val_same_family"])
+    assert torch.equal(same_family_payload["val_loss_mask"], payload["val_same_family_loss_mask"])
 
     manifest = json.loads(manifest_path.read_text())
     audit = json.loads(audit_path.read_text())
@@ -53,9 +62,12 @@ def test_semantic_curriculum_artifact_has_shifted_answer_masks_and_manifest(tmp_
     assert manifest["mask_alignment"] == "token-column aligned; trainer uses loss_mask[:, 1:] for next-token targets"
     assert manifest["architecture_note"] == "DSQG-W overlays semantic width on the DSQG-D retrieval/depth backbone; it is not a DSQG-D replacement."
     assert audit["pass"] is True
-    assert audit["leakage"]["prompt_hash_overlap_count"] == 0
-    assert audit["leakage"]["family_id_overlap_count"] == 0
+    assert audit["validation_lanes"]["strict"]["leakage"]["prompt_hash_overlap_count"] == 0
+    assert audit["validation_lanes"]["strict"]["leakage"]["family_id_overlap_count"] == 0
+    assert audit["validation_lanes"]["same_family"]["leakage"]["prompt_hash_overlap_count"] == 0
+    assert audit["validation_lanes"]["same_family"]["leakage"]["family_id_overlap_count"] > 0
     assert audit["splits"]["train"]["real_loss_tokens"] == int(payload["train_loss_mask"][:, 1:].sum().item())
+    assert audit["splits"]["val_same_family"]["real_loss_tokens"] == int(payload["val_same_family_loss_mask"][:, 1:].sum().item())
     assert set(audit["splits"]["train"]["bucket_counts"]) >= {"lexical_gap", "copy_conflict", "relation_bridge", "retrieval_guardrail"}
 
 

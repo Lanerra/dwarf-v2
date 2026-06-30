@@ -189,8 +189,17 @@ def make_record(
     pad_id: int,
     eos_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    facts_by_bucket = TRAIN_FACTS if split == "train" else VAL_FACTS
-    templates_by_bucket = TRAIN_TEMPLATES if split == "train" else VAL_TEMPLATES
+    if split == "train":
+        facts_by_bucket = TRAIN_FACTS
+        templates_by_bucket = TRAIN_TEMPLATES
+    elif split == "val_same_family":
+        # Same fact families as train, but held-out validation templates.  This
+        # separates template generalization from strict unseen-family generalization.
+        facts_by_bucket = TRAIN_FACTS
+        templates_by_bucket = VAL_TEMPLATES
+    else:
+        facts_by_bucket = VAL_FACTS
+        templates_by_bucket = VAL_TEMPLATES
     relation, subject, answer, evidence = facts_by_bucket[bucket][index % len(facts_by_bucket[bucket])]
     template = templates_by_bucket[bucket][index % len(templates_by_bucket[bucket])]
     distractor = subject if bucket != "copy_conflict" else f"not_{answer}"
@@ -340,7 +349,16 @@ def split_summary(records: list[dict[str, Any]], loss_tokens: int, target_slots:
     }
 
 
-def audit_records(train_records: list[dict[str, Any]], val_records: list[dict[str, Any]], *, train_loss_tokens: int, val_loss_tokens: int, train_target_slots: int | None = None, val_target_slots: int | None = None) -> dict[str, Any]:
+def audit_records(
+    train_records: list[dict[str, Any]],
+    val_records: list[dict[str, Any]],
+    *,
+    train_loss_tokens: int,
+    val_loss_tokens: int,
+    train_target_slots: int | None = None,
+    val_target_slots: int | None = None,
+    allow_family_overlap: bool = False,
+) -> dict[str, Any]:
     train_hashes = {str(r["prompt_hash"]) for r in train_records}
     val_hashes = {str(r["prompt_hash"]) for r in val_records}
     train_ids = {str(r["id"]) for r in train_records}
@@ -356,8 +374,11 @@ def audit_records(train_records: list[dict[str, Any]], val_records: list[dict[st
         "template_id_overlap_count": len(train_templates & val_templates),
     }
     zero_answer_records = [r["id"] for r in train_records + val_records if int(r.get("answer_token_count", 0)) <= 0]
+    fatal_leakage = dict(leakage)
+    if allow_family_overlap:
+        fatal_leakage["family_id_overlap_count"] = 0
     pass_flag = (
-        all(v == 0 for v in leakage.values())
+        all(v == 0 for v in fatal_leakage.values())
         and int(train_loss_tokens) > 0
         and int(val_loss_tokens) > 0
         and not zero_answer_records
@@ -365,6 +386,7 @@ def audit_records(train_records: list[dict[str, Any]], val_records: list[dict[st
     return {
         "pass": bool(pass_flag),
         "leakage": leakage,
+        "allow_family_overlap": bool(allow_family_overlap),
         "zero_answer_records": zero_answer_records[:20],
         "splits": {
             "train": split_summary(train_records, train_loss_tokens, train_target_slots),
@@ -398,9 +420,19 @@ def build_curriculum(
     val, val_mask, val_source_id, val_records = make_split(
         tokenizer, split="val", size=int(val_size), seq_len=int(seq_len), seed=int(seed), pad_id=pad_id, eos_id=eos_id
     )
+    val_same_family, val_same_family_mask, val_same_family_source_id, val_same_family_records = make_split(
+        tokenizer,
+        split="val_same_family",
+        size=int(val_size),
+        seq_len=int(seq_len),
+        seed=int(seed),
+        pad_id=pad_id,
+        eos_id=eos_id,
+    )
     train_loss_tokens = int(train_mask[:, 1:].sum().item())
     val_loss_tokens = int(val_mask[:, 1:].sum().item())
-    audit = audit_records(
+    val_same_family_loss_tokens = int(val_same_family_mask[:, 1:].sum().item())
+    strict_audit = audit_records(
         train_records,
         val_records,
         train_loss_tokens=train_loss_tokens,
@@ -408,12 +440,38 @@ def build_curriculum(
         train_target_slots=int(train_mask[:, 1:].numel()),
         val_target_slots=int(val_mask[:, 1:].numel()),
     )
+    same_family_audit = audit_records(
+        train_records,
+        val_same_family_records,
+        train_loss_tokens=train_loss_tokens,
+        val_loss_tokens=val_same_family_loss_tokens,
+        train_target_slots=int(train_mask[:, 1:].numel()),
+        val_target_slots=int(val_same_family_mask[:, 1:].numel()),
+        allow_family_overlap=True,
+    )
+    audit = {
+        "pass": bool(strict_audit["pass"] and same_family_audit["pass"]),
+        "validation_lanes": {
+            "strict": strict_audit,
+            "same_family": same_family_audit,
+        },
+        "splits": {
+            "train": strict_audit["splits"]["train"],
+            "val": strict_audit["splits"]["val"],
+            "val_same_family": same_family_audit["splits"]["val"],
+        },
+        "zero_answer_records": sorted(
+            set(strict_audit["zero_answer_records"]) | set(same_family_audit["zero_answer_records"])
+        ),
+    }
     if not audit["pass"]:
-        raise ValueError(f"semantic curriculum audit failed: {json.dumps(audit['leakage'], sort_keys=True)}")
+        raise ValueError(f"semantic curriculum audit failed: {json.dumps(audit['validation_lanes'], sort_keys=True)}")
 
     dataset_path = out / f"dsqg_v2_semantic_curriculum_{seq_len}_train{train_size}_val{val_size}.pt"
+    same_family_dataset_path = out / f"dsqg_v2_semantic_curriculum_{seq_len}_train{train_size}_val{val_size}_same_family.pt"
     train_jsonl = out / "train_records.jsonl"
     val_jsonl = out / "val_records.jsonl"
+    val_same_family_jsonl = out / "val_same_family_records.jsonl"
     manifest_path = out / "manifest.json"
     audit_path = out / "audit.json"
     samples_path = out / "decoded_samples.json"
@@ -421,30 +479,46 @@ def build_curriculum(
     payload = {
         "train": train,
         "val": val,
+        "val_same_family": val_same_family,
         "train_loss_mask": train_mask,
         "val_loss_mask": val_mask,
+        "val_same_family_loss_mask": val_same_family_mask,
         "train_source_id": train_source_id,
         "val_source_id": val_source_id,
+        "val_same_family_source_id": val_same_family_source_id,
         "vocab_size": vocab_size,
         "metadata": {
             "name": "dsqg_v2_semantic_curriculum",
             "seq_len": int(seq_len),
             "seed": int(seed),
+            "active_val_lane": "strict",
             "mask_alignment": MASK_ALIGNMENT,
             "architecture_note": ARCHITECTURE_NOTE,
             "bucket_to_id": dict(BUCKET_TO_ID),
         },
     }
+    same_family_payload = dict(payload)
+    same_family_payload.update(
+        {
+            "val": val_same_family,
+            "val_loss_mask": val_same_family_mask,
+            "val_source_id": val_same_family_source_id,
+            "metadata": {**payload["metadata"], "active_val_lane": "same_family"},
+        }
+    )
     # Keep the artifact compatible with the trainer's torch.load(..., weights_only=True).
     # PyTorch's restricted unpickler still rejects newer pickle protocol opcodes in
     # some versions, so use the default protocol instead of protocol 5 here.
     torch.save(payload, dataset_path)
+    torch.save(same_family_payload, same_family_dataset_path)
     write_jsonl(train_jsonl, train_records)
     write_jsonl(val_jsonl, val_records)
+    write_jsonl(val_same_family_jsonl, val_same_family_records)
 
     decoded_samples = {
         "train": [r["decoded_prefix"] for r in train_records[:4]],
         "val": [r["decoded_prefix"] for r in val_records[:4]],
+        "val_same_family": [r["decoded_prefix"] for r in val_same_family_records[:4]],
     }
     samples_path.write_text(json.dumps(decoded_samples, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -454,8 +528,10 @@ def build_curriculum(
         "created_by": str(Path(__file__).relative_to(ROOT)),
         "git_commit": git_commit(),
         "dataset_path": str(dataset_path),
+        "same_family_dataset_path": str(same_family_dataset_path),
         "train_records_jsonl": str(train_jsonl),
         "val_records_jsonl": str(val_jsonl),
+        "val_same_family_records_jsonl": str(val_same_family_jsonl),
         "audit_path": str(audit_path),
         "decoded_samples_path": str(samples_path),
         "tokenizer": {
@@ -469,6 +545,7 @@ def build_curriculum(
             "seq_len": int(seq_len),
             "train_rows": int(train_size),
             "val_rows": int(val_size),
+            "val_same_family_rows": int(val_size),
         },
         "bucket_to_id": dict(BUCKET_TO_ID),
         "mask_alignment": MASK_ALIGNMENT,
@@ -480,26 +557,33 @@ def build_curriculum(
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     audit.update({
         "dataset_path": str(dataset_path),
+        "same_family_dataset_path": str(same_family_dataset_path),
         "manifest_path": str(manifest_path),
         "train_records_jsonl": str(train_jsonl),
         "val_records_jsonl": str(val_jsonl),
+        "val_same_family_records_jsonl": str(val_same_family_jsonl),
         "decoded_samples_path": str(samples_path),
         "dataset_sha256": sha256_file(dataset_path),
+        "same_family_dataset_sha256": sha256_file(same_family_dataset_path),
     })
     audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     return {
         "pass": True,
         "dataset_path": str(dataset_path),
+        "same_family_dataset_path": str(same_family_dataset_path),
         "manifest_path": str(manifest_path),
         "audit_path": str(audit_path),
         "train_records_jsonl": str(train_jsonl),
         "val_records_jsonl": str(val_jsonl),
+        "val_same_family_records_jsonl": str(val_same_family_jsonl),
         "decoded_samples_path": str(samples_path),
         "train_real_loss_tokens": train_loss_tokens,
         "val_real_loss_tokens": val_loss_tokens,
+        "val_same_family_real_loss_tokens": val_same_family_loss_tokens,
         "bucket_counts_train": audit["splits"]["train"]["bucket_counts"],
         "bucket_counts_val": audit["splits"]["val"]["bucket_counts"],
+        "bucket_counts_val_same_family": audit["splits"]["val_same_family"]["bucket_counts"],
     }
 
 
