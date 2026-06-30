@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
-from kernels.hierarchical_sparse_attn_v15_hisa import _build_stage2_token_indices
+from kernels.hierarchical_sparse_attn_v15_hisa import (
+    _build_stage2_token_indices,
+    _pack_hisa_selected_tokens_for_dsqg_w,
+)
 
 
 def test_stage2_query_representative_selector_uses_routing_chosen_rows_not_rowmax() -> None:
@@ -18,7 +22,7 @@ def test_stage2_query_representative_selector_uses_routing_chosen_rows_not_rowma
     q[0, 0, 7] = torch.tensor([0.0, 5.0])
     top_k = torch.tensor([[[[-1], [0]]]], dtype=torch.long)
 
-    rowmax_idx, _, _ = _build_stage2_token_indices(
+    rowmax_idx, _, _, _ = _build_stage2_token_indices(
         q,
         k,
         top_k,
@@ -32,7 +36,7 @@ def test_stage2_query_representative_selector_uses_routing_chosen_rows_not_rowma
     )
     routing = torch.zeros(bsz, heads, seq_len, chunks)
     routing[0, 0, 7, 0] = 1.0
-    rep_idx, _, _ = _build_stage2_token_indices(
+    rep_idx, _, _, _ = _build_stage2_token_indices(
         q,
         k,
         top_k,
@@ -72,3 +76,35 @@ def test_stage2_query_representative_selector_requires_routing_weights() -> None
         assert "routing_weights" in str(exc)
     else:
         raise AssertionError("stage2_rep_r must require routing_weights")
+
+
+def test_pack_hisa_selected_tokens_for_dsqg_w_is_bounded_causal_and_score_sorted() -> None:
+    # HISA internally stores selected tokens as [B,H,C_query,K,M]. DSQG-W
+    # needs per-token bounded candidates [B,T,J] so it composes actual retrieved
+    # evidence instead of doing independent offset retrieval.
+    token_idx = torch.tensor(
+        [[[[[0, 2, 3]], [[1, 4, 6]]]]],
+        dtype=torch.int32,
+    )
+    token_scores = torch.tensor(
+        [[[[[0.1, 9.0, 2.0]], [[7.0, 1.0, 8.0]]]]],
+        dtype=torch.float32,
+    )
+
+    indices, scores = _pack_hisa_selected_tokens_for_dsqg_w(
+        token_idx,
+        token_scores,
+        seq_len=8,
+        chunk_size=4,
+        max_candidates=2,
+    )
+
+    assert indices.shape == (1, 8, 2)
+    assert scores.shape == (1, 8, 2)
+    # Query chunk 0 owns positions 0..3. For t=2, token 3 is future-invalid,
+    # so the highest valid retrieved evidence is token 2, then token 0.
+    assert indices[0, 2].tolist() == [2, 0]
+    assert scores[0, 2].tolist() == pytest.approx([9.0, 0.1])
+    # Query chunk 1 owns positions 4..7. For t=7, token 6 outranks token 1.
+    assert indices[0, 7].tolist() == [6, 1]
+    assert scores[0, 7].tolist() == pytest.approx([8.0, 7.0])

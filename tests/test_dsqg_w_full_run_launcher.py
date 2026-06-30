@@ -37,6 +37,11 @@ def test_full_run_launcher_builds_winning_layout_env(tmp_path: Path) -> None:
     assert env["DWARF_DSQG_W_SITES"] == "2,6,final"
     assert env["DWARF_DSQG_W_MAX_CANDIDATES"] == "16"
     assert env["DWARF_DSQG_W_BOTTLENECK"] == "64"
+    assert env["DWARF_DSQG_W_GATE_INIT"] == "-2.5"
+    assert env["DWARF_DSQG_W_FUSE_INIT_STD"] == "0.02"
+    assert env["DWARF_DSQG_W_DSR_CANDIDATES"] == "1"
+    assert env["DWARF_DSQG_W_LOCAL_OFFSETS"] == "none"
+    assert env["DWARF_DSQG_W_LONG_OFFSETS"] == "none"
     assert env["DWARF_DSQG_W_WIDTH_CELL"] == "0"
     assert env["DWARF_DSQG_W_QUESTION"] == "1"
     assert env["DWARF_DSQG_W_HISA_L3"] == "1"
@@ -80,18 +85,27 @@ def test_full_run_launcher_can_enable_typed_mixer_and_query_rep_hisa_env(tmp_pat
         run_name="combined_unit",
         typed_mixer=True,
         typed_mixer_bottleneck=12,
-        typed_mixer_gate_init=-4.5,
+        gate_init=-2.0,
+        fuse_init_std=0.03,
+        typed_mixer_gate_init=-2.0,
         query_type_bias=True,
         typed_hisa_reps=True,
+        local_offsets="1,2",
+        long_offsets="none",
         hisa_stage2_rep_r=4,
     )
 
     env = cfg["env"]
     assert env["DWARF_DSQG_W_TYPED_MIXER"] == "1"
+    assert env["DWARF_DSQG_W_GATE_INIT"] == "-2.0"
+    assert env["DWARF_DSQG_W_FUSE_INIT_STD"] == "0.03"
     assert env["DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK"] == "12"
-    assert env["DWARF_DSQG_W_TYPED_MIXER_GATE_INIT"] == "-4.5"
+    assert env["DWARF_DSQG_W_TYPED_MIXER_GATE_INIT"] == "-2.0"
     assert env["DWARF_DSQG_W_QUERY_TYPE_BIAS"] == "1"
     assert env["DWARF_DSQG_W_TYPED_HISA_REPS"] == "1"
+    assert env["DWARF_DSQG_W_DSR_CANDIDATES"] == "1"
+    assert env["DWARF_DSQG_W_LOCAL_OFFSETS"] == "1,2"
+    assert env["DWARF_DSQG_W_LONG_OFFSETS"] == "none"
     assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
 
 

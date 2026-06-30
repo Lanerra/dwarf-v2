@@ -36,6 +36,8 @@ def build_run_config(
     sites: str = "2,6,final",
     max_candidates: int = 16,
     bottleneck: int = 64,
+    gate_init: float = -2.5,
+    fuse_init_std: float = 0.02,
     width_cell: bool = False,
     width_bottleneck: int = 64,
     width_gate_init: float = -2.5,
@@ -47,6 +49,9 @@ def build_run_config(
     typed_mixer_gate_init: float = -5.0,
     query_type_bias: bool = False,
     typed_hisa_reps: bool = False,
+    dsr_candidates: bool = True,
+    local_offsets: str = "none",
+    long_offsets: str = "none",
     hisa_stage2_rep_r: int = 0,
     lr: float | None = None,
     dataset: Path | str = DEFAULT_DATASET,
@@ -77,6 +82,8 @@ def build_run_config(
         "DWARF_DSQG_W_SITES": str(sites),
         "DWARF_DSQG_W_MAX_CANDIDATES": str(int(max_candidates)),
         "DWARF_DSQG_W_BOTTLENECK": str(int(bottleneck)),
+        "DWARF_DSQG_W_GATE_INIT": str(float(gate_init)),
+        "DWARF_DSQG_W_FUSE_INIT_STD": str(float(fuse_init_std)),
         "DWARF_DSQG_W_WIDTH_CELL": "1" if width_cell else "0",
         "DWARF_DSQG_W_WIDTH_BOTTLENECK": str(int(width_bottleneck)),
         "DWARF_DSQG_W_WIDTH_GATE_INIT": str(float(width_gate_init)),
@@ -88,6 +95,9 @@ def build_run_config(
         "DWARF_DSQG_W_TYPED_MIXER_GATE_INIT": str(float(typed_mixer_gate_init)),
         "DWARF_DSQG_W_QUERY_TYPE_BIAS": "1" if query_type_bias else "0",
         "DWARF_DSQG_W_TYPED_HISA_REPS": "1" if typed_hisa_reps else "0",
+        "DWARF_DSQG_W_DSR_CANDIDATES": "1" if dsr_candidates else "0",
+        "DWARF_DSQG_W_LOCAL_OFFSETS": str(local_offsets),
+        "DWARF_DSQG_W_LONG_OFFSETS": str(long_offsets),
         "DWARF_HISA_STAGE2_REP_R": str(int(hisa_stage2_rep_r)),
         "DWARF_DSQG_W_QUESTION": "1",
         "DWARF_DSQG_W_HISA_L3": "1",
@@ -171,6 +181,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sites", default="2,6,final")
     parser.add_argument("--max-candidates", type=int, default=16)
     parser.add_argument("--bottleneck", type=int, default=64)
+    parser.add_argument("--gate-init", type=float, default=-2.5)
+    parser.add_argument("--fuse-init-std", type=float, default=0.02)
     parser.add_argument("--width-cell", action="store_true", help="Enable the opt-in DSQG-W candidate lateral width cell.")
     parser.add_argument("--width-bottleneck", type=int, default=64)
     parser.add_argument("--width-gate-init", type=float, default=-2.5)
@@ -182,6 +194,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--typed-mixer-gate-init", type=float, default=-5.0)
     parser.add_argument("--query-type-bias", action="store_true", help="Enable query-conditioned candidate-type score bias.")
     parser.add_argument("--typed-hisa-reps", action="store_true", help="Label first four HISA evidence candidates as representative evidence slots.")
+    parser.add_argument("--no-dsr-candidates", action="store_true", help="Disable direct HISA/DSR selected-token candidates and use fallback offset candidates only.")
+    parser.add_argument("--local-offsets", default="none", help="Comma-separated DSQG-W local offset candidates; default none for D-fed W runs.")
+    parser.add_argument("--long-offsets", default="none", help="Comma-separated DSQG-W long offset candidates; default none for D-fed W runs.")
     parser.add_argument("--hisa-stage2-rep-r", type=int, default=0, help="Enable query-representative HISA Stage-2 selector with r representatives.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
@@ -209,6 +224,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         sites=args.sites,
         max_candidates=args.max_candidates,
         bottleneck=args.bottleneck,
+        gate_init=args.gate_init,
+        fuse_init_std=args.fuse_init_std,
         width_cell=args.width_cell,
         width_bottleneck=args.width_bottleneck,
         width_gate_init=args.width_gate_init,
@@ -220,6 +237,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         typed_mixer_gate_init=args.typed_mixer_gate_init,
         query_type_bias=args.query_type_bias,
         typed_hisa_reps=args.typed_hisa_reps,
+        dsr_candidates=not args.no_dsr_candidates,
+        local_offsets=args.local_offsets,
+        long_offsets=args.long_offsets,
         hisa_stage2_rep_r=args.hisa_stage2_rep_r,
         lr=args.lr,
         dataset=args.dataset,

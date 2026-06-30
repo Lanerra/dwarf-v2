@@ -82,6 +82,75 @@ def test_candidate_provider_deduplicates_by_token_and_source_with_semantic_prior
     assert batch.telemetry["dsqg_w_candidate_duplicate_rate"].item() > 0.0
 
 
+def test_candidate_provider_preserves_and_prioritizes_dsr_scores_without_offsets() -> None:
+    x = make_hidden(batch=1, seq=5)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=2,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=0,
+        k_hisa_evidence=3,
+        k_chunk=0,
+        k_l3_skip=0,
+    )
+    provider = CandidateProvider(cfg)
+    hisa_indices = torch.tensor([[[0, 1, 2], [0, 1, 1], [0, 1, 2], [1, 2, 3], [2, 3, 4]]])
+    hisa_scores = torch.tensor([[[0.0, 1.0, 9.0], [0.0, 8.0, 3.0], [0.0, 4.0, 2.0], [1.0, 7.0, 6.0], [2.0, 5.0, 4.0]]])
+
+    batch = provider.build(
+        x,
+        hisa_evidence_indices=hisa_indices,
+        hisa_evidence_scores=hisa_scores,
+    )
+
+    assert batch.cand_scores is not None
+    assert batch.cand_token_indices[0, 3].tolist() == [2, 3]
+    assert batch.cand_scores[0, 3].tolist() == [7.0, 6.0]
+    assert batch.cand_sources[0, 3].tolist() == [int(CandidateSource.HISA), int(CandidateSource.HISA)]
+    assert batch.telemetry["dsqg_w_candidate_fraction_local"].item() == 0.0
+    assert batch.telemetry["dsqg_w_candidate_score_mean"].item() > 0.0
+
+
+def test_dsqg_w_block_uses_candidate_scores_as_measurable_routing_bias() -> None:
+    torch.manual_seed(101)
+    x = make_hidden(batch=1, seq=4, d=16)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=2,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=0,
+        k_hisa_evidence=2,
+        k_chunk=0,
+        k_l3_skip=0,
+        bottleneck=32,
+        gate_init=-2.5,
+    )
+    provider = CandidateProvider(cfg)
+    indices = torch.tensor([[[0, -1], [0, 1], [0, 2], [1, 3]]])
+    low_then_high = torch.tensor([[[0.0, 0.0], [0.0, 8.0], [0.0, 8.0], [0.0, 8.0]]])
+    cands = provider.build(x, hisa_evidence_indices=indices, hisa_evidence_scores=low_then_high)
+    block = DSQGWBlock.from_config(cfg)
+
+    _, telemetry = block(
+        x,
+        cands.cand_states,
+        cands.cand_types,
+        cands.cand_sources,
+        cands.cand_mask,
+        cand_scores=cands.cand_scores,
+        return_routing=True,
+    )
+
+    assert telemetry["dsqg_w_candidate_score_bias_norm"].item() > 0.0
+    probs = telemetry["dsqg_w_probs"].mean(dim=-1)
+    assert cands.cand_scores[0, 3, 0].item() > cands.cand_scores[0, 3, 1].item()
+    assert probs[0, 3, 0].item() > probs[0, 3, 1].item()
+
+
 def test_candidate_provider_fast_path_matches_reference_candidate_layout() -> None:
     x = make_hidden(batch=2, seq=11, d=16)
     l3 = x + 0.125

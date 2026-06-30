@@ -196,7 +196,24 @@ def test_dsqg_w_hisa_l3_candidate_indices_read_from_l3_states(monkeypatch) -> No
     assert telemetry["dsqg_w_candidate_fraction_l3_skip"].item() > 0.0
     assert telemetry["dsqg_w_hisa_evidence_mass"].item() > 0.0
     assert telemetry["dsqg_w_l3_skip_mass"].item() > 0.0
-    assert telemetry["dsqg_w_l3_source_mass"].item() > 0.0
+    assert telemetry["dsqg_w_hisa_source_mass"].item() > 0.0
+
+
+def test_dsqg_w_packs_actual_dsr_selected_candidates_for_w(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, hisa_l3=True)
+    model = make_model(mod)
+    attn = model.blocks[model.dsr_layer].attn
+    attn._last_token_idx_packed = torch.tensor([[[[[0, 2, 3]], [[1, 4, 6]]]]], dtype=torch.int32)
+    attn._last_token_scores_packed = torch.tensor([[[[[0.1, 9.0, 2.0]], [[7.0, 1.0, 8.0]]]]])
+    attn._last_chunk_size = 4
+
+    indices, scores = model._dsqg_w_dsr_selected_candidates(seq_len=8)
+
+    assert mod.DSQG_W_DSR_CANDIDATES is True
+    assert indices.shape == (1, 8, mod.DSQG_W_K_HISA_EVIDENCE)
+    assert scores.shape == indices.shape
+    assert indices[0, 2, :2].tolist() == [2, 0]
+    assert scores[0, 2, 0].item() > scores[0, 2, 1].item()
 
 
 def test_forward_accepts_optional_dsqg_w_hisa_l3_indices(monkeypatch) -> None:

@@ -162,9 +162,10 @@ except Exception as _q6_fused_exc:
 # =============================================================================
 
 try:
-    from hierarchical_sparse_attn_v15_hisa import HierarchicalSparseAttentionV15HISA
+    from hierarchical_sparse_attn_v15_hisa import HierarchicalSparseAttentionV15HISA, _pack_hisa_selected_tokens_for_dsqg_w
 except Exception:
     from hierarchical_sparse_attn_v15_hisa_triton import HierarchicalSparseAttentionV15HISA
+    _pack_hisa_selected_tokens_for_dsqg_w = None
 
 try:
     from kernels.dsqg_w.dsqg_w_mvp import DSQGWBlock, DSQGWConfig, CandidateProvider
@@ -332,6 +333,8 @@ def _parse_int_tuple_env(name, default):
     raw = os.getenv(name)
     if raw is None or raw.strip() == '':
         return tuple(int(v) for v in default)
+    if raw.strip().lower() in {'none', 'off', 'disable', 'disabled', '[]'}:
+        return tuple()
     out = []
     for part in raw.split(','):
         part = part.strip()
@@ -346,6 +349,7 @@ DSQG_W_ENABLED = os.getenv('DWARF_DSQG_W', '0') == '1'
 DSQG_W_MAX_CANDIDATES = int(os.environ.get('DWARF_DSQG_W_MAX_CANDIDATES', '32'))
 DSQG_W_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_BOTTLENECK', '256'))
 DSQG_W_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_GATE_INIT', '-5.0'))
+DSQG_W_FUSE_INIT_STD = float(os.environ.get('DWARF_DSQG_W_FUSE_INIT_STD', '0.0001'))
 DSQG_W_WIDTH_CELL = os.getenv('DWARF_DSQG_W_WIDTH_CELL', '0') == '1'
 DSQG_W_WIDTH_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_WIDTH_BOTTLENECK', '64'))
 DSQG_W_WIDTH_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_WIDTH_GATE_INIT', '-5.0'))
@@ -357,6 +361,7 @@ DSQG_W_TYPED_MIXER_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_TYPED_MIXER_BOT
 DSQG_W_TYPED_MIXER_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_TYPED_MIXER_GATE_INIT', '-5.0'))
 DSQG_W_QUERY_TYPE_BIAS = os.getenv('DWARF_DSQG_W_QUERY_TYPE_BIAS', '0') == '1'
 DSQG_W_TYPED_HISA_REPS = os.getenv('DWARF_DSQG_W_TYPED_HISA_REPS', '0') == '1'
+DSQG_W_DSR_CANDIDATES = os.getenv('DWARF_DSQG_W_DSR_CANDIDATES', '1') != '0'
 DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2, 4, 8))
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
 DSQG_W_QUESTION_ENABLED = os.getenv('DWARF_DSQG_W_QUESTION', '0') == '1'
@@ -425,11 +430,19 @@ def _dsqg_w_site_key(site):
 
 
 def _dsqg_w_candidate_path_label():
-    parts = ['LOCAL', 'LONG']
+    parts = []
+    if DSQG_W_HISA_L3_ENABLED and DSQG_W_DSR_CANDIDATES:
+        parts.append('DSR_SELECTED')
+    if DSQG_W_LOCAL_OFFSETS:
+        parts.append('LOCAL')
+    if DSQG_W_LONG_OFFSETS:
+        parts.append('LONG')
     if DSQG_W_QUESTION_ENABLED:
         parts.append('QUESTION')
-    if DSQG_W_HISA_L3_ENABLED:
-        parts.extend(['HISA_EVIDENCE', 'L3_SKIP'])
+    if DSQG_W_HISA_L3_ENABLED and not DSQG_W_DSR_CANDIDATES:
+        parts.extend(['HISA_EVIDENCE_FALLBACK', 'L3_SKIP'])
+    elif DSQG_W_HISA_L3_ENABLED and DSQG_W_K_L3_SKIP > 0:
+        parts.append('L3_SKIP')
     parts.append('NULL')
     return '_'.join(parts)
 
@@ -3012,6 +3025,7 @@ class TriadicJ96Dsr(nn.Module):
                 bottleneck=DSQG_W_BOTTLENECK,
                 max_candidates=DSQG_W_MAX_CANDIDATES,
                 gate_init=DSQG_W_GATE_INIT,
+                fuse_init_std=DSQG_W_FUSE_INIT_STD,
                 local_offsets=DSQG_W_LOCAL_OFFSETS,
                 long_offsets=DSQG_W_LONG_OFFSETS,
                 # QUESTION/cue candidates are opt-in so the identity path can
@@ -3086,15 +3100,20 @@ class TriadicJ96Dsr(nn.Module):
         collect_l3_state=False,
         dsqg_w_question_indices=None,
         dsqg_w_hisa_evidence_indices=None,
+        dsqg_w_hisa_evidence_scores=None,
         dsqg_w_l3_skip_indices=None,
     ):
         x = self.drop(self.embedding(idx))
         l3_state = None
+        dsr_hisa_evidence_indices = None
+        dsr_hisa_evidence_scores = None
         for i, block in enumerate(self.blocks):
             if self.training and self._should_checkpoint_block(i):
                 x = self._ckpt(block, x)
             else:
                 x = block(x)
+            if i == self.dsr_layer:
+                dsr_hisa_evidence_indices, dsr_hisa_evidence_scores = self._dsqg_w_dsr_selected_candidates(idx.shape[1])
             if collect_l3_state and i == self.dsr_layer:
                 l3_state = x
             if self.dsqg_w_enabled and i in self.dsqg_w_layer_site_map:
@@ -3103,12 +3122,53 @@ class TriadicJ96Dsr(nn.Module):
                     site_key=self.dsqg_w_layer_site_map[i],
                     question_indices=dsqg_w_question_indices,
                     l3_states=l3_state,
-                    hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                    hisa_evidence_indices=(
+                        dsr_hisa_evidence_indices
+                        if dsr_hisa_evidence_indices is not None
+                        else dsqg_w_hisa_evidence_indices
+                    ),
+                    hisa_evidence_scores=(
+                        dsr_hisa_evidence_scores
+                        if dsr_hisa_evidence_scores is not None
+                        else dsqg_w_hisa_evidence_scores
+                    ),
                     l3_skip_indices=dsqg_w_l3_skip_indices,
                 )
         if collect_l3_state:
-            return x, l3_state if l3_state is not None else x
+            return (
+                x,
+                l3_state if l3_state is not None else x,
+                dsr_hisa_evidence_indices,
+                dsr_hisa_evidence_scores,
+            )
         return x
+
+    def _dsqg_w_dsr_selected_candidates(self, seq_len):
+        if (
+            not self.dsqg_w_enabled
+            or not DSQG_W_HISA_L3_ENABLED
+            or not DSQG_W_DSR_CANDIDATES
+            or DSQG_W_K_HISA_EVIDENCE <= 0
+        ):
+            return None, None
+        if _pack_hisa_selected_tokens_for_dsqg_w is None:
+            return None, None
+        if not (0 <= int(self.dsr_layer) < len(self.blocks)):
+            return None, None
+        dsr_block = self.blocks[int(self.dsr_layer)]
+        attn = getattr(dsr_block, 'attn', None)
+        token_idx = getattr(attn, '_last_token_idx_packed', None)
+        token_scores = getattr(attn, '_last_token_scores_packed', None)
+        chunk_size = getattr(attn, '_last_chunk_size', None)
+        if token_idx is None or token_scores is None or chunk_size is None:
+            return None, None
+        return _pack_hisa_selected_tokens_for_dsqg_w(
+            token_idx,
+            token_scores,
+            seq_len=int(seq_len),
+            chunk_size=int(chunk_size),
+            max_candidates=int(DSQG_W_K_HISA_EVIDENCE),
+        )
 
     def _apply_dsqg_w_recomposer(
         self,
@@ -3118,6 +3178,7 @@ class TriadicJ96Dsr(nn.Module):
         question_indices=None,
         l3_states=None,
         hisa_evidence_indices=None,
+        hisa_evidence_scores=None,
         l3_skip_indices=None,
     ):
         if not self.dsqg_w_enabled:
@@ -3133,6 +3194,7 @@ class TriadicJ96Dsr(nn.Module):
             l3_states=l3_states,
             question_indices=question_indices,
             hisa_evidence_indices=hisa_evidence_indices,
+            hisa_evidence_scores=hisa_evidence_scores,
             l3_skip_indices=l3_skip_indices,
         )
         x_out, telemetry = block(
@@ -3141,6 +3203,7 @@ class TriadicJ96Dsr(nn.Module):
             candidates.cand_types,
             candidates.cand_sources,
             candidates.cand_mask,
+            cand_scores=candidates.cand_scores,
         )
         merged_telemetry = dict(candidates.telemetry)
         merged_telemetry.update(telemetry)
@@ -3157,7 +3220,7 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_l3_skip_indices=None,
     ):
         if self.dsqg_w_enabled:
-            trunk_out, l3_state = self._forward_trunk(
+            trunk_out, l3_state, dsr_hisa_indices, dsr_hisa_scores = self._forward_trunk(
                 idx,
                 collect_l3_state=True,
                 dsqg_w_question_indices=dsqg_w_question_indices,
@@ -3174,7 +3237,12 @@ class TriadicJ96Dsr(nn.Module):
                 site_key='final',
                 question_indices=dsqg_w_question_indices,
                 l3_states=l3_state,
-                hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                hisa_evidence_indices=(
+                    dsr_hisa_indices if dsr_hisa_indices is not None else dsqg_w_hisa_evidence_indices
+                ),
+                hisa_evidence_scores=(
+                    dsr_hisa_scores if dsr_hisa_scores is not None else None
+                ),
                 l3_skip_indices=dsqg_w_l3_skip_indices,
             )
         return self.out(self.norm(x))
@@ -3188,7 +3256,7 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_l3_skip_indices=None,
     ):
         if self.dsqg_w_enabled:
-            trunk_out, l3_state = self._forward_trunk(
+            trunk_out, l3_state, dsr_hisa_indices, dsr_hisa_scores = self._forward_trunk(
                 idx,
                 collect_l3_state=True,
                 dsqg_w_question_indices=dsqg_w_question_indices,
@@ -3205,7 +3273,12 @@ class TriadicJ96Dsr(nn.Module):
                 site_key='final',
                 question_indices=dsqg_w_question_indices,
                 l3_states=l3_state,
-                hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                hisa_evidence_indices=(
+                    dsr_hisa_indices if dsr_hisa_indices is not None else dsqg_w_hisa_evidence_indices
+                ),
+                hisa_evidence_scores=(
+                    dsr_hisa_scores if dsr_hisa_scores is not None else None
+                ),
                 l3_skip_indices=dsqg_w_l3_skip_indices,
             )
         return self.norm(x)
@@ -3368,12 +3441,15 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'max_candidates': DSQG_W_MAX_CANDIDATES,
                 'bottleneck': DSQG_W_BOTTLENECK,
                 'gate_init': DSQG_W_GATE_INIT,
+                'fuse_init_std': DSQG_W_FUSE_INIT_STD,
                 'width_cell': DSQG_W_WIDTH_CELL,
                 'width_bottleneck': DSQG_W_WIDTH_BOTTLENECK,
                 'width_gate_init': DSQG_W_WIDTH_GATE_INIT,
                 'width_aux_weight': DSQG_W_WIDTH_AUX_WEIGHT,
                 'width_entropy_floor': DSQG_W_WIDTH_ENTROPY_FLOOR,
                 'width_entropy_weight': DSQG_W_WIDTH_ENTROPY_WEIGHT,
+                'typed_hisa_reps': DSQG_W_TYPED_HISA_REPS,
+                'dsr_candidates': DSQG_W_DSR_CANDIDATES,
                 'local_offsets': list(DSQG_W_LOCAL_OFFSETS),
                 'long_offsets': list(DSQG_W_LONG_OFFSETS),
                 'question_enabled': DSQG_W_QUESTION_ENABLED,
@@ -3921,12 +3997,13 @@ def train():
         site_text = ','.join(_dsqg_w_site_key(site) for site in DSQG_W_SITE_SPECS)
         print(f'  DSQG-W recomposer sites={site_text}: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
+              f'fuse_init_std={DSQG_W_FUSE_INIT_STD} '
               f'width_cell={DSQG_W_WIDTH_CELL} width_bottleneck={DSQG_W_WIDTH_BOTTLENECK} '
               f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} width_aux_weight={DSQG_W_WIDTH_AUX_WEIGHT} '
               f'width_entropy_floor={DSQG_W_WIDTH_ENTROPY_FLOOR} width_entropy_weight={DSQG_W_WIDTH_ENTROPY_WEIGHT} '
               f'typed_mixer={DSQG_W_TYPED_MIXER} typed_mixer_bottleneck={DSQG_W_TYPED_MIXER_BOTTLENECK} '
               f'typed_mixer_gate_init={DSQG_W_TYPED_MIXER_GATE_INIT} query_type_bias={DSQG_W_QUERY_TYPE_BIAS} '
-              f'typed_hisa_reps={DSQG_W_TYPED_HISA_REPS} '
+              f'typed_hisa_reps={DSQG_W_TYPED_HISA_REPS} dsr_candidates={DSQG_W_DSR_CANDIDATES} '
               f'candidates={candidate_path}')
     else:
         print('  DSQG-W recomposer: disabled')
@@ -4275,6 +4352,26 @@ def train():
                         stage2_frac = float(stage2_frac.detach().item())
                     if isinstance(stage2_frac, float) and math.isfinite(stage2_frac):
                         entropy_str += f' stage2_frac={stage2_frac:.3f}'
+                dsqg_w_tel = getattr(model_ref, 'dsqg_w_last_telemetry', {}) or {}
+                if dsqg_w_tel:
+                    def _tel_float(name):
+                        val = dsqg_w_tel.get(name)
+                        if torch.is_tensor(val) and val.numel() == 1:
+                            return float(val.detach().item())
+                        if isinstance(val, (int, float)):
+                            return float(val)
+                        return None
+                    for _name, _label in [
+                        ('dsqg_w_gate_mean', 'w_gate'),
+                        ('dsqg_w_delta_to_x_ratio', 'w_dx'),
+                        ('dsqg_w_hisa_source_mass', 'w_hisa'),
+                        ('dsqg_w_candidate_score_bias_norm', 'w_score'),
+                        ('dsqg_w_candidate_score_mean', 'w_smean'),
+                        ('dsqg_w_typed_mixer_gate_mean', 'w_mix_gate'),
+                    ]:
+                        _val = _tel_float(_name)
+                        if _val is not None and math.isfinite(_val):
+                            entropy_str += f' {_label}={_val:.3f}'
                 print(f'  [ep{epoch} step {acc_step+1}/{steps_per_epoch}] '
                       f'ce={loss_val:.4f} se_max={se_max:.3f} '
                       f'grad_norm={total_norm:.4f} lr={lr_now:.2e} '

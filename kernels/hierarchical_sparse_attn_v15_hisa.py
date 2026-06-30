@@ -240,14 +240,15 @@ def _build_stage2_token_indices(
     stage2_q_block: int = 256,
     routing_weights: torch.Tensor | None = None,
     stage2_rep_r: int = 0,
-) -> tuple[torch.Tensor, int, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
     """
     Build query-scoped compact Stage-2 token indices.
 
     Returns:
-      token_idx_packed: int32 [B, H, C_query, K, M], where invalid slots are -1.
-      m_actual:         min(max(hisa_top_m_tokens, 1), chunk_size)
-      selected_fraction: scalar tensor with fraction of valid compact slots, or NaN when telemetry is disabled.
+      token_idx_packed:   int32 [B, H, C_query, K, M], where invalid slots are -1.
+      token_score_packed: float [B, H, C_query, K, M], -inf for invalid slots.
+      m_actual:           min(max(hisa_top_m_tokens, 1), chunk_size)
+      selected_fraction:  scalar tensor with fraction of valid compact slots, or NaN when telemetry is disabled.
 
     Unlike the old global [B,H,N] token mask, this metadata is scoped to the
     query chunk and the selected chunk. It therefore cannot be polluted by token
@@ -274,6 +275,12 @@ def _build_stage2_token_indices(
         (B, H, C, K_sel, m_actual),
         -1,
         dtype=torch.int32,
+        device=device,
+    )
+    token_scores_packed = torch.full(
+        (B, H, C, K_sel, m_actual),
+        float("-inf"),
+        dtype=torch.float32,
         device=device,
     )
 
@@ -408,12 +415,74 @@ def _build_stage2_token_indices(
         valid_flat = finite & valid_chunks[..., None] & (flat_pos < N)
         flat_pos = torch.where(valid_flat, flat_pos, torch.full_like(flat_pos, -1))
         token_idx[:, :, c_q, :, :] = flat_pos.to(torch.int32)
+        token_scores_packed[:, :, c_q, :, :] = torch.where(
+            valid_flat,
+            top_vals.float(),
+            torch.full_like(top_vals.float(), float("-inf")),
+        )
 
     if collect_stats:
         selected_fraction = (token_idx >= 0).float().mean().detach()
     else:
         selected_fraction = torch.full((), float('nan'), device=device)
-    return token_idx, m_actual, selected_fraction
+    return token_idx, token_scores_packed, m_actual, selected_fraction
+
+
+def _pack_hisa_selected_tokens_for_dsqg_w(
+    token_idx_packed: torch.Tensor,
+    token_scores_packed: torch.Tensor,
+    *,
+    seq_len: int,
+    chunk_size: int,
+    max_candidates: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert compact HISA [B,H,C,K,M] selections to DSQG-W [B,T,J].
+
+    HISA selection is query-chunk scoped; DSQG-W composes at every token row.
+    This helper broadcasts each query chunk's selected evidence to rows inside
+    that chunk, filters future tokens per row, deduplicates token indices by
+    max score, and keeps the top-J bounded evidence tokens.
+    """
+    if token_idx_packed.shape != token_scores_packed.shape:
+        raise ValueError("token_idx_packed and token_scores_packed must have the same shape")
+    if token_idx_packed.ndim != 5:
+        raise ValueError("expected packed HISA tensors with shape [B,H,C,K,M]")
+    max_candidates = max(1, int(max_candidates))
+    seq_len = int(seq_len)
+    chunk_size = max(1, int(chunk_size))
+    B, _H, C, _K, _M = token_idx_packed.shape
+    device = token_idx_packed.device
+
+    out_idx = torch.full((B, seq_len, max_candidates), -1, dtype=torch.long, device=device)
+    out_scores = torch.full((B, seq_len, max_candidates), float("-inf"), dtype=torch.float32, device=device)
+    positions = torch.arange(seq_len, device=device, dtype=torch.long)
+
+    for c_q in range(C):
+        q_start = c_q * chunk_size
+        if q_start >= seq_len:
+            break
+        q_end = min(q_start + chunk_size, seq_len)
+        flat_idx = token_idx_packed[:, :, c_q].reshape(B, -1).to(torch.long)
+        flat_scores = token_scores_packed[:, :, c_q].reshape(B, -1).to(torch.float32)
+        flat_valid = (flat_idx >= 0) & torch.isfinite(flat_scores) & (flat_idx < seq_len)
+        safe_idx = flat_idx.clamp(0, max(seq_len - 1, 0))
+        for t in range(q_start, q_end):
+            causal = flat_valid & (flat_idx <= positions[t])
+            if not bool(causal.any()):
+                continue
+            score_table = torch.full((B, seq_len), float("-inf"), dtype=torch.float32, device=device)
+            score_table.scatter_reduce_(
+                dim=-1,
+                index=safe_idx,
+                src=torch.where(causal, flat_scores, torch.full_like(flat_scores, float("-inf"))),
+                reduce="amax",
+                include_self=True,
+            )
+            top_scores, top_idx = score_table.topk(max_candidates, dim=-1)
+            valid_top = torch.isfinite(top_scores)
+            out_idx[:, t, :] = torch.where(valid_top, top_idx, torch.full_like(top_idx, -1))
+            out_scores[:, t, :] = torch.where(valid_top, top_scores, torch.full_like(top_scores, float("-inf")))
+    return out_idx, out_scores
 
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +1092,7 @@ class HierarchicalSparseAttentionV15HISA(nn.Module):
                 valid_lengths=causal_control_valid_lengths,
             )
 
-            token_idx_packed, m_actual, selected_fraction = _build_stage2_token_indices(
+            token_idx_packed, token_scores_packed, m_actual, selected_fraction = _build_stage2_token_indices(
                 Q_pad,
                 K_pad,
                 top_k_packed,
@@ -1039,6 +1108,10 @@ class HierarchicalSparseAttentionV15HISA(nn.Module):
                 stage2_rep_r=self.stage2_rep_r,
             )
             self._stage2_selected_fraction = selected_fraction
+            self._last_top_k_packed = top_k_packed.detach()
+            self._last_token_idx_packed = token_idx_packed.detach()
+            self._last_token_scores_packed = token_scores_packed.detach()
+            self._last_chunk_size = int(chunk_size)
 
         apply_rw_bias = self.training or self.routing_bias_in_eval
         out = _DSRHISAAttendFn.apply(

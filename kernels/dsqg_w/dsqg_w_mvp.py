@@ -57,6 +57,7 @@ class DSQGWConfig:
     bottleneck: int = 256
     max_candidates: int = 32
     gate_init: float = -5.0
+    fuse_init_std: float = 1e-4
     local_offsets: tuple[int, ...] = (1, 2, 4, 8)
     long_offsets: tuple[int, ...] = (16, 32, 64, 128, 256, 512, 1024, 2048)
     k_question: int = 4
@@ -84,6 +85,8 @@ class DSQGWConfig:
             raise ValueError("d must be divisible by n_heads")
         if self.max_candidates <= 0:
             raise ValueError("max_candidates must be positive")
+        if self.fuse_init_std < 0.0:
+            raise ValueError("fuse_init_std must be non-negative")
         if self.n_types < len(CandidateType):
             raise ValueError("n_types must cover all CandidateType values")
         if self.n_sources < len(CandidateSource):
@@ -115,6 +118,7 @@ class CandidateBatch:
     cand_mask: torch.Tensor
     cand_token_indices: torch.Tensor
     valid_candidate_count: torch.Tensor
+    cand_scores: torch.Tensor | None = None
     telemetry: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
@@ -137,6 +141,7 @@ class CandidateProvider:
         l3_states: torch.Tensor | None = None,
         question_indices: torch.Tensor | list[list[int]] | None = None,
         hisa_evidence_indices: torch.Tensor | None = None,
+        hisa_evidence_scores: torch.Tensor | None = None,
         chunk_rep_indices: torch.Tensor | None = None,
         chunk_rep_states: torch.Tensor | None = None,
         l3_skip_indices: torch.Tensor | None = None,
@@ -144,6 +149,7 @@ class CandidateProvider:
         if not self._can_use_vectorized(
             question_indices=question_indices,
             hisa_evidence_indices=hisa_evidence_indices,
+            hisa_evidence_scores=hisa_evidence_scores,
             chunk_rep_indices=chunk_rep_indices,
             l3_skip_indices=l3_skip_indices,
         ):
@@ -152,6 +158,7 @@ class CandidateProvider:
                 l3_states=l3_states,
                 question_indices=question_indices,
                 hisa_evidence_indices=hisa_evidence_indices,
+                hisa_evidence_scores=hisa_evidence_scores,
                 chunk_rep_indices=chunk_rep_indices,
                 chunk_rep_states=chunk_rep_states,
                 l3_skip_indices=l3_skip_indices,
@@ -161,6 +168,7 @@ class CandidateProvider:
             l3_states=l3_states,
             question_indices=question_indices,
             hisa_evidence_indices=hisa_evidence_indices,
+            hisa_evidence_scores=hisa_evidence_scores,
             chunk_rep_indices=chunk_rep_indices,
             chunk_rep_states=chunk_rep_states,
             l3_skip_indices=l3_skip_indices,
@@ -177,6 +185,7 @@ class CandidateProvider:
         l3_states: torch.Tensor | None = None,
         question_indices: torch.Tensor | None = None,
         hisa_evidence_indices: torch.Tensor | None = None,
+        hisa_evidence_scores: torch.Tensor | None = None,
         chunk_rep_indices: torch.Tensor | None = None,
         chunk_rep_states: torch.Tensor | None = None,
         l3_skip_indices: torch.Tensor | None = None,
@@ -197,8 +206,15 @@ class CandidateProvider:
         raw_types: list[torch.Tensor] = []
         raw_sources: list[torch.Tensor] = []
         raw_valids: list[torch.Tensor] = []
+        raw_scores: list[torch.Tensor] = []
 
-        def add(tokens: torch.Tensor, ctype: int | torch.Tensor, source: int, valid: torch.Tensor | None = None) -> None:
+        def add(
+            tokens: torch.Tensor,
+            ctype: int | torch.Tensor,
+            source: int,
+            valid: torch.Tensor | None = None,
+            score: torch.Tensor | None = None,
+        ) -> None:
             tokens = tokens.to(device=device, dtype=torch.long)
             if tokens.ndim == 2:
                 tokens = tokens.unsqueeze(-1)
@@ -229,6 +245,19 @@ class CandidateProvider:
                 raw_types.append(torch.full(tokens.shape, int(ctype), device=device, dtype=torch.long))
             raw_sources.append(torch.full(tokens.shape, int(source), device=device, dtype=torch.long))
             raw_valids.append(valid_mask)
+            if score is None:
+                raw_scores.append(torch.zeros(tokens.shape, device=device, dtype=final_states.dtype))
+            else:
+                score_values = score.to(device=device, dtype=final_states.dtype)
+                if score_values.ndim == 2:
+                    score_values = score_values.unsqueeze(-1)
+                if score_values.shape[0] == 1 and bsz != 1:
+                    score_values = score_values.expand(bsz, -1, -1)
+                if score_values.shape[1] == 1 and seq_len != 1:
+                    score_values = score_values.expand(-1, seq_len, -1)
+                if score_values.shape != tokens.shape:
+                    raise ValueError("candidate score tensor must broadcast to candidate token tensor shape")
+                raw_scores.append(torch.nan_to_num(score_values, nan=0.0, neginf=0.0, posinf=0.0))
 
         for offset in self.config.local_offsets:
             add(positions - int(offset), int(CandidateType.LOCAL), int(CandidateSource.FINAL))
@@ -236,6 +265,7 @@ class CandidateProvider:
         if q_idx is not None:
             add(q_idx, int(CandidateType.QUESTION), int(CandidateSource.FINAL))
         h_idx = self._normalize_index_tensor(hisa_evidence_indices, bsz, seq_len, self.config.k_hisa_evidence, device)
+        h_scores = self._normalize_score_tensor(hisa_evidence_scores, bsz, seq_len, 0 if h_idx is None else h_idx.shape[-1], device)
         if h_idx is not None:
             if self.config.typed_hisa_reps:
                 rep_types = [
@@ -247,11 +277,11 @@ class CandidateProvider:
                 n_rep = min(h_idx.shape[-1], len(rep_types))
                 if n_rep > 0:
                     type_ids = torch.tensor(rep_types[:n_rep], device=device, dtype=torch.long).reshape(1, 1, n_rep)
-                    add(h_idx[..., :n_rep], type_ids, int(CandidateSource.L3))
+                    add(h_idx[..., :n_rep], type_ids, int(CandidateSource.HISA), score=None if h_scores is None else h_scores[..., :n_rep])
                 if h_idx.shape[-1] > n_rep:
-                    add(h_idx[..., n_rep:], int(CandidateType.HISA_EVIDENCE), int(CandidateSource.L3))
+                    add(h_idx[..., n_rep:], int(CandidateType.HISA_EVIDENCE), int(CandidateSource.HISA), score=None if h_scores is None else h_scores[..., n_rep:])
             else:
-                add(h_idx, int(CandidateType.HISA_EVIDENCE), int(CandidateSource.L3))
+                add(h_idx, int(CandidateType.HISA_EVIDENCE), int(CandidateSource.HISA), score=h_scores)
         for offset in self.config.long_offsets:
             add(positions - int(offset), int(CandidateType.LONG_OFFSET), int(CandidateSource.FINAL))
         c_idx = self._normalize_index_tensor(chunk_rep_indices, bsz, seq_len, self.config.k_chunk, device)
@@ -266,11 +296,13 @@ class CandidateProvider:
             types = torch.cat(raw_types, dim=-1)
             sources = torch.cat(raw_sources, dim=-1)
             valid = torch.cat(raw_valids, dim=-1)
+            scores = torch.cat(raw_scores, dim=-1)
         else:
             tokens = positions.new_empty((bsz, seq_len, 0))
             types = positions.new_empty((bsz, seq_len, 0))
             sources = positions.new_empty((bsz, seq_len, 0))
             valid = torch.zeros((bsz, seq_len, 0), device=device, dtype=torch.bool)
+            scores = final_states.new_empty((bsz, seq_len, 0))
 
         had_valid = valid.any(dim=-1, keepdim=True)
         if self.config.null_fallback:
@@ -280,6 +312,7 @@ class CandidateProvider:
             types = torch.cat([types, torch.full_like(null_tokens, int(CandidateType.NULL))], dim=-1)
             sources = torch.cat([sources, torch.full_like(null_tokens, int(CandidateSource.NULL))], dim=-1)
             valid = torch.cat([valid, null_valid], dim=-1)
+            scores = torch.cat([scores, final_states.new_zeros(null_tokens.shape)], dim=-1)
 
         if tokens.shape[-1] == 0 or not valid.any(dim=-1).all():
             raise RuntimeError("CandidateProvider produced an all-invalid DSQG-W candidate row")
@@ -297,16 +330,24 @@ class CandidateProvider:
         order = torch.arange(r_count, device=device, dtype=torch.long)
         priority_j = priority.unsqueeze(-2)
         min_priority = priority_j.masked_fill(~same_key, 99).amin(dim=-1)
+        score_j = scores.unsqueeze(-2)
+        max_score_same_key = score_j.masked_fill(~same_key, float("-inf")).amax(dim=-1)
         earlier_same_key = same_key & (order.reshape(1, 1, 1, r_count) < order.reshape(1, 1, r_count, 1))
         duplicate_mask = valid & earlier_same_key.any(dim=-1)
         same_min_priority = earlier_same_key & (priority_j == priority.unsqueeze(-1))
-        keep = valid & (priority == min_priority) & ~same_min_priority.any(dim=-1)
+        same_min_priority_higher_or_equal_score = same_min_priority & (score_j >= scores.unsqueeze(-1))
+        keep = valid & (priority == min_priority) & (scores >= max_score_same_key) & ~same_min_priority_higher_or_equal_score.any(dim=-1)
         duplicate_count = duplicate_mask.sum()
 
         sort_stride_source = max(self.config.n_sources, len(CandidateSource)) + 1
         sort_stride_token = (seq_len + 1) * sort_stride_source
-        sort_key = priority * sort_stride_token + tokens.clamp_min(0) * sort_stride_source + sources.clamp_min(0)
-        sort_key = sort_key.masked_fill(~keep, torch.iinfo(torch.long).max)
+        sort_key = (
+            priority.to(torch.float64) * float(sort_stride_token * 1_000_000)
+            - scores.to(torch.float64) * float(sort_stride_token)
+            + tokens.clamp_min(0).to(torch.float64) * float(sort_stride_source)
+            + sources.clamp_min(0).to(torch.float64)
+        )
+        sort_key = sort_key.masked_fill(~keep, float("inf"))
         order_idx = sort_key.argsort(dim=-1)
         j_max = self.config.max_candidates
         if order_idx.shape[-1] < j_max:
@@ -317,11 +358,13 @@ class CandidateProvider:
         cand_token_indices = tokens.gather(-1, order_idx)
         cand_types = types.gather(-1, order_idx)
         cand_sources = sources.gather(-1, order_idx)
+        cand_scores = scores.gather(-1, order_idx)
         cand_mask = keep.gather(-1, order_idx)
         valid_count = cand_mask.sum(dim=-1).to(torch.long)
         cand_token_indices = cand_token_indices.masked_fill(~cand_mask, -1)
         cand_types = cand_types.masked_fill(~cand_mask, int(CandidateType.NULL))
         cand_sources = cand_sources.masked_fill(~cand_mask, int(CandidateSource.NULL))
+        cand_scores = cand_scores.masked_fill(~cand_mask, 0.0)
 
         gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
         final_gather = self._gather_states(final_states, gather_tokens)
@@ -343,6 +386,8 @@ class CandidateProvider:
             "dsqg_w_candidate_duplicate_rate": duplicate_count.to(final_states.dtype) / denom,
             "dsqg_w_candidate_invalid_rate": invalid_count.to(final_states.dtype) / denom,
             "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+            "dsqg_w_candidate_score_mean": cand_scores.masked_select(cand_mask).mean() if cand_mask.any() else final_states.new_tensor(0.0),
+            "dsqg_w_candidate_score_max": cand_scores.masked_select(cand_mask).max() if cand_mask.any() else final_states.new_tensor(0.0),
         }
         mask_denom = cand_mask.float().sum().clamp_min(1.0)
         for ctype in CandidateType:
@@ -356,6 +401,7 @@ class CandidateProvider:
             cand_mask=cand_mask,
             cand_token_indices=cand_token_indices,
             valid_candidate_count=valid_count,
+            cand_scores=cand_scores,
             telemetry=telemetry,
         )
 
@@ -387,6 +433,33 @@ class CandidateProvider:
         return values
 
     @staticmethod
+    def _normalize_score_tensor(
+        scores: torch.Tensor | None,
+        bsz: int,
+        seq_len: int,
+        limit: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if scores is None or limit <= 0:
+            return None
+        values = scores.to(device=device)
+        if values.ndim == 1:
+            values = values[:limit].reshape(1, 1, -1).expand(bsz, seq_len, -1)
+        elif values.ndim == 2:
+            values = values[:, :limit].reshape(values.shape[0], 1, -1).expand(-1, seq_len, -1)
+        elif values.ndim == 3:
+            values = values[:, :, :limit]
+        else:
+            raise ValueError("candidate score tensors must be rank 1, 2, or 3")
+        if values.shape[0] == 1 and bsz != 1:
+            values = values.expand(bsz, -1, -1)
+        if values.shape[1] == 1 and seq_len != 1:
+            values = values.expand(-1, seq_len, -1)
+        if values.shape[:2] != (bsz, seq_len):
+            raise ValueError("candidate score tensor must broadcast to [B,T,K]")
+        return values[..., :limit]
+
+    @staticmethod
     def _gather_states(states: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, d = states.shape
         batch_offsets = torch.arange(bsz, device=states.device, dtype=torch.long).reshape(bsz, 1, 1) * seq_len
@@ -400,6 +473,7 @@ class CandidateProvider:
         l3_states: torch.Tensor | None = None,
         question_indices: torch.Tensor | list[list[int]] | None = None,
         hisa_evidence_indices: torch.Tensor | None = None,
+        hisa_evidence_scores: torch.Tensor | None = None,
         chunk_rep_indices: torch.Tensor | None = None,
         chunk_rep_states: torch.Tensor | None = None,
         l3_skip_indices: torch.Tensor | None = None,
@@ -466,7 +540,7 @@ class CandidateProvider:
                     consider(q_idx, int(CandidateSource.FINAL), int(CandidateType.QUESTION), None)
 
                 for h_idx in self._indices_for_position(hisa_evidence_indices, b, t, self.config.k_hisa_evidence):
-                    consider(h_idx, int(CandidateSource.L3), int(CandidateType.HISA_EVIDENCE), None)
+                    consider(h_idx, int(CandidateSource.HISA), int(CandidateType.HISA_EVIDENCE), None)
 
                 for offset in self.config.long_offsets:
                     consider(t - int(offset), int(CandidateSource.FINAL), int(CandidateType.LONG_OFFSET), int(offset))
@@ -813,6 +887,7 @@ class DSQGWBlock(nn.Module):
         max_candidates: int,
         local_type_id: int,
         gate_init: float = -5.0,
+        fuse_init_std: float = 1e-4,
         use_width_cell: bool = False,
         width_bottleneck: int = 64,
         width_gate_init: float = -5.0,
@@ -880,7 +955,7 @@ class DSQGWBlock(nn.Module):
             nn.Linear(bottleneck, d),
         )
         self.gate = nn.Parameter(torch.full((d,), float(gate_init)))
-        nn.init.normal_(self.fuse[-1].weight, mean=0.0, std=1e-4)
+        nn.init.normal_(self.fuse[-1].weight, mean=0.0, std=float(fuse_init_std))
         nn.init.zeros_(self.fuse[-1].bias)
 
     @classmethod
@@ -894,6 +969,7 @@ class DSQGWBlock(nn.Module):
             max_candidates=config.max_candidates,
             local_type_id=config.local_type_id,
             gate_init=config.gate_init,
+            fuse_init_std=config.fuse_init_std,
             use_width_cell=config.use_width_cell,
             width_bottleneck=config.width_bottleneck,
             width_gate_init=config.width_gate_init,
@@ -914,6 +990,7 @@ class DSQGWBlock(nn.Module):
         cand_sources: torch.Tensor,
         cand_mask: torch.Tensor,
         *,
+        cand_scores: torch.Tensor | None = None,
         return_routing: bool = False,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         bsz, seq_len, d = x.shape
@@ -948,6 +1025,17 @@ class DSQGWBlock(nn.Module):
 
         scores = (q[:, :, None, :, :] * k_eff).sum(dim=-1) / math.sqrt(float(dh))
         scores = scores + self.type_bias[cand_types]
+        candidate_score_bias_norm = x.new_tensor(0.0)
+        if cand_scores is not None:
+            if cand_scores.shape != cand_mask.shape:
+                raise ValueError("cand_scores must have shape [B,T,J]")
+            score_bias = cand_scores.to(device=x.device, dtype=scores.dtype)
+            score_bias = torch.nan_to_num(score_bias, nan=0.0, neginf=0.0, posinf=0.0)
+            valid_denom = cand_mask.to(score_bias.dtype).sum(dim=-1, keepdim=True).clamp_min(1.0)
+            score_bias = score_bias - (score_bias.masked_fill(~cand_mask, 0.0).sum(dim=-1, keepdim=True) / valid_denom)
+            score_bias = score_bias.masked_fill(~cand_mask, 0.0)
+            scores = scores + score_bias[:, :, :, None]
+            candidate_score_bias_norm = score_bias.masked_select(cand_mask).norm() / cand_mask.float().sum().clamp_min(1.0)
         query_type_bias_norm = x.new_tensor(0.0)
         if self.use_query_type_bias:
             qtb = self.query_type_bias(x_n).reshape(bsz, seq_len, self.n_types, h)
@@ -1001,6 +1089,7 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_typed_read_norms": torch.stack(typed_read_norms).detach(),
             "read_mix_weight_norm": self.read_mix.weight.norm().detach(),
             "dsqg_w_query_type_bias_norm": query_type_bias_norm.detach(),
+            "dsqg_w_candidate_score_bias_norm": candidate_score_bias_norm.detach(),
         }
         for ctype in CandidateType:
             mask = (cand_types == int(ctype)) & cand_mask
