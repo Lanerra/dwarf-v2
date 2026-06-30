@@ -3659,6 +3659,94 @@ def _streamed_linear_ce_loss(hidden: torch.Tensor,
     return total_loss, n_valid
 
 
+def _validate_dataset_token_tensor(name: str, tensor: torch.Tensor) -> None:
+    if not torch.is_tensor(tensor):
+        raise ValueError(f'{name} must be a tensor, got {type(tensor).__name__}')
+    if tensor.ndim != 2:
+        raise ValueError(f'{name} must have shape [rows, seq_len], got {tuple(tensor.shape)}')
+    if tensor.size(1) < 2:
+        raise ValueError(f'{name} seq_len must be >= 2 for next-token training, got {tensor.size(1)}')
+
+
+def _coerce_dataset_loss_mask(name: str, mask: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+    if not torch.is_tensor(mask):
+        raise ValueError(f'{name} must be a tensor, got {type(mask).__name__}')
+    if tuple(mask.shape) != tuple(data.shape):
+        raise ValueError(f'{name} shape {tuple(mask.shape)} must match {tuple(data.shape)}')
+    return mask.to(dtype=torch.bool).contiguous()
+
+
+def _dataset_loss_mask_stats(train_loss_mask: torch.Tensor,
+                             val_loss_mask: torch.Tensor,
+                             *,
+                             source: str) -> dict:
+    train_targets = train_loss_mask[:, 1:]
+    val_targets = val_loss_mask[:, 1:]
+    train_real = int(train_targets.sum().item())
+    val_real = int(val_targets.sum().item())
+    train_slots = int(train_targets.numel())
+    val_slots = int(val_targets.numel())
+    if train_real == 0:
+        raise ValueError('loss masks select zero train target rows after next-token shift')
+    sparse = not (bool(train_loss_mask.all()) and bool(val_loss_mask.all()))
+    return {
+        'source': source,
+        'has_train_loss_mask': source == 'dataset',
+        'has_val_loss_mask': source == 'dataset',
+        'uses_sparse_loss_mask': bool(sparse),
+        'train_real_tokens': train_real,
+        'train_target_slots': train_slots,
+        'train_real_fraction': float(train_real / max(train_slots, 1)),
+        'val_real_tokens': val_real,
+        'val_target_slots': val_slots,
+        'val_real_fraction': float(val_real / max(val_slots, 1)),
+    }
+
+
+def _prepare_dataset_loss_masks(cache: dict,
+                                train_data: torch.Tensor,
+                                val_data: torch.Tensor,
+                                *,
+                                use_liger_ce: bool) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Validate optional DWARF-v2-shaped loss masks and compute shifted-row stats.
+
+    Masks are stored token-aligned with the dataset. The trainer predicts
+    ``batch[:, 1:]`` from ``batch[:, :-1]``, so the effective target mask is
+    always ``batch_loss_mask[:, 1:]``: a true mark at token column ``c`` trains
+    the prediction at input position ``c - 1`` for that token.
+    """
+    _validate_dataset_token_tensor('train', train_data)
+    _validate_dataset_token_tensor('val', val_data)
+    if not isinstance(cache, dict):
+        raise ValueError('encoded dataset must be a dict with train/val tensors')
+
+    has_train_mask = cache.get('train_loss_mask') is not None
+    has_val_mask = cache.get('val_loss_mask') is not None
+    if has_train_mask != has_val_mask:
+        raise ValueError('dataset must provide both train_loss_mask and val_loss_mask, or neither')
+
+    if not has_train_mask:
+        print('  [dataset] no loss masks found; using all-token CE')
+        train_loss_mask = torch.ones_like(train_data, dtype=torch.bool)
+        val_loss_mask = torch.ones_like(val_data, dtype=torch.bool)
+        return train_loss_mask, val_loss_mask, _dataset_loss_mask_stats(
+            train_loss_mask, val_loss_mask, source='all_token'
+        )
+
+    train_loss_mask = _coerce_dataset_loss_mask('train_loss_mask', cache['train_loss_mask'], train_data)
+    val_loss_mask = _coerce_dataset_loss_mask('val_loss_mask', cache['val_loss_mask'], val_data)
+    if use_liger_ce and (not bool(train_loss_mask.all()) or not bool(val_loss_mask.all())):
+        raise RuntimeError('Liger fused CE does not support sparse loss masks; run with DWARF_LIGER=0.')
+    return train_loss_mask, val_loss_mask, _dataset_loss_mask_stats(
+        train_loss_mask, val_loss_mask, source='dataset'
+    )
+
+
+def _attach_loss_mask_stats_to_checkpoint_config(config: dict, loss_mask_stats: dict) -> dict:
+    config.setdefault('dataset', {})['loss_mask'] = dict(loss_mask_stats)
+    return config
+
+
 def _dsqg_w_width_aux_loss(*models):
     if (not DSQG_W_ENABLED) or (not DSQG_W_WIDTH_CELL) or DSQG_W_WIDTH_AUX_WEIGHT <= 0.0:
         return None
@@ -3868,17 +3956,9 @@ def train():
     # Keep cached sequences compact on host; cast targets to int64 per batch for CE.
     train_data = _cache['train'].to(dtype=torch.int32).contiguous()
     val_data = _cache['val'].to(dtype=torch.int32).contiguous()
-    train_loss_mask = _cache.get('train_loss_mask') if isinstance(_cache, dict) else None
-    val_loss_mask = _cache.get('val_loss_mask') if isinstance(_cache, dict) else None
-    if train_loss_mask is None or val_loss_mask is None:
-        print('  [dataset] no loss masks found; using all-token CE')
-        train_loss_mask = torch.ones_like(train_data, dtype=torch.bool)
-        val_loss_mask = torch.ones_like(val_data, dtype=torch.bool)
-    else:
-        train_loss_mask = train_loss_mask.to(dtype=torch.bool).contiguous()
-        val_loss_mask = val_loss_mask.to(dtype=torch.bool).contiguous()
-    if USE_LIGER_CE and (not bool(train_loss_mask.all()) or not bool(val_loss_mask.all())):
-        raise RuntimeError('Liger fused CE does not support sparse loss masks; run with DWARF_LIGER=0.')
+    train_loss_mask, val_loss_mask, loss_mask_stats = _prepare_dataset_loss_masks(
+        _cache, train_data, val_data, use_liger_ce=USE_LIGER_CE
+    )
 
     if len(train_data) > MAX_TRAIN_SEQS:
         subset_idx = torch.randperm(len(train_data))[:MAX_TRAIN_SEQS]
@@ -3887,15 +3967,18 @@ def train():
     if len(val_data) > MAX_VAL_SEQS:
         val_data = val_data[:MAX_VAL_SEQS]
         val_loss_mask = val_loss_mask[:MAX_VAL_SEQS]
+    loss_mask_stats = _dataset_loss_mask_stats(
+        train_loss_mask, val_loss_mask, source=loss_mask_stats['source']
+    )
     if PIN_DATASET:
         train_data = train_data.pin_memory()
         val_data = val_data.pin_memory()
         train_loss_mask = train_loss_mask.pin_memory()
         val_loss_mask = val_loss_mask.pin_memory()
-    train_real = int(train_loss_mask[:, 1:].sum().item())
-    val_real = int(val_loss_mask[:, 1:].sum().item())
-    train_slots = max(train_loss_mask[:, 1:].numel(), 1)
-    val_slots = max(val_loss_mask[:, 1:].numel(), 1)
+    train_real = loss_mask_stats['train_real_tokens']
+    val_real = loss_mask_stats['val_real_tokens']
+    train_slots = max(loss_mask_stats['train_target_slots'], 1)
+    val_slots = max(loss_mask_stats['val_target_slots'], 1)
     print(
         f'  train: {len(train_data):,} seqs  val: {len(val_data):,} seqs  host_dtype={train_data.dtype} '
         f'train_real={train_real:,}/{train_slots:,} ({train_real/train_slots:.2%}) '
@@ -4020,6 +4103,7 @@ def train():
     checkpoint_config = _base_checkpoint_config(
         git_hash=git_hash, tok_path=tok_path, encoded_path=encoded_path, n_params=n_params
     )
+    _attach_loss_mask_stats_to_checkpoint_config(checkpoint_config, loss_mask_stats)
 
     for epoch in range(start_epoch, SCREEN_EPOCHS + 1):
         if device == 'cuda':

@@ -22,6 +22,7 @@ datasets/*.pt
 datasets/*.pth
 datasets/*.npy
 datasets/*.npz
+datasets/dsqg_v2_semantic_curriculum_*/
 checkpoints/*.pt
 checkpoints/*.pth
 
