@@ -7,7 +7,7 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -107,6 +107,18 @@ VARIANTS: tuple[Variant, ...] = (
         notes="Full D-fed typed mixer + query type bias + typed representative labels.",
     ),
 )
+
+
+def select_variants(variant_ids: str) -> tuple[Variant, ...]:
+    requested = [part.strip() for part in variant_ids.split(",") if part.strip()]
+    by_id = {variant.variant_id: variant for variant in VARIANTS}
+    if not requested:
+        return VARIANTS
+    unknown = [variant_id for variant_id in requested if variant_id not in by_id]
+    if unknown:
+        valid = ",".join(variant.variant_id for variant in VARIANTS)
+        raise ValueError(f"unknown variant id(s): {','.join(unknown)}; valid={valid}")
+    return tuple(by_id[variant_id] for variant_id in requested)
 
 
 def _jsonable(value: Any) -> Any:
@@ -250,12 +262,19 @@ def run_variant(
     return result
 
 
-def run_lane(args: argparse.Namespace, lane: str, out_root: Path, *, dry_run: bool) -> dict[str, Any]:
+def run_lane(
+    args: argparse.Namespace,
+    lane: str,
+    out_root: Path,
+    *,
+    variants: tuple[Variant, ...],
+    dry_run: bool,
+) -> dict[str, Any]:
     dataset = _lane_dataset(args, lane)
     if not dataset.exists():
         raise FileNotFoundError(f"{lane} dataset does not exist: {dataset}")
     lane_results: list[dict[str, Any]] = []
-    for variant in VARIANTS:
+    for variant in variants:
         result = run_variant(args=args, lane=lane, variant=variant, out_root=out_root, dry_run=dry_run)
         lane_results.append(result)
         if not dry_run and not result["health"]["pass"]:
@@ -278,6 +297,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tokenizer", type=Path, default=launcher.DEFAULT_TOKENIZER)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--lanes", choices=("same_family", "pretrain", "both"), default="both")
+    parser.add_argument(
+        "--variant-ids",
+        default=",".join(variant.variant_id for variant in VARIANTS),
+        help="Comma-separated variant ids to run in order. Use B_dsr_rep4,C_dfed_w_min,D_dfed_w_full for the tight attribution ladder.",
+    )
     parser.add_argument("--max-acc-steps", type=int, default=64)
     parser.add_argument("--train-seqs", type=int, default=512)
     parser.add_argument("--val-seqs", type=int, default=128)
@@ -303,6 +327,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     args = parse_args(argv)
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+    variants = select_variants(args.variant_ids)
     started = time.time()
     manifest = {
         "objective": "dsqg_w_dfed_ladder",
@@ -311,7 +336,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         "out_root": str(out_root),
         "dry_run": bool(args.dry_run),
         "args": {k: _jsonable(v) for k, v in vars(args).items()},
-        "variants": [_jsonable(v) for v in VARIANTS],
+        "variants": [_jsonable(v) for v in variants],
         "started_at": datetime.now().isoformat(timespec="seconds"),
     }
     write_json(out_root / "ladder_manifest.json", manifest)
@@ -325,7 +350,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 results["pretrain_skip_reason"] = "same_family lane did not pass mechanical health gate"
                 print(f"[pretrain] skipped: {results['pretrain_skip_reason']}", flush=True)
                 break
-        lane_result = run_lane(args, lane, out_root, dry_run=bool(args.dry_run))
+        lane_result = run_lane(args, lane, out_root, variants=variants, dry_run=bool(args.dry_run))
         results["lanes"][lane] = lane_result
     results["elapsed_s"] = time.time() - started
     results["pass"] = all(lane_result["summary"].get("pass") for lane_result in results["lanes"].values())

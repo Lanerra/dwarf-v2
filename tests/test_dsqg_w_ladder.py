@@ -102,3 +102,42 @@ def test_ladder_runner_dry_run_writes_variant_configs(tmp_path: Path) -> None:
     assert cfg_d["env"]["DWARF_DSQG_W_DSR_CANDIDATES"] == "1"
     assert cfg_d["env"]["DWARF_DSQG_W_LOCAL_OFFSETS"] == "none"
     assert cfg_d["env"]["DWARF_DSQG_W_TYPED_MIXER"] == "1"
+
+
+def test_ladder_runner_variant_ids_filter_tighter_attribution_set(tmp_path: Path) -> None:
+    mod = load_module(RUNNER_SCRIPT, "run_dsqg_w_ladder_filter_test")
+    dataset = tmp_path / "same_family.pt"
+    dataset.write_bytes(b"not loaded during dry-run")
+    out_root = tmp_path / "tight_ladder"
+
+    result = mod.main(
+        [
+            "--out-root",
+            str(out_root),
+            "--lanes",
+            "same_family",
+            "--same-family-dataset",
+            str(dataset),
+            "--variant-ids",
+            "B_dsr_rep4,C_dfed_w_min,D_dfed_w_full",
+            "--max-acc-steps",
+            "3",
+            "--train-seqs",
+            "4",
+            "--val-seqs",
+            "2",
+            "--dry-run",
+        ]
+    )
+
+    assert result["pass"] is True
+    manifest = json.loads((out_root / "ladder_manifest.json").read_text(encoding="utf-8"))
+    assert [v["variant_id"] for v in manifest["variants"]] == [
+        "B_dsr_rep4",
+        "C_dfed_w_min",
+        "D_dfed_w_full",
+    ]
+    assert not (out_root / "same_family/A_dsr_rowmax/run_config.json").exists()
+    assert (out_root / "same_family/B_dsr_rep4/run_config.json").exists()
+    assert (out_root / "same_family/C_dfed_w_min/run_config.json").exists()
+    assert (out_root / "same_family/D_dfed_w_full/run_config.json").exists()
