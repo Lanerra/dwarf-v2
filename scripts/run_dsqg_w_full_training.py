@@ -42,6 +42,12 @@ def build_run_config(
     width_aux_weight: float = 0.0,
     width_entropy_floor: float = 1.5,
     width_entropy_weight: float = 0.25,
+    typed_mixer: bool = False,
+    typed_mixer_bottleneck: int = 64,
+    typed_mixer_gate_init: float = -5.0,
+    query_type_bias: bool = False,
+    typed_hisa_reps: bool = False,
+    hisa_stage2_rep_r: int = 0,
     lr: float | None = None,
     dataset: Path | str = DEFAULT_DATASET,
     tokenizer: Path | str = DEFAULT_TOKENIZER,
@@ -77,6 +83,12 @@ def build_run_config(
         "DWARF_DSQG_W_WIDTH_AUX_WEIGHT": str(float(width_aux_weight)),
         "DWARF_DSQG_W_WIDTH_ENTROPY_FLOOR": str(float(width_entropy_floor)),
         "DWARF_DSQG_W_WIDTH_ENTROPY_WEIGHT": str(float(width_entropy_weight)),
+        "DWARF_DSQG_W_TYPED_MIXER": "1" if typed_mixer else "0",
+        "DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK": str(int(typed_mixer_bottleneck)),
+        "DWARF_DSQG_W_TYPED_MIXER_GATE_INIT": str(float(typed_mixer_gate_init)),
+        "DWARF_DSQG_W_QUERY_TYPE_BIAS": "1" if query_type_bias else "0",
+        "DWARF_DSQG_W_TYPED_HISA_REPS": "1" if typed_hisa_reps else "0",
+        "DWARF_HISA_STAGE2_REP_R": str(int(hisa_stage2_rep_r)),
         "DWARF_DSQG_W_QUESTION": "1",
         "DWARF_DSQG_W_HISA_L3": "1",
         "DWARF_DSQG_W_K_QUESTION": "4",
@@ -165,6 +177,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width-aux-weight", type=float, default=0.0)
     parser.add_argument("--width-entropy-floor", type=float, default=1.5)
     parser.add_argument("--width-entropy-weight", type=float, default=0.25)
+    parser.add_argument("--typed-mixer", action="store_true", help="Enable the typed candidate-set mixer before DSQG-W scoring.")
+    parser.add_argument("--typed-mixer-bottleneck", type=int, default=64)
+    parser.add_argument("--typed-mixer-gate-init", type=float, default=-5.0)
+    parser.add_argument("--query-type-bias", action="store_true", help="Enable query-conditioned candidate-type score bias.")
+    parser.add_argument("--typed-hisa-reps", action="store_true", help="Label first four HISA evidence candidates as representative evidence slots.")
+    parser.add_argument("--hisa-stage2-rep-r", type=int, default=0, help="Enable query-representative HISA Stage-2 selector with r representatives.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
@@ -197,6 +215,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         width_aux_weight=args.width_aux_weight,
         width_entropy_floor=args.width_entropy_floor,
         width_entropy_weight=args.width_entropy_weight,
+        typed_mixer=args.typed_mixer,
+        typed_mixer_bottleneck=args.typed_mixer_bottleneck,
+        typed_mixer_gate_init=args.typed_mixer_gate_init,
+        query_type_bias=args.query_type_bias,
+        typed_hisa_reps=args.typed_hisa_reps,
+        hisa_stage2_rep_r=args.hisa_stage2_rep_r,
         lr=args.lr,
         dataset=args.dataset,
         tokenizer=args.tokenizer,

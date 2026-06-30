@@ -72,6 +72,29 @@ def test_full_run_launcher_can_enable_width_cell_env(tmp_path: Path) -> None:
     assert env["DWARF_DSQG_W_WIDTH_ENTROPY_WEIGHT"] == "0.4"
 
 
+def test_full_run_launcher_can_enable_typed_mixer_and_query_rep_hisa_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "combined_run",
+        run_name="combined_unit",
+        typed_mixer=True,
+        typed_mixer_bottleneck=12,
+        typed_mixer_gate_init=-4.5,
+        query_type_bias=True,
+        typed_hisa_reps=True,
+        hisa_stage2_rep_r=4,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W_TYPED_MIXER"] == "1"
+    assert env["DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK"] == "12"
+    assert env["DWARF_DSQG_W_TYPED_MIXER_GATE_INIT"] == "-4.5"
+    assert env["DWARF_DSQG_W_QUERY_TYPE_BIAS"] == "1"
+    assert env["DWARF_DSQG_W_TYPED_HISA_REPS"] == "1"
+    assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
+
+
 def test_full_run_launcher_dry_run_writes_config_without_executing(tmp_path: Path) -> None:
     mod = load_launcher_module()
 

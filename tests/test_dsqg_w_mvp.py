@@ -4,6 +4,7 @@ import inspect
 
 import pytest
 import torch
+import torch.nn as nn
 
 from kernels.dsqg_w.dsqg_w_mvp import (
     CandidateProvider,
@@ -11,6 +12,7 @@ from kernels.dsqg_w.dsqg_w_mvp import (
     CandidateType,
     DSQGWBlock,
     DSQGWConfig,
+    DSQGWTypedCandidateMixer,
     answer_masked_loss,
     conditional_copy_unlikelihood_loss,
     entropy_floor_loss,
@@ -284,6 +286,111 @@ def test_dsqg_w_width_cell_pair_bias_can_directionally_route_question_to_evidenc
 
     assert telemetry["dsqg_w_width_question_to_hisa_evidence_mass"].item() > 0.70
     assert telemetry["dsqg_w_width_self_mass"].item() < 0.60
+
+
+def test_candidate_provider_can_label_hisa_evidence_slots_as_query_representatives() -> None:
+    x = make_hidden(batch=1, seq=6, d=16)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=8,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=0,
+        k_hisa_evidence=4,
+        typed_hisa_reps=True,
+    )
+    provider = CandidateProvider(cfg)
+    hisa = torch.tensor([[[0, 0, 0, 0], [0, 0, 0, 0], [0, 1, 0, 1], [0, 1, 2, 0], [0, 1, 2, 3], [1, 2, 3, 4]]])
+
+    batch = provider.build(x, hisa_evidence_indices=hisa)
+
+    valid_types = batch.cand_types[batch.cand_mask].tolist()
+    assert int(CandidateType.HISA_EVIDENCE_REP0) in valid_types
+    assert int(CandidateType.HISA_EVIDENCE_REP1) in valid_types
+    assert int(CandidateType.HISA_EVIDENCE_REP2) in valid_types
+    assert int(CandidateType.HISA_EVIDENCE_REP3) in valid_types
+    assert int(CandidateType.HISA_EVIDENCE) not in valid_types
+    assert batch.telemetry["dsqg_w_candidate_fraction_hisa_evidence_rep0"].item() > 0.0
+
+
+def test_typed_candidate_mixer_is_bounded_and_near_identity_when_closed() -> None:
+    torch.manual_seed(53)
+    x = make_hidden(batch=1, seq=7, d=16)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=10,
+        bottleneck=32,
+        gate_init=-5.0,
+        use_typed_mixer=True,
+        typed_mixer_bottleneck=8,
+        typed_mixer_gate_init=-12.0,
+        typed_hisa_reps=True,
+        k_hisa_evidence=4,
+    )
+    provider = CandidateProvider(cfg)
+    cands = provider.build(
+        x,
+        question_indices=torch.tensor([[0, 2, 5]]),
+        hisa_evidence_indices=torch.tensor([[[0, 0, 0, 0], [0, 0, 0, 0], [0, 1, 0, 1], [0, 1, 2, 0], [0, 1, 2, 3], [1, 2, 3, 4], [2, 3, 4, 5]]]),
+    )
+    block = DSQGWBlock.from_config(cfg).eval()
+    assert isinstance(block.typed_mixer, DSQGWTypedCandidateMixer)
+
+    out, telemetry = block(x, cands.cand_states, cands.cand_types, cands.cand_sources, cands.cand_mask)
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert telemetry["dsqg_w_typed_mixer_gate_mean"].item() < 1e-4
+    assert telemetry["dsqg_w_typed_mixer_entropy"].item() > 0.0
+    assert telemetry["dsqg_w_typed_mixer_delta_norm"].item() >= 0.0
+
+
+def test_query_conditioned_type_bias_can_route_scores_to_hisa_rep_candidate() -> None:
+    torch.manual_seed(59)
+    x = torch.zeros(1, 5, 16)
+    x[:, :, 0] = 1.0
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=6,
+        bottleneck=32,
+        gate_init=-5.0,
+        local_offsets=(1,),
+        long_offsets=(),
+        k_question=0,
+        k_hisa_evidence=1,
+        use_query_type_bias=True,
+        typed_hisa_reps=True,
+    )
+    provider = CandidateProvider(cfg)
+    cands = provider.build(x, hisa_evidence_indices=torch.tensor([[[0], [0], [1], [2], [3]]]))
+    block = DSQGWBlock.from_config(cfg).eval()
+    block.norm_x = nn.Identity()
+    with torch.no_grad():
+        block.q_proj.weight.zero_()
+        block.k_proj.weight.zero_()
+        block.type_bias.zero_()
+        block.source_bias.zero_()
+        block.role_key.weight.zero_()
+        block.source_key.weight.zero_()
+        block.query_type_bias.weight.zero_()
+        for head in range(cfg.n_heads):
+            out_idx = int(CandidateType.HISA_EVIDENCE_REP0) * cfg.n_heads + head
+            block.query_type_bias.weight[out_idx, 0] = 8.0
+
+    _, telemetry = block(
+        x,
+        cands.cand_states,
+        cands.cand_types,
+        cands.cand_sources,
+        cands.cand_mask,
+        return_routing=True,
+    )
+
+    assert telemetry["dsqg_w_hisa_evidence_rep0_mass"].item() > 0.80
+    assert telemetry["dsqg_w_query_type_bias_norm"].item() > 0.0
 
 
 def test_width_pair_transfer_loss_rewards_question_evidence_lateral_mass() -> None:

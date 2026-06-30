@@ -16,6 +16,10 @@ class CandidateType(IntEnum):
     LONG_OFFSET = 4
     CHUNK_REP = 5
     L3_SKIP = 6
+    HISA_EVIDENCE_REP0 = 7
+    HISA_EVIDENCE_REP1 = 8
+    HISA_EVIDENCE_REP2 = 9
+    HISA_EVIDENCE_REP3 = 10
 
 
 class CandidateSource(IntEnum):
@@ -31,6 +35,10 @@ class CandidateSource(IntEnum):
 # replace duplicate local/long routes instead of letting them inflate mass.
 _CANDIDATE_PRIORITY: dict[int, int] = {
     int(CandidateType.HISA_EVIDENCE): 0,
+    int(CandidateType.HISA_EVIDENCE_REP0): 0,
+    int(CandidateType.HISA_EVIDENCE_REP1): 0,
+    int(CandidateType.HISA_EVIDENCE_REP2): 0,
+    int(CandidateType.HISA_EVIDENCE_REP3): 0,
     int(CandidateType.QUESTION): 1,
     int(CandidateType.CHUNK_REP): 2,
     int(CandidateType.L3_SKIP): 3,
@@ -63,6 +71,11 @@ class DSQGWConfig:
     width_self_bias_init: float = 0.0
     width_entropy_floor: float = 0.0
     width_entropy_weight: float = 0.0
+    use_typed_mixer: bool = False
+    typed_mixer_bottleneck: int = 64
+    typed_mixer_gate_init: float = -5.0
+    use_query_type_bias: bool = False
+    typed_hisa_reps: bool = False
 
     def __post_init__(self) -> None:
         if self.d <= 0:
@@ -81,6 +94,8 @@ class DSQGWConfig:
             raise ValueError("width_entropy_floor must be non-negative")
         if self.width_entropy_weight < 0.0:
             raise ValueError("width_entropy_weight must be non-negative")
+        if self.typed_mixer_bottleneck <= 0:
+            raise ValueError("typed_mixer_bottleneck must be positive")
 
 
 @dataclass(frozen=True)
@@ -183,7 +198,7 @@ class CandidateProvider:
         raw_sources: list[torch.Tensor] = []
         raw_valids: list[torch.Tensor] = []
 
-        def add(tokens: torch.Tensor, ctype: int, source: int, valid: torch.Tensor | None = None) -> None:
+        def add(tokens: torch.Tensor, ctype: int | torch.Tensor, source: int, valid: torch.Tensor | None = None) -> None:
             tokens = tokens.to(device=device, dtype=torch.long)
             if tokens.ndim == 2:
                 tokens = tokens.unsqueeze(-1)
@@ -197,7 +212,21 @@ class CandidateProvider:
             if valid is not None:
                 valid_mask = valid_mask & valid.to(device=device, dtype=torch.bool)
             raw_tokens.append(tokens)
-            raw_types.append(torch.full(tokens.shape, int(ctype), device=device, dtype=torch.long))
+            if isinstance(ctype, torch.Tensor):
+                type_values = ctype.to(device=device, dtype=torch.long)
+                if type_values.ndim == 1:
+                    type_values = type_values.reshape(1, 1, -1)
+                elif type_values.ndim == 2:
+                    type_values = type_values.unsqueeze(-1)
+                if type_values.shape[0] == 1 and bsz != 1:
+                    type_values = type_values.expand(bsz, -1, -1)
+                if type_values.shape[1] == 1 and seq_len != 1:
+                    type_values = type_values.expand(-1, seq_len, -1)
+                if type_values.shape != tokens.shape:
+                    raise ValueError("candidate type tensor must broadcast to candidate token tensor shape")
+                raw_types.append(type_values)
+            else:
+                raw_types.append(torch.full(tokens.shape, int(ctype), device=device, dtype=torch.long))
             raw_sources.append(torch.full(tokens.shape, int(source), device=device, dtype=torch.long))
             raw_valids.append(valid_mask)
 
@@ -208,7 +237,21 @@ class CandidateProvider:
             add(q_idx, int(CandidateType.QUESTION), int(CandidateSource.FINAL))
         h_idx = self._normalize_index_tensor(hisa_evidence_indices, bsz, seq_len, self.config.k_hisa_evidence, device)
         if h_idx is not None:
-            add(h_idx, int(CandidateType.HISA_EVIDENCE), int(CandidateSource.L3))
+            if self.config.typed_hisa_reps:
+                rep_types = [
+                    int(CandidateType.HISA_EVIDENCE_REP0),
+                    int(CandidateType.HISA_EVIDENCE_REP1),
+                    int(CandidateType.HISA_EVIDENCE_REP2),
+                    int(CandidateType.HISA_EVIDENCE_REP3),
+                ]
+                n_rep = min(h_idx.shape[-1], len(rep_types))
+                if n_rep > 0:
+                    type_ids = torch.tensor(rep_types[:n_rep], device=device, dtype=torch.long).reshape(1, 1, n_rep)
+                    add(h_idx[..., :n_rep], type_ids, int(CandidateSource.L3))
+                if h_idx.shape[-1] > n_rep:
+                    add(h_idx[..., n_rep:], int(CandidateType.HISA_EVIDENCE), int(CandidateSource.L3))
+            else:
+                add(h_idx, int(CandidateType.HISA_EVIDENCE), int(CandidateSource.L3))
         for offset in self.config.long_offsets:
             add(positions - int(offset), int(CandidateType.LONG_OFFSET), int(CandidateSource.FINAL))
         c_idx = self._normalize_index_tensor(chunk_rep_indices, bsz, seq_len, self.config.k_chunk, device)
@@ -669,6 +712,86 @@ class DSQGWWidthCell(nn.Module):
         return out, telemetry
 
 
+class DSQGWTypedCandidateMixer(nn.Module):
+    """Small typed candidate-set mixer applied before DSQG-W query scoring.
+
+    This is bounded to the candidate axis J.  It never attends over sequence
+    positions; it only lets the already-built causal candidate set exchange
+    typed evidence before the main query-conditioned scoring step.
+    """
+
+    def __init__(
+        self,
+        *,
+        d: int,
+        n_heads: int,
+        n_types: int,
+        bottleneck: int,
+        gate_init: float = -5.0,
+    ) -> None:
+        super().__init__()
+        if d % n_heads != 0:
+            raise ValueError("d must be divisible by n_heads")
+        self.d = int(d)
+        self.n_heads = int(n_heads)
+        self.mix_dim = int(bottleneck)
+        if self.mix_dim % self.n_heads != 0:
+            raise ValueError("typed mixer bottleneck must be divisible by n_heads")
+        self.n_types = int(n_types)
+
+        self.norm_c = nn.LayerNorm(d)
+        self.type_embed = nn.Embedding(n_types, d)
+        self.q_proj = nn.Linear(d, self.mix_dim, bias=False)
+        self.k_proj = nn.Linear(d, self.mix_dim, bias=False)
+        self.v_proj = nn.Linear(d, self.mix_dim, bias=False)
+        self.out_proj = nn.Linear(self.mix_dim, d, bias=False)
+        self.type_pair_bias = nn.Parameter(torch.zeros(n_types, n_types))
+        self.gate = nn.Parameter(torch.full((d,), float(gate_init)))
+
+    def forward(
+        self,
+        cand_states: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bsz, seq_len, j_count, d = cand_states.shape
+        if d != self.d:
+            raise ValueError(f"cand_states last dim {d} does not match typed mixer d {self.d}")
+        if cand_types.shape != (bsz, seq_len, j_count) or cand_mask.shape != cand_types.shape:
+            raise ValueError("candidate type/mask tensors must have shape [B,T,J]")
+        if not cand_mask.any(dim=-1).all():
+            raise ValueError("typed candidate mixer received an all-invalid candidate row")
+
+        c = self.norm_c(cand_states + self.type_embed(cand_types))
+        q = self.q_proj(c)
+        k = self.k_proj(c)
+        v = self.v_proj(c)
+        scores = (q[:, :, :, None, :] * k[:, :, None, :, :]).sum(dim=-1) / math.sqrt(float(self.mix_dim))
+        scores = scores + self.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
+        valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
+        scores = scores.masked_fill(~valid_pair, torch.finfo(scores.dtype).min)
+        probs = F.softmax(scores, dim=-1)
+        probs = probs.masked_fill(~valid_pair, 0.0)
+
+        mixed = (probs[..., None] * v[:, :, None, :, :]).sum(dim=3)
+        delta = self.out_proj(mixed)
+        gate = torch.sigmoid(self.gate).reshape(1, 1, 1, d)
+        out = cand_states + gate * delta * cand_mask[..., None].to(delta.dtype)
+
+        valid_targets = cand_mask.bool()
+        p_safe = probs.clamp_min(1e-8)
+        entropy = (-(p_safe * p_safe.log()).sum(dim=-1)).masked_select(valid_targets).mean()
+        delta_norm = delta.masked_select(cand_mask[..., None]).reshape(-1, d).norm(dim=-1).mean()
+        telemetry = {
+            "dsqg_w_typed_mixer_entropy": entropy.detach(),
+            "dsqg_w_typed_mixer_gate_mean": gate.mean().detach(),
+            "dsqg_w_typed_mixer_gate_min": gate.min().detach(),
+            "dsqg_w_typed_mixer_gate_max": gate.max().detach(),
+            "dsqg_w_typed_mixer_delta_norm": delta_norm.detach(),
+        }
+        return out, telemetry
+
+
 class DSQGWBlock(nn.Module):
     """Diagnostic DSQG-W semantic-width recomposer.
 
@@ -696,6 +819,10 @@ class DSQGWBlock(nn.Module):
         width_self_bias_init: float = 0.0,
         width_entropy_floor: float = 0.0,
         width_entropy_weight: float = 0.0,
+        use_typed_mixer: bool = False,
+        typed_mixer_bottleneck: int = 64,
+        typed_mixer_gate_init: float = -5.0,
+        use_query_type_bias: bool = False,
     ) -> None:
         super().__init__()
         if d % n_heads != 0:
@@ -722,6 +849,18 @@ class DSQGWBlock(nn.Module):
             if use_width_cell
             else None
         )
+        self.typed_mixer = (
+            DSQGWTypedCandidateMixer(
+                d=d,
+                n_heads=n_heads,
+                n_types=n_types,
+                bottleneck=typed_mixer_bottleneck,
+                gate_init=typed_mixer_gate_init,
+            )
+            if use_typed_mixer
+            else None
+        )
+        self.use_query_type_bias = bool(use_query_type_bias)
 
         self.norm_x = nn.LayerNorm(d)
         self.norm_c = nn.LayerNorm(d)
@@ -731,6 +870,7 @@ class DSQGWBlock(nn.Module):
         self.role_key = nn.Embedding(n_types, d)
         self.source_key = nn.Embedding(n_sources, d)
         self.type_bias = nn.Parameter(torch.zeros(n_types, n_heads))
+        self.query_type_bias = nn.Linear(d, n_types * n_heads, bias=False)
         self.source_bias = nn.Parameter(torch.zeros(n_sources, n_heads))
         self.read_mix = nn.Linear((n_types + 1) * d, d, bias=False)
         self.norm_z = nn.LayerNorm(4 * d)
@@ -760,6 +900,10 @@ class DSQGWBlock(nn.Module):
             width_self_bias_init=config.width_self_bias_init,
             width_entropy_floor=config.width_entropy_floor,
             width_entropy_weight=config.width_entropy_weight,
+            use_typed_mixer=config.use_typed_mixer,
+            typed_mixer_bottleneck=config.typed_mixer_bottleneck,
+            typed_mixer_gate_init=config.typed_mixer_gate_init,
+            use_query_type_bias=config.use_query_type_bias,
         )
 
     def forward(
@@ -786,6 +930,9 @@ class DSQGWBlock(nn.Module):
         width_telemetry: dict[str, torch.Tensor] = {}
         if self.width_cell is not None:
             cand_states, width_telemetry = self.width_cell(cand_states, cand_types, cand_sources, cand_mask)
+        typed_mixer_telemetry: dict[str, torch.Tensor] = {}
+        if self.typed_mixer is not None:
+            cand_states, typed_mixer_telemetry = self.typed_mixer(cand_states, cand_types, cand_mask)
 
         h = self.n_heads
         dh = self.dh
@@ -801,6 +948,14 @@ class DSQGWBlock(nn.Module):
 
         scores = (q[:, :, None, :, :] * k_eff).sum(dim=-1) / math.sqrt(float(dh))
         scores = scores + self.type_bias[cand_types]
+        query_type_bias_norm = x.new_tensor(0.0)
+        if self.use_query_type_bias:
+            qtb = self.query_type_bias(x_n).reshape(bsz, seq_len, self.n_types, h)
+            scores = scores + qtb.gather(
+                2,
+                cand_types[:, :, :, None].expand(-1, -1, -1, h),
+            )
+            query_type_bias_norm = qtb.norm(dim=-1).mean()
         scores = scores + self.source_bias[cand_sources]
         scores = scores.masked_fill(~cand_mask[:, :, :, None], torch.finfo(scores.dtype).min)
         probs = F.softmax(scores, dim=2)
@@ -845,6 +1000,7 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_read_norm": read_norm.detach(),
             "dsqg_w_typed_read_norms": torch.stack(typed_read_norms).detach(),
             "read_mix_weight_norm": self.read_mix.weight.norm().detach(),
+            "dsqg_w_query_type_bias_norm": query_type_bias_norm.detach(),
         }
         for ctype in CandidateType:
             mask = (cand_types == int(ctype)) & cand_mask
@@ -863,6 +1019,7 @@ class DSQGWBlock(nn.Module):
         telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
         telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
         telemetry.update(width_telemetry)
+        telemetry.update(typed_mixer_telemetry)
 
         if return_routing:
             telemetry["dsqg_w_probs"] = probs

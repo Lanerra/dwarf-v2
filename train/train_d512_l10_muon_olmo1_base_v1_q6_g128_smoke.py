@@ -352,6 +352,11 @@ DSQG_W_WIDTH_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_WIDTH_GATE_INIT', '-
 DSQG_W_WIDTH_AUX_WEIGHT = float(os.environ.get('DWARF_DSQG_W_WIDTH_AUX_WEIGHT', '0.0'))
 DSQG_W_WIDTH_ENTROPY_FLOOR = float(os.environ.get('DWARF_DSQG_W_WIDTH_ENTROPY_FLOOR', '1.5'))
 DSQG_W_WIDTH_ENTROPY_WEIGHT = float(os.environ.get('DWARF_DSQG_W_WIDTH_ENTROPY_WEIGHT', '0.25'))
+DSQG_W_TYPED_MIXER = os.getenv('DWARF_DSQG_W_TYPED_MIXER', '0') == '1'
+DSQG_W_TYPED_MIXER_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK', '64'))
+DSQG_W_TYPED_MIXER_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_TYPED_MIXER_GATE_INIT', '-5.0'))
+DSQG_W_QUERY_TYPE_BIAS = os.getenv('DWARF_DSQG_W_QUERY_TYPE_BIAS', '0') == '1'
+DSQG_W_TYPED_HISA_REPS = os.getenv('DWARF_DSQG_W_TYPED_HISA_REPS', '0') == '1'
 DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2, 4, 8))
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
 DSQG_W_QUESTION_ENABLED = os.getenv('DWARF_DSQG_W_QUESTION', '0') == '1'
@@ -3020,6 +3025,11 @@ class TriadicJ96Dsr(nn.Module):
                 width_gate_init=DSQG_W_WIDTH_GATE_INIT,
                 width_entropy_floor=DSQG_W_WIDTH_ENTROPY_FLOOR,
                 width_entropy_weight=DSQG_W_WIDTH_ENTROPY_WEIGHT,
+                use_typed_mixer=DSQG_W_TYPED_MIXER,
+                typed_mixer_bottleneck=DSQG_W_TYPED_MIXER_BOTTLENECK,
+                typed_mixer_gate_init=DSQG_W_TYPED_MIXER_GATE_INIT,
+                use_query_type_bias=DSQG_W_QUERY_TYPE_BIAS,
+                typed_hisa_reps=DSQG_W_TYPED_HISA_REPS,
             )
             self.dsqg_w_candidate_provider = CandidateProvider(self.dsqg_w_config)
             for site_key in self.dsqg_w_site_keys:
@@ -3907,13 +3917,16 @@ def train():
     else:
         print('  q6_g128 smoke path: disabled')
     if DSQG_W_ENABLED:
-        candidate_path = _dsqg_w_candidate_path_label().replace('_', '/')
+        candidate_path = _dsqg_w_candidate_path_label()
         site_text = ','.join(_dsqg_w_site_key(site) for site in DSQG_W_SITE_SPECS)
         print(f'  DSQG-W recomposer sites={site_text}: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
               f'width_cell={DSQG_W_WIDTH_CELL} width_bottleneck={DSQG_W_WIDTH_BOTTLENECK} '
               f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} width_aux_weight={DSQG_W_WIDTH_AUX_WEIGHT} '
               f'width_entropy_floor={DSQG_W_WIDTH_ENTROPY_FLOOR} width_entropy_weight={DSQG_W_WIDTH_ENTROPY_WEIGHT} '
+              f'typed_mixer={DSQG_W_TYPED_MIXER} typed_mixer_bottleneck={DSQG_W_TYPED_MIXER_BOTTLENECK} '
+              f'typed_mixer_gate_init={DSQG_W_TYPED_MIXER_GATE_INIT} query_type_bias={DSQG_W_QUERY_TYPE_BIAS} '
+              f'typed_hisa_reps={DSQG_W_TYPED_HISA_REPS} '
               f'candidates={candidate_path}')
     else:
         print('  DSQG-W recomposer: disabled')
