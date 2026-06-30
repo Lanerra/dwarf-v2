@@ -33,6 +33,7 @@ def build_run_config(
     epochs: int = 1,
     log_interval: int = 1,
     passkey_trials: int = 2,
+    dsqg_w: bool = True,
     sites: str = "2,6,final",
     max_candidates: int = 16,
     bottleneck: int = 64,
@@ -78,7 +79,7 @@ def build_run_config(
         "DWARF_GA": str(int(grad_accum)),
         "DWARF_LOG_INTERVAL": str(int(log_interval)),
         "DWARF_PASSKEY_TRIALS": str(int(passkey_trials)),
-        "DWARF_DSQG_W": "1",
+        "DWARF_DSQG_W": "1" if dsqg_w else "0",
         "DWARF_DSQG_W_SITES": str(sites),
         "DWARF_DSQG_W_MAX_CANDIDATES": str(int(max_candidates)),
         "DWARF_DSQG_W_BOTTLENECK": str(int(bottleneck)),
@@ -178,6 +179,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--passkey-trials", type=int, default=2)
+    parser.add_argument("--disable-dsqg-w", action="store_true", help="Run the DSR backbone without DSQG-W recomposition.")
     parser.add_argument("--sites", default="2,6,final")
     parser.add_argument("--max-candidates", type=int, default=16)
     parser.add_argument("--bottleneck", type=int, default=64)
@@ -221,6 +223,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         epochs=args.epochs,
         log_interval=args.log_interval,
         passkey_trials=args.passkey_trials,
+        dsqg_w=not args.disable_dsqg_w,
         sites=args.sites,
         max_candidates=args.max_candidates,
         bottleneck=args.bottleneck,

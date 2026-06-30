@@ -77,6 +77,21 @@ def test_full_run_launcher_can_enable_width_cell_env(tmp_path: Path) -> None:
     assert env["DWARF_DSQG_W_WIDTH_ENTROPY_WEIGHT"] == "0.4"
 
 
+def test_full_run_launcher_can_disable_dsqg_w_for_backbone_controls(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "d_only",
+        run_name="d_only_unit",
+        dsqg_w=False,
+        hisa_stage2_rep_r=4,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W"] == "0"
+    assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
+
+
 def test_full_run_launcher_can_enable_typed_mixer_and_query_rep_hisa_env(tmp_path: Path) -> None:
     mod = load_launcher_module()
 
