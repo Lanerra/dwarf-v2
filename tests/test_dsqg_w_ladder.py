@@ -141,3 +141,42 @@ def test_ladder_runner_variant_ids_filter_tighter_attribution_set(tmp_path: Path
     assert (out_root / "same_family/B_dsr_rep4/run_config.json").exists()
     assert (out_root / "same_family/C_dfed_w_min/run_config.json").exists()
     assert (out_root / "same_family/D_dfed_w_full/run_config.json").exists()
+
+
+def test_ladder_runner_can_select_pure_dsqg_control(tmp_path: Path) -> None:
+    mod = load_module(RUNNER_SCRIPT, "run_dsqg_w_ladder_pure_test")
+    dataset = tmp_path / "pretrain.pt"
+    dataset.write_bytes(b"not loaded during dry-run")
+    out_root = tmp_path / "pure_ladder"
+
+    result = mod.main(
+        [
+            "--out-root",
+            str(out_root),
+            "--lanes",
+            "pretrain",
+            "--pretrain-dataset",
+            str(dataset),
+            "--variant-ids",
+            "P_pure_dsqg_v1,D_dfed_w_full",
+            "--max-acc-steps",
+            "3",
+            "--train-seqs",
+            "4",
+            "--val-seqs",
+            "2",
+            "--sites",
+            "6,final",
+            "--dry-run",
+        ]
+    )
+
+    assert result["pass"] is True
+    manifest = json.loads((out_root / "ladder_manifest.json").read_text(encoding="utf-8"))
+    assert [v["variant_id"] for v in manifest["variants"]] == ["P_pure_dsqg_v1", "D_dfed_w_full"]
+    cfg_p = json.loads((out_root / "pretrain/P_pure_dsqg_v1/run_config.json").read_text(encoding="utf-8"))
+    cfg_d = json.loads((out_root / "pretrain/D_dfed_w_full/run_config.json").read_text(encoding="utf-8"))
+    assert cfg_p["env"]["DWARF_PURE_DSQG"] == "1"
+    assert cfg_p["env"]["DWARF_DSQG_W"] == "0"
+    assert cfg_d["env"]["DWARF_PURE_DSQG"] == "0"
+    assert cfg_d["env"]["DWARF_DSQG_W_SITES"] == "6,final"

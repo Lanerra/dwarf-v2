@@ -46,6 +46,7 @@ class Variant:
     dsr_candidates: bool = True
     local_offsets: str = "none"
     long_offsets: str = "none"
+    pure_dsqg: bool = False
     gate_init: float = -2.0
     fuse_init_std: float = 0.02
     bottleneck: int = 128
@@ -63,6 +64,7 @@ class Variant:
             "dsr_candidates": self.dsr_candidates,
             "local_offsets": self.local_offsets,
             "long_offsets": self.long_offsets,
+            "pure_dsqg": self.pure_dsqg,
             "gate_init": self.gate_init,
             "fuse_init_std": self.fuse_init_std,
             "bottleneck": self.bottleneck,
@@ -72,6 +74,14 @@ class Variant:
 
 
 VARIANTS: tuple[Variant, ...] = (
+    Variant(
+        variant_id="P_pure_dsqg_v1",
+        label="Pure DSQG-D v1 no-HISA control",
+        dsqg_w=False,
+        hisa_stage2_rep_r=0,
+        pure_dsqg=True,
+        notes="Original-style pure DSQG-D control; HISA/DSR disabled and no DSQG-W.",
+    ),
     Variant(
         variant_id="A_dsr_rowmax",
         label="D-only rowmax Stage-2 baseline",
@@ -108,6 +118,8 @@ VARIANTS: tuple[Variant, ...] = (
     ),
 )
 
+DEFAULT_VARIANT_IDS = "A_dsr_rowmax,B_dsr_rep4,C_dfed_w_min,D_dfed_w_full"
+
 
 def select_variants(variant_ids: str) -> tuple[Variant, ...]:
     requested = [part.strip() for part in variant_ids.split(",") if part.strip()]
@@ -136,6 +148,7 @@ def _jsonable(value: Any) -> Any:
             "dsr_candidates": value.dsr_candidates,
             "local_offsets": value.local_offsets,
             "long_offsets": value.long_offsets,
+            "pure_dsqg": value.pure_dsqg,
             "gate_init": value.gate_init,
             "fuse_init_std": value.fuse_init_std,
             "notes": value.notes,
@@ -244,7 +257,7 @@ def run_variant(
             expected_steps=int(args.max_acc_steps),
             expected_gpu=args.expected_gpu,
             require_dsqg_w=variant.dsqg_w,
-            expected_stage2_rep_r=variant.hisa_stage2_rep_r,
+            expected_stage2_rep_r=None if variant.pure_dsqg else variant.hisa_stage2_rep_r,
             returncode=int(exec_report["returncode"]),
         )
         result["metrics"] = parsed["metrics"]
@@ -299,8 +312,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lanes", choices=("same_family", "pretrain", "both"), default="both")
     parser.add_argument(
         "--variant-ids",
-        default=",".join(variant.variant_id for variant in VARIANTS),
-        help="Comma-separated variant ids to run in order. Use B_dsr_rep4,C_dfed_w_min,D_dfed_w_full for the tight attribution ladder.",
+        default=DEFAULT_VARIANT_IDS,
+        help="Comma-separated variant ids to run in order. Use P_pure_dsqg_v1,D_dfed_w_full for the pure-vs-W baseline gate.",
     )
     parser.add_argument("--max-acc-steps", type=int, default=64)
     parser.add_argument("--train-seqs", type=int, default=512)

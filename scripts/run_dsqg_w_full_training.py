@@ -54,6 +54,7 @@ def build_run_config(
     local_offsets: str = "none",
     long_offsets: str = "none",
     hisa_stage2_rep_r: int = 0,
+    pure_dsqg: bool = False,
     lr: float | None = None,
     dataset: Path | str = DEFAULT_DATASET,
     tokenizer: Path | str = DEFAULT_TOKENIZER,
@@ -108,6 +109,7 @@ def build_run_config(
         "DWARF_TORCH_COMPILE": "0",
         "DWARF_LIGER": "0",
         "DWARF_Q6_G128": "0",
+        "DWARF_PURE_DSQG": "1" if pure_dsqg else "0",
         "DWARF_PIN_DATASET": "0",
     }
     if lr is not None:
@@ -200,6 +202,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-offsets", default="none", help="Comma-separated DSQG-W local offset candidates; default none for D-fed W runs.")
     parser.add_argument("--long-offsets", default="none", help="Comma-separated DSQG-W long offset candidates; default none for D-fed W runs.")
     parser.add_argument("--hisa-stage2-rep-r", type=int, default=0, help="Enable query-representative HISA Stage-2 selector with r representatives.")
+    parser.add_argument("--pure-dsqg", action="store_true", help="Disable HISA/DSR and run the pure DSQG-D v1 control layout.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
@@ -244,6 +247,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         local_offsets=args.local_offsets,
         long_offsets=args.long_offsets,
         hisa_stage2_rep_r=args.hisa_stage2_rep_r,
+        pure_dsqg=args.pure_dsqg,
         lr=args.lr,
         dataset=args.dataset,
         tokenizer=args.tokenizer,

@@ -306,6 +306,7 @@ MUON_NS_STEPS = int(os.getenv('DWARF_MUON_NS_STEPS', '5'))
 CHECKPOINT_STRATEGY = os.getenv('DWARF_CKPT', 'none').lower()
 DATASET_PATH = os.environ.get('DWARF_DATASET', 'datasets/dwarf_base_v1_olmo1tok_2048_2b.pt')
 STAGGER_MOVT_PLANES = os.getenv('DWARF_STAGGER_MOVT_PLANES', '1') == '1'
+PURE_DSQG_BASELINE = os.getenv('DWARF_PURE_DSQG', '0') == '1'
 Q6_G128_ENABLED = os.getenv('DWARF_Q6_G128', '0') == '1'
 Q6_G128_FUSED_CONSUME = os.getenv('DWARF_Q6_G128_FUSED_CONSUME', '0') == '1'
 Q6_G128_FUSED_BLOCK_N = int(os.environ.get('DWARF_Q6_G128_FUSED_BLOCK_N', '32'))
@@ -431,7 +432,7 @@ def _dsqg_w_site_key(site):
 
 def _dsqg_w_candidate_path_label():
     parts = []
-    if DSQG_W_HISA_L3_ENABLED and DSQG_W_DSR_CANDIDATES:
+    if DSQG_W_HISA_L3_ENABLED and DSQG_W_DSR_CANDIDATES and not PURE_DSQG_BASELINE:
         parts.append('DSR_SELECTED')
     if DSQG_W_LOCAL_OFFSETS:
         parts.append('LOCAL')
@@ -476,7 +477,7 @@ def _movt_plane_shift_for_dsqg_index(dsqg_index: int, head_dim: int, r_planes: i
 # Pre-DSR: 1 triad (L0-2), Post-DSR: 2 full triads (L4-9)
 # =============================================================================
 
-LAYER_LAYOUT = [
+_HISA_LAYER_LAYOUT = [
     ('A', GROUP_A, J_SMALL_A, J_LARGE_A, False),   # L00
     ('B', GROUP_B, J_SMALL_B, J_LARGE_B, False),   # L01
     ('C', GROUP_C, J_SMALL_C, J_LARGE_C, True),    # L02
@@ -488,6 +489,21 @@ LAYER_LAYOUT = [
     ('B', GROUP_B, J_SMALL_B, J_LARGE_B, False),   # L08
     ('C', GROUP_C, J_SMALL_C, J_LARGE_C, False),   # L09
 ]
+
+_PURE_DSQG_LAYER_LAYOUT = [
+    ('A', GROUP_A, J_SMALL_A, J_LARGE_A, False),   # L00
+    ('B', GROUP_B, J_SMALL_B, J_LARGE_B, False),   # L01
+    ('C', GROUP_C, J_SMALL_C, J_LARGE_C, True),    # L02
+    ('A', GROUP_A, J_SMALL_A, J_LARGE_A, False),   # L03: pure-DSQG v1 control slot
+    ('A', GROUP_A, J_SMALL_A, J_LARGE_A, False),   # L04
+    ('B', GROUP_B, J_SMALL_B, J_LARGE_B, False),   # L05
+    ('C', GROUP_C, J_SMALL_C, J_LARGE_C, False),   # L06
+    ('A', GROUP_A, J_SMALL_A, J_LARGE_A, False),   # L07
+    ('B', GROUP_B, J_SMALL_B, J_LARGE_B, False),   # L08
+    ('C', GROUP_C, J_SMALL_C, J_LARGE_C, False),   # L09
+]
+
+LAYER_LAYOUT = _PURE_DSQG_LAYER_LAYOUT if PURE_DSQG_BASELINE else _HISA_LAYER_LAYOUT
 
 assert len(LAYER_LAYOUT) == NUM_LAYERS
 
@@ -3428,6 +3444,7 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
             'num_chunks': NUM_CHUNKS,
             'top_k_chunks': TOP_K_CHUNKS,
             'hisa_top_m_tokens': HISA_TOP_M_TOKENS,
+            'pure_dsqg_baseline': PURE_DSQG_BASELINE,
             'r_planes': R_PLANES,
             'stagger_movt_planes': STAGGER_MOVT_PLANES,
             'movt_plane_shifts': [
@@ -3943,8 +3960,12 @@ def train():
         git_hash = 'unknown'
 
     print('=' * 70)
-    print(f'  DWARF D512-L10 OLMo1Tok BaseV1 — V15 HISA@L{DSR_LAYER} + R_PLANES=4, TIED LM_HEAD')
-    print(f'  DSR@L{DSR_LAYER}: HierarchicalSparseAttentionV15HISA(C={NUM_CHUNKS}, top_k={TOP_K_CHUNKS}, HISA_m={HISA_TOP_M_TOKENS})')
+    if PURE_DSQG_BASELINE:
+        print('  DWARF D512-L10 OLMo1Tok BaseV1 — PURE DSQG-D v1 control + R_PLANES=4, TIED LM_HEAD')
+        print(f'  DSR/HISA: disabled; L{DSR_LAYER} uses DSQG-A control slot')
+    else:
+        print(f'  DWARF D512-L10 OLMo1Tok BaseV1 — V15 HISA@L{DSR_LAYER} + R_PLANES=4, TIED LM_HEAD')
+        print(f'  DSR@L{DSR_LAYER}: HierarchicalSparseAttentionV15HISA(C={NUM_CHUNKS}, top_k={TOP_K_CHUNKS}, HISA_m={HISA_TOP_M_TOKENS})')
     print('  SCRATCH PRETRAINING: base_v1 OLMo-1 tokenizer 35 Mix6T / 20 Cosmo / 15 Code / 15 FinePDFs / 5 Wiki / 5 LongABC / 5 FW-Edu buffer.')
     print('=' * 70)
     if torch.cuda.is_available():
@@ -4007,8 +4028,12 @@ def train():
               f'candidates={candidate_path}')
     else:
         print('  DSQG-W recomposer: disabled')
-    print('  DSR:  V15HISA')
-    print(f"  HISA Stage-2 selector: rep_r={os.getenv('HISA_STAGE2_REP_R', os.getenv('DWARF_HISA_STAGE2_REP_R', '0'))} (0=rowmax baseline)")
+    if PURE_DSQG_BASELINE:
+        print('  DSR:  disabled (pure DSQG-D v1 control)')
+        print('  HISA Stage-2 selector: disabled (pure DSQG-D v1 control)')
+    else:
+        print('  DSR:  V15HISA')
+        print(f"  HISA Stage-2 selector: rep_r={os.getenv('HISA_STAGE2_REP_R', os.getenv('DWARF_HISA_STAGE2_REP_R', '0'))} (0=rowmax baseline)")
     if USE_LIGER_CE:
         print('  Using Liger fused CE')
     else:
@@ -4091,7 +4116,10 @@ def train():
     n_params = model.param_count()
     print(f'Parameters: {n_params:,} ({n_params / 1e6:.1f}M)')
     print(f'  Layout: {model.layer_summary()}')
-    print(f'  DSR effective stage2_rep_r={getattr(model.blocks[DSR_LAYER].attn, "stage2_rep_r", "?")}')
+    if PURE_DSQG_BASELINE:
+        print('  DSR effective stage2_rep_r=disabled')
+    else:
+        print(f'  DSR effective stage2_rep_r={getattr(model.blocks[DSR_LAYER].attn, "stage2_rep_r", "?")}')
 
     if TORCH_COMPILE_ENABLED:
         if COMPILE_CAPTURE_SCALARS:
