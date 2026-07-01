@@ -363,6 +363,10 @@ def _build_stage2_token_indices(
                 # Conservative union: take top ceil(M/r) tokens per query rep,
                 # deduplicate by scatter-reducing into token_scores, then fill
                 # any duplicate-created holes from pooled representative scores.
+                # A token can be selected by one representative with a lower
+                # score while another representative assigns it a higher score;
+                # keep the pooled maximum so the union never shadows stronger
+                # representative evidence for the same token.
                 top_rep_vals, top_rep_idx = rep_scores.topk(
                     min(per_rep_m, chunk_size), dim=-1
                 )
@@ -378,9 +382,7 @@ def _build_stage2_token_indices(
                     include_self=True,
                 )
                 pooled_scores = rep_scores.max(dim=-2).values
-                token_scores = torch.where(
-                    torch.isfinite(union_scores), union_scores, pooled_scores
-                )
+                token_scores = torch.maximum(union_scores, pooled_scores)
         else:
             # Running max of causal-masked scores over query rows, streamed in
             # blocks. One compact token set per selected chunk for this query
@@ -1019,12 +1021,13 @@ class HierarchicalSparseAttentionV15HISA(nn.Module):
         # Query-row block size for streamed Stage-2 token scoring (memory knob;
         # does not change selection semantics).
         self.stage2_q_block = int(stage2_q_block)
-        # Experimental linear Stage-2 selector: when >0, choose this many
-        # routing-weight query representatives per selected chunk instead of
-        # row-maxing over every query row. Default 0 preserves V15.1 behavior.
+        # Linear Stage-2 selector: by default choose routing-weight query
+        # representatives per selected chunk instead of row-maxing over every
+        # query row. Set HISA_STAGE2_REP_R=0 / DWARF_HISA_STAGE2_REP_R=0 to use
+        # the legacy row-max selector as an explicit diagnostic fallback.
         self.stage2_rep_r = int(os.getenv(
             "HISA_STAGE2_REP_R",
-            os.getenv("DWARF_HISA_STAGE2_REP_R", "0"),
+            os.getenv("DWARF_HISA_STAGE2_REP_R", "4"),
         ))
         self.temperature = 1.0
         self.W_q = nn.Linear(D, H * hd, bias=False)

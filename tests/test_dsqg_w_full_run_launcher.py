@@ -42,6 +42,7 @@ def test_full_run_launcher_builds_winning_layout_env(tmp_path: Path) -> None:
     assert env["DWARF_DSQG_W_DSR_CANDIDATES"] == "1"
     assert env["DWARF_DSQG_W_LOCAL_OFFSETS"] == "none"
     assert env["DWARF_DSQG_W_LONG_OFFSETS"] == "none"
+    assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
     assert env["DWARF_DSQG_W_WIDTH_CELL"] == "0"
     assert env["DWARF_DSQG_W_QUESTION"] == "1"
     assert env["DWARF_DSQG_W_HISA_L3"] == "1"
@@ -90,6 +91,18 @@ def test_full_run_launcher_can_disable_dsqg_w_for_backbone_controls(tmp_path: Pa
     env = cfg["env"]
     assert env["DWARF_DSQG_W"] == "0"
     assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
+
+
+def test_full_run_launcher_can_opt_into_rowmax_stage2_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "rowmax_diagnostic",
+        run_name="rowmax_unit",
+        hisa_stage2_rep_r=0,
+    )
+
+    assert cfg["env"]["DWARF_HISA_STAGE2_REP_R"] == "0"
 
 
 def test_full_run_launcher_can_enable_typed_mixer_and_query_rep_hisa_env(tmp_path: Path) -> None:
