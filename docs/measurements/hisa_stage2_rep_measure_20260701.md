@@ -49,10 +49,24 @@ DSQG-W sites `2,6,final`, DSR-selected/question/L3-skip candidates, 8 optimizer 
 | 4 | 37186.82 | 0.0% | 2,713 MB | 27s | 10.7538 | 0.893 | 0.535 | 0.263 |
 | 8 | 37184.36 | 0.0% | 2,713 MB | 29s | 10.7543 | 0.917 | 0.538 | 0.267 |
 
+## 200-step D-only rep_r sweep
+
+Raw local artifact directory: `results/hisa_stage2_rep_r_sweep_20260701_163442/` (ignored by git; contains `summary.md`, `sweep_results.json`, per-rep logs/configs, and transient checkpoints).
+
+Real trainer, DSQG-W off to isolate HISA Stage-2, `MAX_ACC_STEPS=200`, `MAX_TRAIN_SEQS=256`, `MAX_VAL_SEQS=128`, `BS=1`, `GA=1`, `LOG_INTERVAL=10`, passkey trials=1, RTX 4090 via `CUDA_VISIBLE_DEVICES=0`. All variants passed mechanical health: expected GPU observed, final step `200/200`, finite CE/PPL, matching `rep_r`, no fatal log patterns.
+
+| rep_r | avg tok/s | relative to rowmax | final CE | ΔCE | val PPL | ΔPPL | passkey | stage2 frac | routing ent | peak VRAM | elapsed |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 19,430 | 1.000x | 7.3927 | 0.0000 | 2014.50 | 0.00 | 0.0% | 0.949 | 2.530 | 1,804 MB | 35s |
+| 1 | 19,053 | 0.981x | 7.3934 | +0.0007 | 2015.56 | +1.06 | 0.0% | 0.827 | 2.530 | 1,804 MB | 36s |
+| 2 | 18,977 | 0.977x | 7.3932 | +0.0005 | 2014.79 | +0.29 | 0.0% | 0.863 | 2.530 | 1,804 MB | 36s |
+| 4 | 18,866 | 0.971x | 7.3929 | +0.0002 | 2014.87 | +0.37 | 0.0% | 0.897 | 2.530 | 1,804 MB | 36s |
+| 8 | 18,996 | 0.978x | 7.3928 | +0.0001 | 2014.58 | +0.08 | 0.0% | 0.917 | 2.529 | 1,804 MB | 36s |
+
 ## Readout
 
-- At N=2048 trainer scale, `rep4` and `rep8` are effectively throughput-neutral in the full trainer: `rep4` is 0.998x rowmax and `rep8` is 1.001x rowmax in this 12-step bench. The full model is not Stage-2-selector dominated at this context length.
-- The representative selector materially narrows the Stage-2 candidate surface: rowmax selected fraction `0.949`; rep4 `~0.89`; rep8 `~0.91`.
-- Coverage is decent but not identical: rep4 recovers 93.4% of rowmax tokens / 93.9% of rowmax score mass and hits rowmax top-1 96.8%; rep8 improves to 96.0% / 96.4% / 98.3%.
-- Tiny scratch PPL/passkey screens show no gross regression, but they are too short and from random init; passkey stays 0% for all variants, so this does not validate retrieval quality.
-- DSQG-W candidate telemetry tracks the expected surface change: `w_hisa` final is slightly lower for rep4/rep8 than rowmax, consistent with narrower DSR-selected evidence, while PPL differences are noise at this scale.
+- At N=2048 trainer scale, query representatives do not improve end-to-end trainer throughput; the 200-step D-only sweep shows `rep1..rep8` at ~0.97-0.98x rowmax. The full trainer is not Stage-2-selector dominated at this context length, and the rep path has enough PyTorch/gather overhead to erase the smaller dot-product count.
+- The representative selector materially narrows the Stage-2 candidate surface: rowmax selected fraction `0.949`; rep1 `0.827`; rep2 `0.863`; rep4 `0.897`; rep8 `0.917`.
+- Short-run quality is effectively unchanged in this scratch screen: 200-step final CE deltas are <= +0.0007 and val PPL deltas are <= +1.06 versus rowmax. This is a health/throughput screen, not a retrieval-quality claim; passkey stays 0% for all variants from this random-init horizon.
+- Coverage is decent but not identical: the forward audit showed rep4 recovers 93.4% of rowmax tokens / 93.9% of rowmax score mass and hits rowmax top-1 96.8%; rep8 improves to 96.0% / 96.4% / 98.3%.
+- DSQG-W candidate telemetry tracks the expected surface change in the tiny W-on screen: `w_hisa` final is slightly lower for rep4/rep8 than rowmax, consistent with narrower DSR-selected evidence, while PPL differences are noise at that scale.
