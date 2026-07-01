@@ -270,9 +270,10 @@ def main():
         },
         "features": {
             "sourcewise": True,
-            "triton_recompute_backward": True,
+            "triton_full_recompute_backward": False,
+            "triton_compact_read_backward": True,
             "triton_no_routing": True,
-            "triton_read_mix_fused": True,
+            "triton_compact_read_slots": True,
             "local_offsets": list(config.local_offsets),
             "long_offsets": list(config.long_offsets),
             "k_question": config.k_question,
@@ -306,6 +307,11 @@ def main():
             "triton_no_route_probs_materialized": float(triton_no_route_tel["dsqg_w_triton_probs_materialized"].item()),
             "triton_read_accum_materialized": float(triton_no_route_tel["dsqg_w_triton_read_accum_materialized"].item()),
             "triton_read_mix_fused": float(triton_no_route_tel["dsqg_w_triton_read_mix_fused"].item()),
+            "triton_compact_read_slots_materialized": float(
+                triton_no_route_tel["dsqg_w_triton_compact_read_slots_materialized"].item()
+            ),
+            "triton_compact_read_slots": float(triton_no_route_tel["dsqg_w_triton_compact_read_slots"].item()),
+            "triton_score_recompute_blocks": float(triton_no_route_tel["dsqg_w_triton_score_recompute_blocks"].item()),
         },
         "forward_timings": [
             bench_forward("dense_forward_no_routing", lambda: dense_forward(False)),

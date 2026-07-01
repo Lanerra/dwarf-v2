@@ -308,7 +308,7 @@ def test_triton_sourcewise_avoids_forbidden_candidate_surfaces_with_padded_hd(mo
     assert all(len(shape) == 3 for shape in projected_input_shapes)
 
 
-def test_triton_sourcewise_autograd_matches_eager_sourcewise_backward_on_cuda(monkeypatch) -> None:
+def test_triton_sourcewise_autograd_uses_compact_read_backward_not_full_recompute_on_cuda(monkeypatch) -> None:
     _require_cuda_triton()
     torch.manual_seed(202607013)
     config = DSQGWConfig(
@@ -334,6 +334,13 @@ def test_triton_sourcewise_autograd_matches_eager_sourcewise_backward_on_cuda(mo
     triton_block = DSQGWBlock.from_config(config).cuda()
     triton_block.load_state_dict(eager_block.state_dict())
 
+    import kernels.dsqg_w.dsqg_w_mvp as dsqg_w_mvp
+
+    def forbidden_full_recompute(*args, **kwargs):
+        raise AssertionError("Triton no-routing backward must not call the full PyTorch recompute helper")
+
+    monkeypatch.setattr(dsqg_w_mvp, "_dsqg_w_sourcewise_functional_recompute", forbidden_full_recompute)
+
     eager_out, _ = eager_block.forward_sourcewise(
         eager_x,
         metadata.cand_token_indices,
@@ -355,7 +362,8 @@ def test_triton_sourcewise_autograd_matches_eager_sourcewise_backward_on_cuda(mo
     )
 
     assert torch.allclose(triton_out, eager_out, atol=2e-5, rtol=2e-5)
-    assert telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 1.0
+    assert telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 0.0
+    assert telemetry["dsqg_w_triton_compact_read_backward"].item() == 1.0
     eager_loss = eager_out.square().mean()
     triton_loss = triton_out.square().mean()
     eager_loss.backward()
@@ -366,14 +374,27 @@ def test_triton_sourcewise_autograd_matches_eager_sourcewise_backward_on_cuda(mo
     assert triton_l3.grad is not None
     assert triton_block.read_mix.weight.grad is not None
     assert triton_block.q_proj.weight.grad is not None
+    assert triton_block.k_proj.weight.grad is not None
+    assert triton_block.v_proj.weight.grad is not None
+    assert triton_block.norm_z.weight.grad is not None
+    assert triton_block.fuse[0].weight.grad is not None
+    assert triton_block.fuse[2].weight.grad is not None
+    assert triton_block.gate.grad is not None
     assert torch.allclose(triton_x.grad, eager_x.grad, atol=3e-4, rtol=3e-4)
     assert torch.allclose(triton_l3.grad, eager_l3.grad, atol=3e-4, rtol=3e-4)
-    assert torch.allclose(
-        triton_block.read_mix.weight.grad,
-        eager_block.read_mix.weight.grad,
-        atol=3e-4,
-        rtol=3e-4,
-    )
+    for name, triton_param, eager_param in (
+        ("q_proj.weight", triton_block.q_proj.weight, eager_block.q_proj.weight),
+        ("k_proj.weight", triton_block.k_proj.weight, eager_block.k_proj.weight),
+        ("v_proj.weight", triton_block.v_proj.weight, eager_block.v_proj.weight),
+        ("read_mix.weight", triton_block.read_mix.weight, eager_block.read_mix.weight),
+        ("norm_z.weight", triton_block.norm_z.weight, eager_block.norm_z.weight),
+        ("fuse.0.weight", triton_block.fuse[0].weight, eager_block.fuse[0].weight),
+        ("fuse.2.weight", triton_block.fuse[2].weight, eager_block.fuse[2].weight),
+        ("gate", triton_block.gate, eager_block.gate),
+    ):
+        assert triton_param.grad is not None, name
+        assert eager_param.grad is not None, name
+        assert torch.allclose(triton_param.grad, eager_param.grad, atol=3e-4, rtol=3e-4), name
 
 
 def test_triton_sourcewise_no_routing_and_fused_read_mix_do_not_materialize_forbidden_outputs(monkeypatch) -> None:
@@ -413,7 +434,9 @@ def test_triton_sourcewise_no_routing_and_fused_read_mix_do_not_materialize_forb
     assert "dsqg_w_probs" not in telemetry
     assert telemetry["dsqg_w_triton_probs_materialized"].item() == 0.0
     assert telemetry["dsqg_w_triton_read_accum_materialized"].item() == 0.0
-    assert telemetry["dsqg_w_triton_read_mix_fused"].item() == 1.0
+    assert telemetry["dsqg_w_triton_compact_read_slots_materialized"].item() == 1.0
+    assert telemetry["dsqg_w_triton_compact_read_slots"].item() == len(block.read_type_ids) + 1
+    assert telemetry["dsqg_w_triton_score_recompute_blocks"].item() == 1.0
 
 
 def test_vectorized_candidate_provider_skips_unused_summary_gather(monkeypatch) -> None:

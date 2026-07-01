@@ -368,5 +368,6 @@ def test_dsqg_w_triton_sourcewise_env_is_training_smoke_accepted_on_cuda(monkeyp
 
     assert out.shape[:2] == idx.shape
     assert model.dsqg_w_last_telemetry["dsqg_w_triton_sourcewise"].item() == 1.0
-    assert model.dsqg_w_last_telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 1.0
+    assert model.dsqg_w_last_telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 0.0
+    assert model.dsqg_w_last_telemetry["dsqg_w_triton_compact_read_backward"].item() == 1.0
     assert model.dsqg_w.read_mix.weight.grad is not None
