@@ -347,6 +347,7 @@ def _parse_int_tuple_env(name, default):
 
 
 DSQG_W_ENABLED = os.getenv('DWARF_DSQG_W', '0') == '1'
+DSQG_W_SOURCEWISE = os.getenv('DWARF_DSQG_W_SOURCEWISE', '0') == '1'
 DSQG_W_MAX_CANDIDATES = int(os.environ.get('DWARF_DSQG_W_MAX_CANDIDATES', '32'))
 DSQG_W_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_BOTTLENECK', '256'))
 DSQG_W_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_GATE_INIT', '-5.0'))
@@ -3020,6 +3021,7 @@ class TriadicJ96Dsr(nn.Module):
         self.out = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.out.weight = self.embedding.weight
         self.dsqg_w_enabled = bool(DSQG_W_ENABLED)
+        self.dsqg_w_sourcewise_enabled = bool(DSQG_W_SOURCEWISE)
         self.dsqg_w_config = None
         self.dsqg_w_candidate_provider = None
         self.dsqg_w = None
@@ -3205,22 +3207,41 @@ class TriadicJ96Dsr(nn.Module):
         if site_key not in self.dsqg_w_blocks:
             return x
         block = self.dsqg_w_blocks[site_key]
-        candidates = self.dsqg_w_candidate_provider.build(
-            x,
-            l3_states=l3_states,
-            question_indices=question_indices,
-            hisa_evidence_indices=hisa_evidence_indices,
-            hisa_evidence_scores=hisa_evidence_scores,
-            l3_skip_indices=l3_skip_indices,
-        )
-        x_out, telemetry = block(
-            x,
-            candidates.cand_states,
-            candidates.cand_types,
-            candidates.cand_sources,
-            candidates.cand_mask,
-            cand_scores=candidates.cand_scores,
-        )
+        if self.dsqg_w_sourcewise_enabled:
+            candidates = self.dsqg_w_candidate_provider.build_metadata(
+                x,
+                l3_states=l3_states,
+                question_indices=question_indices,
+                hisa_evidence_indices=hisa_evidence_indices,
+                hisa_evidence_scores=hisa_evidence_scores,
+                l3_skip_indices=l3_skip_indices,
+            )
+            x_out, telemetry = block.forward_sourcewise(
+                x,
+                candidates.cand_token_indices,
+                candidates.cand_types,
+                candidates.cand_sources,
+                candidates.cand_mask,
+                l3_states=l3_states,
+                cand_scores=candidates.cand_scores,
+            )
+        else:
+            candidates = self.dsqg_w_candidate_provider.build(
+                x,
+                l3_states=l3_states,
+                question_indices=question_indices,
+                hisa_evidence_indices=hisa_evidence_indices,
+                hisa_evidence_scores=hisa_evidence_scores,
+                l3_skip_indices=l3_skip_indices,
+            )
+            x_out, telemetry = block(
+                x,
+                candidates.cand_states,
+                candidates.cand_types,
+                candidates.cand_sources,
+                candidates.cand_mask,
+                cand_scores=candidates.cand_scores,
+            )
         merged_telemetry = dict(candidates.telemetry)
         merged_telemetry.update(telemetry)
         merged_telemetry['dsqg_w_site_key'] = site_key
@@ -3454,6 +3475,7 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
             'tied_lm_head': True,
             'dsqg_w': {
                 'enabled': DSQG_W_ENABLED,
+                'sourcewise': DSQG_W_SOURCEWISE,
                 'insertion': 'after_final_trunk_before_final_norm',
                 'max_candidates': DSQG_W_MAX_CANDIDATES,
                 'bottleneck': DSQG_W_BOTTLENECK,
@@ -4018,7 +4040,7 @@ def train():
         site_text = ','.join(_dsqg_w_site_key(site) for site in DSQG_W_SITE_SPECS)
         print(f'  DSQG-W recomposer sites={site_text}: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
-              f'fuse_init_std={DSQG_W_FUSE_INIT_STD} '
+              f'fuse_init_std={DSQG_W_FUSE_INIT_STD} sourcewise={DSQG_W_SOURCEWISE} '
               f'width_cell={DSQG_W_WIDTH_CELL} width_bottleneck={DSQG_W_WIDTH_BOTTLENECK} '
               f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} width_aux_weight={DSQG_W_WIDTH_AUX_WEIGHT} '
               f'width_entropy_floor={DSQG_W_WIDTH_ENTROPY_FLOOR} width_entropy_weight={DSQG_W_WIDTH_ENTROPY_WEIGHT} '

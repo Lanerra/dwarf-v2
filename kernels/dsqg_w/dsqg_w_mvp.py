@@ -172,6 +172,40 @@ class CandidateProvider:
             chunk_rep_indices=chunk_rep_indices,
             chunk_rep_states=chunk_rep_states,
             l3_skip_indices=l3_skip_indices,
+            materialize_states=True,
+        )
+
+    def build_metadata(
+        self,
+        final_states: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        question_indices: torch.Tensor | None = None,
+        hisa_evidence_indices: torch.Tensor | None = None,
+        hisa_evidence_scores: torch.Tensor | None = None,
+        chunk_rep_indices: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+        l3_skip_indices: torch.Tensor | None = None,
+    ) -> CandidateBatch:
+        """Build compact candidate metadata without materializing [B,T,J,D] states."""
+        if not self._can_use_vectorized(
+            question_indices=question_indices,
+            hisa_evidence_indices=hisa_evidence_indices,
+            hisa_evidence_scores=hisa_evidence_scores,
+            chunk_rep_indices=chunk_rep_indices,
+            l3_skip_indices=l3_skip_indices,
+        ):
+            raise ValueError("build_metadata requires tensor candidate indices/scores")
+        return self._build_vectorized(
+            final_states,
+            l3_states=l3_states,
+            question_indices=question_indices,
+            hisa_evidence_indices=hisa_evidence_indices,
+            hisa_evidence_scores=hisa_evidence_scores,
+            chunk_rep_indices=chunk_rep_indices,
+            chunk_rep_states=chunk_rep_states,
+            l3_skip_indices=l3_skip_indices,
+            materialize_states=False,
         )
 
     @staticmethod
@@ -189,6 +223,7 @@ class CandidateProvider:
         chunk_rep_indices: torch.Tensor | None = None,
         chunk_rep_states: torch.Tensor | None = None,
         l3_skip_indices: torch.Tensor | None = None,
+        materialize_states: bool = True,
     ) -> CandidateBatch:
         if final_states.ndim != 3:
             raise ValueError("final_states must have shape [B, T, D]")
@@ -366,27 +401,30 @@ class CandidateProvider:
         cand_sources = cand_sources.masked_fill(~cand_mask, int(CandidateSource.NULL))
         cand_scores = cand_scores.masked_fill(~cand_mask, 0.0)
 
-        gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
-        final_source = (cand_sources == int(CandidateSource.FINAL)) | (cand_sources == int(CandidateSource.QUESTION_CACHE))
-        l3_source = (cand_sources == int(CandidateSource.L3)) | (cand_sources == int(CandidateSource.HISA))
-        summary_source = cand_sources == int(CandidateSource.SUMMARY)
-        final_needed = bool(self.config.local_offsets or self.config.long_offsets or q_idx is not None)
-        l3_needed = h_idx is not None or s_idx is not None
-        summary_needed = c_idx is not None
+        if materialize_states:
+            gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
+            final_source = (cand_sources == int(CandidateSource.FINAL)) | (cand_sources == int(CandidateSource.QUESTION_CACHE))
+            l3_source = (cand_sources == int(CandidateSource.L3)) | (cand_sources == int(CandidateSource.HISA))
+            summary_source = cand_sources == int(CandidateSource.SUMMARY)
+            final_needed = bool(self.config.local_offsets or self.config.long_offsets or q_idx is not None)
+            l3_needed = h_idx is not None or s_idx is not None
+            summary_needed = c_idx is not None
 
-        final_gather = self._gather_states(final_states, gather_tokens) if final_needed else None
-        cand_states = torch.zeros((bsz, seq_len, j_max, d), device=device, dtype=final_states.dtype)
-        if final_gather is not None:
-            cand_states = torch.where(final_source[..., None], final_gather, cand_states)
-        if l3_needed:
-            l3_base = l3_states if l3_states is not None else final_states
-            l3_gather = final_gather if l3_base is final_states and final_gather is not None else self._gather_states(l3_base, gather_tokens)
-            cand_states = torch.where(l3_source[..., None], l3_gather, cand_states)
-        if summary_needed:
-            summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
-            summary_gather = final_gather if summary_base is final_states and final_gather is not None else self._gather_states(summary_base, gather_tokens)
-            cand_states = torch.where(summary_source[..., None], summary_gather, cand_states)
-        cand_states = cand_states * cand_mask[..., None].to(cand_states.dtype)
+            final_gather = self._gather_states(final_states, gather_tokens) if final_needed else None
+            cand_states = torch.zeros((bsz, seq_len, j_max, d), device=device, dtype=final_states.dtype)
+            if final_gather is not None:
+                cand_states = torch.where(final_source[..., None], final_gather, cand_states)
+            if l3_needed:
+                l3_base = l3_states if l3_states is not None else final_states
+                l3_gather = final_gather if l3_base is final_states and final_gather is not None else self._gather_states(l3_base, gather_tokens)
+                cand_states = torch.where(l3_source[..., None], l3_gather, cand_states)
+            if summary_needed:
+                summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
+                summary_gather = final_gather if summary_base is final_states and final_gather is not None else self._gather_states(summary_base, gather_tokens)
+                cand_states = torch.where(summary_source[..., None], summary_gather, cand_states)
+            cand_states = cand_states * cand_mask[..., None].to(cand_states.dtype)
+        else:
+            cand_states = final_states.new_empty((0,))
 
         denom = torch.tensor(float(raw_count * bsz * seq_len), device=device, dtype=final_states.dtype).clamp_min(1.0)
         telemetry = {
@@ -1046,6 +1084,223 @@ class DSQGWBlock(nn.Module):
             read = read + F.linear(r_type, weight[:, start : start + self.d])
             typed_read_norms[type_id] = r_type.norm(dim=-1).mean()
         return read, typed_read_norms
+
+    @staticmethod
+    def _gather_source_rows(states: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len = states.shape[:2]
+        batch_offsets = torch.arange(bsz, device=states.device, dtype=torch.long).reshape(bsz, 1) * seq_len
+        flat_indices = (batch_offsets + token_indices.to(torch.long)).reshape(-1)
+        return states.reshape(bsz * seq_len, *states.shape[2:]).index_select(0, flat_indices).reshape(
+            bsz, seq_len, *states.shape[2:]
+        )
+
+    def _source_projection_cache(
+        self,
+        x: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+        needed_source_ids: tuple[int, ...] | None = None,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        final_states = x
+        l3_base = l3_states if l3_states is not None else final_states
+        summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
+        zero_base = torch.zeros_like(final_states)
+        bases: dict[int, torch.Tensor] = {
+            int(CandidateSource.FINAL): final_states,
+            int(CandidateSource.QUESTION_CACHE): final_states,
+            int(CandidateSource.L3): l3_base,
+            int(CandidateSource.HISA): l3_base,
+            int(CandidateSource.SUMMARY): summary_base,
+            int(CandidateSource.NULL): zero_base,
+        }
+        projected_by_object: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        out: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        needed = None if needed_source_ids is None else set(int(source_id) for source_id in needed_source_ids)
+        for source_id, states in bases.items():
+            if needed is not None and int(source_id) not in needed:
+                continue
+            cache_key = id(states)
+            projected = projected_by_object.get(cache_key)
+            if projected is None:
+                states_n = self.norm_c(states)
+                k_src = self.k_proj(states_n).reshape(*states.shape[:2], self.n_heads, self.dh)
+                v_src = self.v_proj(states_n).reshape(*states.shape[:2], self.n_heads, self.dh)
+                projected = (k_src, v_src)
+                projected_by_object[cache_key] = projected
+            out[source_id] = projected
+        return out
+
+    def forward_sourcewise(
+        self,
+        x: torch.Tensor,
+        cand_token_indices: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+        cand_scores: torch.Tensor | None = None,
+        return_routing: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.width_cell is not None or self.typed_mixer is not None:
+            raise NotImplementedError("sourcewise DSQG-W does not implement width_cell or typed_mixer")
+        bsz, seq_len, d = x.shape
+        if d != self.d:
+            raise ValueError(f"x last dim {d} does not match block d {self.d}")
+        if cand_types.shape != cand_mask.shape or cand_sources.shape != cand_mask.shape:
+            raise ValueError("candidate type/source/mask tensors must have shape [B,T,J]")
+        if cand_token_indices.shape != cand_mask.shape:
+            raise ValueError("candidate token indices must have shape [B,T,J]")
+        if cand_mask.shape[:2] != (bsz, seq_len):
+            raise ValueError("candidate metadata shape mismatch")
+        if not cand_mask.any(dim=-1).all():
+            raise ValueError("DSQG-W received an all-invalid candidate row")
+        j_count = cand_mask.shape[-1]
+        if j_count > self.max_candidates:
+            raise ValueError("candidate count exceeds DSQG-W max_candidates")
+        if l3_states is not None and l3_states.shape != x.shape:
+            raise ValueError("l3_states must match x shape")
+        if chunk_rep_states is not None and chunk_rep_states.shape != x.shape:
+            raise ValueError("chunk_rep_states must match x shape")
+
+        h = self.n_heads
+        dh = self.dh
+        x_n = self.norm_x(x)
+        q = self.q_proj(x_n).reshape(bsz, seq_len, h, dh)
+        needed_source_ids = tuple(
+            int(source)
+            for source in CandidateSource
+            if bool(((cand_sources == int(source)) & cand_mask).any())
+        )
+        projected_sources = self._source_projection_cache(
+            x,
+            l3_states=l3_states,
+            chunk_rep_states=chunk_rep_states,
+            needed_source_ids=needed_source_ids,
+        )
+        gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
+
+        score_bias = None
+        candidate_score_bias_norm = x.new_tensor(0.0)
+        if cand_scores is not None:
+            if cand_scores.shape != cand_mask.shape:
+                raise ValueError("cand_scores must have shape [B,T,J]")
+            score_bias = cand_scores.to(device=x.device, dtype=x.dtype)
+            score_bias = torch.nan_to_num(score_bias, nan=0.0, neginf=0.0, posinf=0.0)
+            valid_denom = cand_mask.to(score_bias.dtype).sum(dim=-1, keepdim=True).clamp_min(1.0)
+            score_bias = score_bias - (score_bias.masked_fill(~cand_mask, 0.0).sum(dim=-1, keepdim=True) / valid_denom)
+            score_bias = score_bias.masked_fill(~cand_mask, 0.0)
+            candidate_score_bias_norm = score_bias.masked_select(cand_mask).norm() / cand_mask.float().sum().clamp_min(1.0)
+        qtb = None
+        query_type_bias_norm = x.new_tensor(0.0)
+        if self.use_query_type_bias:
+            qtb = self.query_type_bias(x_n).reshape(bsz, seq_len, self.n_types, h)
+            query_type_bias_norm = qtb.norm(dim=-1).mean()
+
+        score_parts: list[torch.Tensor] = []
+        for j in range(j_count):
+            token_j = gather_tokens[:, :, j]
+            source_j = cand_sources[:, :, j]
+            k_j = x.new_zeros((bsz, seq_len, h, dh))
+            for source_id, (k_src, _) in projected_sources.items():
+                source_mask = (source_j == int(source_id)) & cand_mask[:, :, j]
+                if bool(source_mask.any()):
+                    gathered = self._gather_source_rows(k_src, token_j)
+                    k_j = k_j + gathered * source_mask[:, :, None, None].to(k_j.dtype)
+            role = self.role_key(cand_types[:, :, j]).reshape(bsz, seq_len, h, dh)
+            source = self.source_key(source_j).reshape(bsz, seq_len, h, dh)
+            score_j = (q * (k_j + role + source)).sum(dim=-1) / math.sqrt(float(dh))
+            score_j = score_j + self.type_bias[cand_types[:, :, j]]
+            if score_bias is not None:
+                score_j = score_j + score_bias[:, :, j, None]
+            if qtb is not None:
+                score_j = score_j + qtb.gather(2, cand_types[:, :, j, None, None].expand(-1, -1, 1, h)).squeeze(2)
+            score_j = score_j + self.source_bias[source_j]
+            score_j = score_j.masked_fill(~cand_mask[:, :, j, None], torch.finfo(score_j.dtype).min)
+            score_parts.append(score_j)
+        scores = torch.stack(score_parts, dim=2)
+        probs = F.softmax(scores, dim=2)
+
+        r_all_h = x.new_zeros((bsz, seq_len, h, dh))
+        typed_reads_h = {
+            type_id: x.new_zeros((bsz, seq_len, h, dh))
+            for type_id in self.read_type_ids
+            if 0 <= type_id < self.n_types
+        }
+        for j in range(j_count):
+            token_j = gather_tokens[:, :, j]
+            source_j = cand_sources[:, :, j]
+            v_j = x.new_zeros((bsz, seq_len, h, dh))
+            for source_id, (_, v_src) in projected_sources.items():
+                source_mask = (source_j == int(source_id)) & cand_mask[:, :, j]
+                if bool(source_mask.any()):
+                    gathered = self._gather_source_rows(v_src, token_j)
+                    v_j = v_j + gathered * source_mask[:, :, None, None].to(v_j.dtype)
+            contrib = probs[:, :, j, :, None] * v_j
+            r_all_h = r_all_h + contrib
+            for type_id in typed_reads_h:
+                type_mask = ((cand_types[:, :, j] == int(type_id)) & cand_mask[:, :, j])[:, :, None, None]
+                typed_reads_h[type_id] = typed_reads_h[type_id] + contrib * type_mask.to(contrib.dtype)
+
+        r_all = r_all_h.reshape(bsz, seq_len, d)
+        weight = self.read_mix.weight
+        read = F.linear(r_all, weight[:, : self.d])
+        typed_read_norms = [r_all.new_tensor(0.0) for _ in range(self.n_types)]
+        for type_id, r_type_h in typed_reads_h.items():
+            r_type = r_type_h.reshape(bsz, seq_len, d)
+            start = (int(type_id) + 1) * self.d
+            read = read + F.linear(r_type, weight[:, start : start + self.d])
+            typed_read_norms[int(type_id)] = r_type.norm(dim=-1).mean()
+
+        z = torch.cat([x, read, x * read, read - x], dim=-1)
+        delta = self.fuse(self.norm_z(z))
+        gate = torch.sigmoid(self.gate).reshape(1, 1, d)
+        x_out = x + gate * delta
+
+        p_mean = probs.mean(dim=-1)
+        p_safe = p_mean.clamp_min(1e-8)
+        entropy = -(p_safe * p_safe.log()).sum(dim=-1).mean()
+        valid_counts = cand_mask.sum(dim=-1).float()
+        delta_norm = delta.norm(dim=-1).mean()
+        x_norm = x.norm(dim=-1).mean()
+        read_norm = read.norm(dim=-1).mean()
+        telemetry: dict[str, torch.Tensor] = {
+            "dsqg_w_entropy": entropy.detach(),
+            "dsqg_w_valid_candidate_count": valid_counts.mean().detach(),
+            "dsqg_w_gate_mean": gate.mean().detach(),
+            "dsqg_w_gate_min": gate.min().detach(),
+            "dsqg_w_gate_max": gate.max().detach(),
+            "dsqg_w_delta_norm": delta_norm.detach(),
+            "dsqg_w_x_norm": x_norm.detach(),
+            "dsqg_w_delta_to_x_ratio": (delta_norm / x_norm.clamp_min(1e-8)).detach(),
+            "dsqg_w_read_norm": read_norm.detach(),
+            "dsqg_w_typed_read_norms": torch.stack(typed_read_norms).detach(),
+            "read_mix_weight_norm": self.read_mix.weight.norm().detach(),
+            "dsqg_w_query_type_bias_norm": query_type_bias_norm.detach(),
+            "dsqg_w_candidate_score_bias_norm": candidate_score_bias_norm.detach(),
+            "dsqg_w_sourcewise": x.new_tensor(1.0).detach(),
+        }
+        for ctype in CandidateType:
+            mask = (cand_types == int(ctype)) & cand_mask
+            mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
+            telemetry[f"dsqg_w_{ctype.name.lower()}_mass"] = mass.detach()
+        telemetry["dsqg_w_local_mass"] = telemetry[f"dsqg_w_{CandidateType.LOCAL.name.lower()}_mass"]
+        telemetry["dsqg_w_question_mass"] = telemetry[f"dsqg_w_{CandidateType.QUESTION.name.lower()}_mass"]
+        telemetry["dsqg_w_hisa_evidence_mass"] = telemetry[f"dsqg_w_{CandidateType.HISA_EVIDENCE.name.lower()}_mass"]
+        telemetry["dsqg_w_long_offset_mass"] = telemetry[f"dsqg_w_{CandidateType.LONG_OFFSET.name.lower()}_mass"]
+        telemetry["dsqg_w_chunk_rep_mass"] = telemetry[f"dsqg_w_{CandidateType.CHUNK_REP.name.lower()}_mass"]
+        telemetry["dsqg_w_null_mass"] = telemetry[f"dsqg_w_{CandidateType.NULL.name.lower()}_mass"]
+        for source in CandidateSource:
+            mask = (cand_sources == int(source)) & cand_mask
+            mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
+            telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
+        telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
+        telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
+        if return_routing:
+            telemetry["dsqg_w_probs"] = probs
+        return x_out, telemetry
 
     def forward(
         self,
