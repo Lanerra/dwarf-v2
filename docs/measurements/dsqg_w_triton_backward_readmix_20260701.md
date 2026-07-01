@@ -172,6 +172,39 @@ Interpretation:
 - Peak VRAM is lower than dense and eager trainer runs in this tiny bench (`2930 MB` vs `3801 MB` dense, `3507 MB` eager), consistent with avoiding dense candidate state/read surfaces in forward.
 - First Triton step includes substantial compile overhead (`approx_compile_overhead_ms=5652.3`) on a 3-step window; still, the trailing average is slower than eager because backward is PyTorch recompute and the fused read projection repeats score work across output blocks.
 
+## Fresh 20-step trainer comparison after verification
+
+After the coder run completed, a fresh independent 20-step bench-only comparison was run from the same worktree. Raw local logs are under:
+
+```text
+results/dsqg_w_triton_backward_fresh_trainer20_20260701_140640/
+```
+
+Command shape for each variant:
+
+```bash
+DWARF_BENCH_ONLY=1 PYTHONPATH=. /home/dlewis3/Desktop/AI/DWARF/.venv/bin/python \
+  scripts/run_dsqg_w_full_training.py \
+  --max-acc-steps 20 --train-seqs 32 --val-seqs 4 \
+  --batch-size 1 --grad-accum 1 --passkey-trials 0 --execute \
+  [dense default | --sourcewise | --triton-sourcewise]
+```
+
+All three runs exited 0 with empty stderr logs.
+
+| path | first_step_ms | trailing_avg_ms | steady_tok_s | peak_vram |
+|---|---:|---:|---:|---:|
+| dense DSQG-W | 1090.9 | 370.1 | 5530 | 3801 MB |
+| eager sourcewise DSQG-W | 2475.6 | 1877.6 | 1090 | 3507 MB |
+| Triton sourcewise recompute | 1137.3 | 418.2 | 4895 | 2930 MB |
+
+Fresh 20-step interpretation:
+
+- Triton recompute is now a large trainer-speed win over eager sourcewise in this post-compile short window: `4895` vs `1090` tok/s, about `4.49x` faster.
+- Triton remains slower than dense default in step time (`418.2` vs `370.1` ms; `0.885x` dense tok/s), but much closer than eager sourcewise.
+- Triton peak VRAM is lower than both dense and eager (`2930 MB` vs `3801 MB` dense and `3507 MB` eager).
+- This 20-step result is more representative than the earlier 3-step cold smoke; the 3-step window overweighted first-use/compile effects and Python recompute setup.
+
 ## Materialization status
 
 Avoided in the optimized no-routing Triton path:
