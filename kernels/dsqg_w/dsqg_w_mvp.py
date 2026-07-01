@@ -367,18 +367,25 @@ class CandidateProvider:
         cand_scores = cand_scores.masked_fill(~cand_mask, 0.0)
 
         gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
-        final_gather = self._gather_states(final_states, gather_tokens)
-        l3_base = l3_states if l3_states is not None else final_states
-        l3_gather = self._gather_states(l3_base, gather_tokens)
-        summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
-        summary_gather = self._gather_states(summary_base, gather_tokens)
-        cand_states = torch.zeros((bsz, seq_len, j_max, d), device=device, dtype=final_states.dtype)
         final_source = (cand_sources == int(CandidateSource.FINAL)) | (cand_sources == int(CandidateSource.QUESTION_CACHE))
         l3_source = (cand_sources == int(CandidateSource.L3)) | (cand_sources == int(CandidateSource.HISA))
         summary_source = cand_sources == int(CandidateSource.SUMMARY)
-        cand_states = torch.where(final_source[..., None], final_gather, cand_states)
-        cand_states = torch.where(l3_source[..., None], l3_gather, cand_states)
-        cand_states = torch.where(summary_source[..., None], summary_gather, cand_states)
+        final_needed = bool(self.config.local_offsets or self.config.long_offsets or q_idx is not None)
+        l3_needed = h_idx is not None or s_idx is not None
+        summary_needed = c_idx is not None
+
+        final_gather = self._gather_states(final_states, gather_tokens) if final_needed else None
+        cand_states = torch.zeros((bsz, seq_len, j_max, d), device=device, dtype=final_states.dtype)
+        if final_gather is not None:
+            cand_states = torch.where(final_source[..., None], final_gather, cand_states)
+        if l3_needed:
+            l3_base = l3_states if l3_states is not None else final_states
+            l3_gather = final_gather if l3_base is final_states and final_gather is not None else self._gather_states(l3_base, gather_tokens)
+            cand_states = torch.where(l3_source[..., None], l3_gather, cand_states)
+        if summary_needed:
+            summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
+            summary_gather = final_gather if summary_base is final_states and final_gather is not None else self._gather_states(summary_base, gather_tokens)
+            cand_states = torch.where(summary_source[..., None], summary_gather, cand_states)
         cand_states = cand_states * cand_mask[..., None].to(cand_states.dtype)
 
         denom = torch.tensor(float(raw_count * bsz * seq_len), device=device, dtype=final_states.dtype).clamp_min(1.0)
@@ -866,6 +873,37 @@ class DSQGWTypedCandidateMixer(nn.Module):
         return out, telemetry
 
 
+def _read_type_ids_from_config(config: DSQGWConfig) -> tuple[int, ...]:
+    """Return a semantics-preserving superset of candidate types a config can emit."""
+    type_ids: set[int] = set()
+    if config.null_fallback:
+        type_ids.add(int(CandidateType.NULL))
+    if config.local_offsets:
+        type_ids.add(int(CandidateType.LOCAL))
+    if config.k_question > 0:
+        type_ids.add(int(CandidateType.QUESTION))
+    if config.k_hisa_evidence > 0:
+        if config.typed_hisa_reps:
+            type_ids.update(
+                {
+                    int(CandidateType.HISA_EVIDENCE_REP0),
+                    int(CandidateType.HISA_EVIDENCE_REP1),
+                    int(CandidateType.HISA_EVIDENCE_REP2),
+                    int(CandidateType.HISA_EVIDENCE_REP3),
+                    int(CandidateType.HISA_EVIDENCE),
+                }
+            )
+        else:
+            type_ids.add(int(CandidateType.HISA_EVIDENCE))
+    if config.long_offsets:
+        type_ids.add(int(CandidateType.LONG_OFFSET))
+    if config.k_chunk > 0:
+        type_ids.add(int(CandidateType.CHUNK_REP))
+    if config.k_l3_skip > 0:
+        type_ids.add(int(CandidateType.L3_SKIP))
+    return tuple(sorted(type_id for type_id in type_ids if 0 <= type_id < config.n_types))
+
+
 class DSQGWBlock(nn.Module):
     """Diagnostic DSQG-W semantic-width recomposer.
 
@@ -898,6 +936,7 @@ class DSQGWBlock(nn.Module):
         typed_mixer_bottleneck: int = 64,
         typed_mixer_gate_init: float = -5.0,
         use_query_type_bias: bool = False,
+        read_type_ids: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         if d % n_heads != 0:
@@ -909,6 +948,7 @@ class DSQGWBlock(nn.Module):
         self.n_sources = int(n_sources)
         self.max_candidates = int(max_candidates)
         self.local_type_id = int(local_type_id)
+        self.read_type_ids = tuple(range(self.n_types)) if read_type_ids is None else tuple(int(t) for t in read_type_ids)
         self.width_cell = (
             DSQGWWidthCell(
                 d=d,
@@ -980,7 +1020,32 @@ class DSQGWBlock(nn.Module):
             typed_mixer_bottleneck=config.typed_mixer_bottleneck,
             typed_mixer_gate_init=config.typed_mixer_gate_init,
             use_query_type_bias=config.use_query_type_bias,
+            read_type_ids=_read_type_ids_from_config(config),
         )
+
+    def _mix_typed_reads(
+        self,
+        r_all: torch.Tensor,
+        probs: torch.Tensor,
+        v: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        bsz, seq_len, _ = r_all.shape
+        weight = self.read_mix.weight
+        read = F.linear(r_all, weight[:, : self.d])
+        typed_read_norms = [r_all.new_tensor(0.0) for _ in range(self.n_types)]
+        for type_id in self.read_type_ids:
+            if type_id < 0 or type_id >= self.n_types:
+                continue
+            type_mask = ((cand_types == type_id) & cand_mask)[:, :, :, None, None]
+            p_type = probs[..., None].masked_fill(~type_mask, 0.0)
+            r_type_h = (p_type * v).sum(dim=2)
+            r_type = r_type_h.reshape(bsz, seq_len, self.d)
+            start = (type_id + 1) * self.d
+            read = read + F.linear(r_type, weight[:, start : start + self.d])
+            typed_read_norms[type_id] = r_type.norm(dim=-1).mean()
+        return read, typed_read_norms
 
     def forward(
         self,
@@ -1051,18 +1116,7 @@ class DSQGWBlock(nn.Module):
         r_all_h = (probs[..., None] * v).sum(dim=2)
         r_all = r_all_h.reshape(bsz, seq_len, d)
 
-        typed_reads = []
-        typed_read_norms = []
-        for type_id in range(self.n_types):
-            type_mask = ((cand_types == type_id) & cand_mask)[:, :, :, None, None]
-            p_type = probs[..., None].masked_fill(~type_mask, 0.0)
-            r_type_h = (p_type * v).sum(dim=2)
-            r_type = r_type_h.reshape(bsz, seq_len, d)
-            typed_reads.append(r_type)
-            typed_read_norms.append(r_type.norm(dim=-1).mean())
-
-        r_cat = torch.cat([r_all] + typed_reads, dim=-1)
-        read = self.read_mix(r_cat)
+        read, typed_read_norms = self._mix_typed_reads(r_all, probs, v, cand_types, cand_mask)
         z = torch.cat([x, read, x * read, read - x], dim=-1)
         delta = self.fuse(self.norm_z(z))
         gate = torch.sigmoid(self.gate).reshape(1, 1, d)
