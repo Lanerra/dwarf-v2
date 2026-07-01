@@ -308,11 +308,11 @@ def test_triton_sourcewise_avoids_forbidden_candidate_surfaces_with_padded_hd(mo
     assert all(len(shape) == 3 for shape in projected_input_shapes)
 
 
-def test_triton_sourcewise_training_backward_is_explicitly_unsupported(monkeypatch) -> None:
+def test_triton_sourcewise_autograd_matches_eager_sourcewise_backward_on_cuda(monkeypatch) -> None:
     _require_cuda_triton()
     torch.manual_seed(202607013)
     config = DSQGWConfig(
-        d=20,
+        d=32,
         n_heads=4,
         max_candidates=8,
         local_offsets=(1,),
@@ -321,15 +321,82 @@ def test_triton_sourcewise_training_backward_is_explicitly_unsupported(monkeypat
         k_hisa_evidence=2,
         k_l3_skip=1,
         k_chunk=0,
+        gate_init=-2.0,
+        fuse_init_std=0.02,
+        use_query_type_bias=True,
     )
     x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=9)
-    x.requires_grad_(True)
-    l3.requires_grad_(True)
-    block = DSQGWBlock.from_config(config).cuda()
+    eager_x = x.detach().clone().requires_grad_(True)
+    eager_l3 = l3.detach().clone().requires_grad_(True)
+    triton_x = x.detach().clone().requires_grad_(True)
+    triton_l3 = l3.detach().clone().requires_grad_(True)
+    eager_block = DSQGWBlock.from_config(config).cuda()
+    triton_block = DSQGWBlock.from_config(config).cuda()
+    triton_block.load_state_dict(eager_block.state_dict())
+
+    eager_out, _ = eager_block.forward_sourcewise(
+        eager_x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=eager_l3,
+        cand_scores=metadata.cand_scores,
+    )
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
+    triton_out, telemetry = triton_block.forward_sourcewise(
+        triton_x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=triton_l3,
+        cand_scores=metadata.cand_scores,
+    )
+
+    assert torch.allclose(triton_out, eager_out, atol=2e-5, rtol=2e-5)
+    assert telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 1.0
+    eager_loss = eager_out.square().mean()
+    triton_loss = triton_out.square().mean()
+    eager_loss.backward()
+    triton_loss.backward()
+    torch.cuda.synchronize()
+
+    assert triton_x.grad is not None
+    assert triton_l3.grad is not None
+    assert triton_block.read_mix.weight.grad is not None
+    assert triton_block.q_proj.weight.grad is not None
+    assert torch.allclose(triton_x.grad, eager_x.grad, atol=3e-4, rtol=3e-4)
+    assert torch.allclose(triton_l3.grad, eager_l3.grad, atol=3e-4, rtol=3e-4)
+    assert torch.allclose(
+        triton_block.read_mix.weight.grad,
+        eager_block.read_mix.weight.grad,
+        atol=3e-4,
+        rtol=3e-4,
+    )
+
+
+def test_triton_sourcewise_no_routing_and_fused_read_mix_do_not_materialize_forbidden_outputs(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607014)
+    config = DSQGWConfig(
+        d=32,
+        n_heads=4,
+        max_candidates=8,
+        local_offsets=(1,),
+        long_offsets=(),
+        k_question=2,
+        k_hisa_evidence=2,
+        k_l3_skip=1,
+        k_chunk=0,
+        use_query_type_bias=True,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=9)
+    block = DSQGWBlock.from_config(config).cuda().eval()
     monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
 
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        block.forward_sourcewise(
+    with torch.no_grad():
+        out, telemetry = block.forward_sourcewise(
             x,
             metadata.cand_token_indices,
             metadata.cand_types,
@@ -337,7 +404,16 @@ def test_triton_sourcewise_training_backward_is_explicitly_unsupported(monkeypat
             metadata.cand_mask,
             l3_states=l3,
             cand_scores=metadata.cand_scores,
+            return_routing=False,
         )
+
+    torch.cuda.synchronize()
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert "dsqg_w_probs" not in telemetry
+    assert telemetry["dsqg_w_triton_probs_materialized"].item() == 0.0
+    assert telemetry["dsqg_w_triton_read_accum_materialized"].item() == 0.0
+    assert telemetry["dsqg_w_triton_read_mix_fused"].item() == 1.0
 
 
 def test_vectorized_candidate_provider_skips_unused_summary_gather(monkeypatch) -> None:

@@ -25,7 +25,7 @@ def env_flag(name: str, value: str | None):
             os.environ[name] = old
 
 
-def build_fixture(batch: int = 2, seq_len: int = 512):
+def build_inputs(batch: int = 1, seq_len: int = 256):
     torch.manual_seed(20260701)
     device = torch.device("cuda")
     config = DSQGWConfig(
@@ -61,32 +61,19 @@ def build_fixture(batch: int = 2, seq_len: int = 512):
     l3_skip = torch.stack(
         [(positions - 16).clamp_min(0), (positions - 64).clamp_min(0)], dim=-1
     ).unsqueeze(0).expand(batch, -1, -1).contiguous()
-    provider = CandidateProvider(config)
-    dense_candidates = provider.build(
-        x,
-        l3_states=l3,
-        question_indices=question,
-        hisa_evidence_indices=hisa,
-        hisa_evidence_scores=hisa_scores,
-        l3_skip_indices=l3_skip,
-    )
-    metadata = provider.build_metadata(
-        x,
-        l3_states=l3,
-        question_indices=question,
-        hisa_evidence_indices=hisa,
-        hisa_evidence_scores=hisa_scores,
-        l3_skip_indices=l3_skip,
-    )
+    return config, x, l3, question, hisa, hisa_scores, l3_skip
+
+
+def build_blocks(config: DSQGWConfig):
     dense_block = DSQGWBlock.from_config(config).cuda().eval()
     eager_block = DSQGWBlock.from_config(config).cuda().eval()
     triton_block = DSQGWBlock.from_config(config).cuda().eval()
     eager_block.load_state_dict(dense_block.state_dict())
     triton_block.load_state_dict(dense_block.state_dict())
-    return config, x, l3, dense_candidates, metadata, dense_block, eager_block, triton_block
+    return dense_block, eager_block, triton_block
 
 
-def bench(name: str, fn, *, warmup: int = 10, iters: int = 50):
+def bench_forward(name: str, fn, *, warmup: int = 5, iters: int = 20):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     with torch.no_grad():
@@ -109,6 +96,28 @@ def bench(name: str, fn, *, warmup: int = 10, iters: int = 50):
     }
 
 
+def bench_fwd_bwd(name: str, fn, *, warmup: int = 1, iters: int = 5):
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return {
+        "name": name,
+        "ms": start.elapsed_time(end) / iters,
+        "peak_mb": torch.cuda.max_memory_allocated() / (1024 * 1024),
+        "iters": iters,
+        "warmup": warmup,
+    }
+
+
 def main():
     if not torch.cuda.is_available():
         raise SystemExit("CUDA unavailable")
@@ -117,9 +126,27 @@ def main():
     except Exception as exc:
         raise SystemExit(f"Triton unavailable: {exc}") from exc
 
-    config, x, l3, dense_candidates, metadata, dense_block, eager_block, triton_block = build_fixture()
+    config, x, l3, question, hisa, hisa_scores, l3_skip = build_inputs()
+    provider = CandidateProvider(config)
+    dense_candidates = provider.build(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+    metadata = provider.build_metadata(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+    dense_block, eager_block, triton_block = build_blocks(config)
 
-    def dense_forward():
+    def dense_forward(return_routing: bool = False):
         return dense_block(
             x,
             dense_candidates.cand_states,
@@ -127,10 +154,10 @@ def main():
             dense_candidates.cand_sources,
             dense_candidates.cand_mask,
             cand_scores=dense_candidates.cand_scores,
-            return_routing=True,
+            return_routing=return_routing,
         )
 
-    def eager_forward():
+    def eager_forward(return_routing: bool = False):
         return eager_block.forward_sourcewise(
             x,
             metadata.cand_token_indices,
@@ -139,10 +166,10 @@ def main():
             metadata.cand_mask,
             l3_states=l3,
             cand_scores=metadata.cand_scores,
-            return_routing=True,
+            return_routing=return_routing,
         )
 
-    def triton_forward():
+    def triton_forward(return_routing: bool = False):
         with env_flag("DWARF_DSQG_W_TRITON_SOURCEWISE", "1"):
             return triton_block.forward_sourcewise(
                 x,
@@ -152,13 +179,83 @@ def main():
                 metadata.cand_mask,
                 l3_states=l3,
                 cand_scores=metadata.cand_scores,
-                return_routing=True,
+                return_routing=return_routing,
             )
 
+    def dense_fwd_bwd():
+        dense_block.zero_grad(set_to_none=True)
+        bx = x.detach().clone().requires_grad_(True)
+        bl3 = l3.detach().clone().requires_grad_(True)
+        candidates = provider.build(
+            bx,
+            l3_states=bl3,
+            question_indices=question,
+            hisa_evidence_indices=hisa,
+            hisa_evidence_scores=hisa_scores,
+            l3_skip_indices=l3_skip,
+        )
+        out, _ = dense_block(
+            bx,
+            candidates.cand_states,
+            candidates.cand_types,
+            candidates.cand_sources,
+            candidates.cand_mask,
+            cand_scores=candidates.cand_scores,
+        )
+        out.float().square().mean().backward()
+
+    def eager_fwd_bwd():
+        eager_block.zero_grad(set_to_none=True)
+        bx = x.detach().clone().requires_grad_(True)
+        bl3 = l3.detach().clone().requires_grad_(True)
+        candidates = provider.build_metadata(
+            bx,
+            l3_states=bl3,
+            question_indices=question,
+            hisa_evidence_indices=hisa,
+            hisa_evidence_scores=hisa_scores,
+            l3_skip_indices=l3_skip,
+        )
+        out, _ = eager_block.forward_sourcewise(
+            bx,
+            candidates.cand_token_indices,
+            candidates.cand_types,
+            candidates.cand_sources,
+            candidates.cand_mask,
+            l3_states=bl3,
+            cand_scores=candidates.cand_scores,
+        )
+        out.float().square().mean().backward()
+
+    def triton_fwd_bwd():
+        triton_block.zero_grad(set_to_none=True)
+        bx = x.detach().clone().requires_grad_(True)
+        bl3 = l3.detach().clone().requires_grad_(True)
+        candidates = provider.build_metadata(
+            bx,
+            l3_states=bl3,
+            question_indices=question,
+            hisa_evidence_indices=hisa,
+            hisa_evidence_scores=hisa_scores,
+            l3_skip_indices=l3_skip,
+        )
+        with env_flag("DWARF_DSQG_W_TRITON_SOURCEWISE", "1"):
+            out, _ = triton_block.forward_sourcewise(
+                bx,
+                candidates.cand_token_indices,
+                candidates.cand_types,
+                candidates.cand_sources,
+                candidates.cand_mask,
+                l3_states=bl3,
+                cand_scores=candidates.cand_scores,
+            )
+        out.float().square().mean().backward()
+
     with torch.no_grad():
-        dense_out, dense_tel = dense_forward()
-        eager_out, eager_tel = eager_forward()
-        triton_out, triton_tel = triton_forward()
+        dense_out, dense_tel = dense_forward(return_routing=True)
+        eager_out, eager_tel = eager_forward(return_routing=True)
+        triton_out, triton_tel = triton_forward(return_routing=True)
+        triton_no_route_out, triton_no_route_tel = triton_forward(return_routing=False)
         torch.cuda.synchronize()
 
     result = {
@@ -173,7 +270,9 @@ def main():
         },
         "features": {
             "sourcewise": True,
-            "triton_forward_only": True,
+            "triton_recompute_backward": True,
+            "triton_no_routing": True,
+            "triton_read_mix_fused": True,
             "local_offsets": list(config.local_offsets),
             "long_offsets": list(config.long_offsets),
             "k_question": config.k_question,
@@ -184,6 +283,7 @@ def main():
         "parity": {
             "eager_vs_dense_out_max_abs_diff": float((eager_out - dense_out).abs().max().item()),
             "triton_vs_eager_out_max_abs_diff": float((triton_out - eager_out).abs().max().item()),
+            "triton_no_route_vs_route_out_max_abs_diff": float((triton_no_route_out - triton_out).abs().max().item()),
             "triton_vs_dense_out_max_abs_diff": float((triton_out - dense_out).abs().max().item()),
             "triton_vs_eager_probs_max_abs_diff": float(
                 (triton_tel["dsqg_w_probs"] - eager_tel["dsqg_w_probs"]).abs().max().item()
@@ -203,11 +303,20 @@ def main():
                 * (config.d // config.n_heads)
                 * x.element_size()
             ),
+            "triton_no_route_probs_materialized": float(triton_no_route_tel["dsqg_w_triton_probs_materialized"].item()),
+            "triton_read_accum_materialized": float(triton_no_route_tel["dsqg_w_triton_read_accum_materialized"].item()),
+            "triton_read_mix_fused": float(triton_no_route_tel["dsqg_w_triton_read_mix_fused"].item()),
         },
-        "timings": [
-            bench("dense_forward", dense_forward),
-            bench("eager_sourcewise_forward", eager_forward),
-            bench("triton_sourcewise_forward", triton_forward),
+        "forward_timings": [
+            bench_forward("dense_forward_no_routing", lambda: dense_forward(False)),
+            bench_forward("eager_sourcewise_forward_no_routing", lambda: eager_forward(False)),
+            bench_forward("triton_sourcewise_forward_no_routing", lambda: triton_forward(False)),
+            bench_forward("triton_sourcewise_forward_with_routing", lambda: triton_forward(True), warmup=2, iters=5),
+        ],
+        "fwd_bwd_timings": [
+            bench_fwd_bwd("dense_fwd_bwd", dense_fwd_bwd),
+            bench_fwd_bwd("eager_sourcewise_fwd_bwd", eager_fwd_bwd),
+            bench_fwd_bwd("triton_sourcewise_fwd_bwd", triton_fwd_bwd),
         ],
     }
     print(json.dumps(result, indent=2, sort_keys=True))

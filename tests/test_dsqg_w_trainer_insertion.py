@@ -5,13 +5,14 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAINER = ROOT / "train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py"
 
 
-def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: bool = False, sites: str | None = None, sourcewise: bool = False):
+def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: bool = False, sites: str | None = None, sourcewise: bool = False, triton_sourcewise: bool = False):
     monkeypatch.setenv("DWARF_DISABLE_BNB", "1")
     monkeypatch.setenv("DWARF_LIGER", "0")
     monkeypatch.setenv("DWARF_TORCH_COMPILE", "0")
@@ -23,6 +24,10 @@ def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: 
             monkeypatch.setenv("DWARF_DSQG_W_SOURCEWISE", "1")
         else:
             monkeypatch.delenv("DWARF_DSQG_W_SOURCEWISE", raising=False)
+        if triton_sourcewise:
+            monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_TRITON_SOURCEWISE", raising=False)
         if sites is not None:
             monkeypatch.setenv("DWARF_DSQG_W_SITES", sites)
         else:
@@ -41,6 +46,7 @@ def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: 
     else:
         monkeypatch.delenv("DWARF_DSQG_W", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_SOURCEWISE", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_TRITON_SOURCEWISE", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_SITES", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_QUESTION", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_HISA_L3", raising=False)
@@ -332,3 +338,35 @@ def test_dsqg_w_sourcewise_env_uses_metadata_recomposer(monkeypatch) -> None:
     assert out.shape == x.shape
     assert calls == ["metadata"]
     assert model.dsqg_w_last_telemetry["dsqg_w_sourcewise"].item() == 1.0
+
+
+def test_dsqg_w_triton_sourcewise_env_is_training_smoke_accepted_on_cuda(monkeypatch) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Triton DSQG-W sourcewise trainer smoke")
+    pytest.importorskip("triton")
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        sourcewise=True,
+        triton_sourcewise=True,
+    )
+    model = make_model(mod).cuda().train()
+    idx = torch.randint(0, 128, (1, 8), device="cuda", dtype=torch.long)
+    question, hisa, l3_skip = mod._dsqg_w_training_candidate_indices(idx)
+
+    out = model(
+        idx,
+        dsqg_w_question_indices=question,
+        dsqg_w_hisa_evidence_indices=hisa,
+        dsqg_w_l3_skip_indices=l3_skip,
+    )
+    loss = out.float().square().mean()
+    loss.backward()
+    torch.cuda.synchronize()
+
+    assert out.shape[:2] == idx.shape
+    assert model.dsqg_w_last_telemetry["dsqg_w_triton_sourcewise"].item() == 1.0
+    assert model.dsqg_w_last_telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 1.0
+    assert model.dsqg_w.read_mix.weight.grad is not None

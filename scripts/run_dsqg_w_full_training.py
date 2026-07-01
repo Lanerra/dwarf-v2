@@ -196,7 +196,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--triton-sourcewise",
         action="store_true",
-        help="Enable the forward-only Triton DSQG-W sourcewise prototype; requires --sourcewise and is not a training/backward path.",
+        help="Enable the opt-in Triton DSQG-W sourcewise path with recompute backward; requires --sourcewise.",
     )
     parser.add_argument("--width-cell", action="store_true", help="Enable the opt-in DSQG-W candidate lateral width cell.")
     parser.add_argument("--width-bottleneck", type=int, default=64)
