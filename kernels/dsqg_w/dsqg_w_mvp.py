@@ -1129,6 +1129,7 @@ if _TRITON_SOURCEWISE_AVAILABLE:
         cand_mask_ptr,
         type_slot_map_ptr,
         read_slots_ptr,
+        lse_ptr,
         probs_ptr,
         B: tl.constexpr,
         N: tl.constexpr,
@@ -1142,6 +1143,7 @@ if _TRITON_SOURCEWISE_AVAILABLE:
         BLOCK_HD: tl.constexpr,
         USE_QTB: tl.constexpr,
         USE_SCORE_BIAS: tl.constexpr,
+        STORE_LSE: tl.constexpr,
         STORE_PROBS: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -1206,6 +1208,9 @@ if _TRITON_SOURCEWISE_AVAILABLE:
             score = tl.where(valid, score, -float("inf"))
             denom += tl.where(valid, tl.exp(score - max_score), 0.0)
 
+        if STORE_LSE:
+            tl.store(lse_ptr + (b * N + n) * H + h, max_score + tl.log(denom))
+
         slot_ids = tl.arange(0, MAX_READ_SLOTS)
         acc = tl.zeros((int(MAX_READ_SLOTS), int(BLOCK_HD)), tl.float32)
         for j in tl.static_range(0, J):
@@ -1245,6 +1250,165 @@ if _TRITON_SOURCEWISE_AVAILABLE:
 
         store_base = ((b * N + n) * READ_SLOTS + slot_ids[:, None]) * D + h * HD + offs[None, :]
         tl.store(read_slots_ptr + store_base, acc, mask=(slot_ids[:, None] < READ_SLOTS) & hd_mask[None, :])
+
+
+    @triton.jit
+    def _dsqg_w_sourcewise_read_slots_backward_kernel(
+        q_ptr,
+        k_final_ptr,
+        v_final_ptr,
+        k_l3_ptr,
+        v_l3_ptr,
+        k_summary_ptr,
+        v_summary_ptr,
+        role_key_ptr,
+        source_key_ptr,
+        type_bias_ptr,
+        source_bias_ptr,
+        qtb_ptr,
+        score_bias_ptr,
+        cand_token_ptr,
+        cand_type_ptr,
+        cand_source_ptr,
+        cand_mask_ptr,
+        type_slot_map_ptr,
+        lse_ptr,
+        grad_slots_ptr,
+        grad_q_ptr,
+        grad_k_final_ptr,
+        grad_v_final_ptr,
+        grad_k_l3_ptr,
+        grad_v_l3_ptr,
+        grad_k_summary_ptr,
+        grad_v_summary_ptr,
+        grad_role_key_ptr,
+        grad_source_key_ptr,
+        grad_type_bias_ptr,
+        grad_source_bias_ptr,
+        grad_qtb_ptr,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        D: tl.constexpr,
+        J: tl.constexpr,
+        N_TYPES: tl.constexpr,
+        READ_SLOTS: tl.constexpr,
+        BLOCK_HD: tl.constexpr,
+        USE_QTB: tl.constexpr,
+        USE_SCORE_BIAS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        h = pid % H
+        row = pid // H
+        n = row % N
+        b = row // N
+        offs = tl.arange(0, BLOCK_HD)
+        hd_mask = offs < HD
+        inv_sqrt = 1.0 / tl.sqrt(HD + 0.0)
+        q_base = ((b * N + n) * H + h) * HD + offs
+        q = tl.load(q_ptr + q_base, mask=hd_mask, other=0.0).to(tl.float32)
+        lse = tl.load(lse_ptr + (b * N + n) * H + h).to(tl.float32)
+        row_j_base = (b * N + n) * J
+
+        sum_p_dp = 0.0
+        for j in tl.static_range(0, J):
+            meta = row_j_base + j
+            valid = tl.load(cand_mask_ptr + meta).to(tl.int1)
+            tok = tl.load(cand_token_ptr + meta)
+            ctype = tl.load(cand_type_ptr + meta)
+            source_id = tl.load(cand_source_ptr + meta)
+            tok = tl.maximum(0, tl.minimum(tok, N - 1))
+            src_base = ((b * N + tok) * H + h) * HD + offs
+            k = tl.zeros((int(BLOCK_HD),), tl.float32)
+            k += tl.load(k_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+            k += tl.load(k_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+            k += tl.load(k_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+            role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+            score += tl.load(type_bias_ptr + ctype * H + h, mask=valid, other=0.0).to(tl.float32)
+            score += tl.load(source_bias_ptr + source_id * H + h, mask=valid, other=0.0).to(tl.float32)
+            if USE_SCORE_BIAS:
+                score += tl.load(score_bias_ptr + meta, mask=valid, other=0.0).to(tl.float32)
+            if USE_QTB:
+                score += tl.load(qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, mask=valid, other=0.0).to(tl.float32)
+            p = tl.where(valid, tl.exp(score - lse), 0.0)
+
+            v = tl.zeros((int(BLOCK_HD),), tl.float32)
+            v += tl.load(v_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+            v += tl.load(v_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+            v += tl.load(v_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+            grad_slot0 = tl.load(grad_slots_ptr + ((b * N + n) * READ_SLOTS + 0) * D + h * HD + offs, mask=hd_mask, other=0.0).to(tl.float32)
+            type_slot = tl.load(type_slot_map_ptr + ctype, mask=valid & (ctype >= 0) & (ctype < N_TYPES), other=-1)
+            grad_type = tl.load(
+                grad_slots_ptr + ((b * N + n) * READ_SLOTS + type_slot) * D + h * HD + offs,
+                mask=hd_mask & valid & (type_slot > 0) & (type_slot < READ_SLOTS),
+                other=0.0,
+            ).to(tl.float32)
+            dcontrib = grad_slot0 + grad_type
+            dp = tl.sum(dcontrib * v, axis=0)
+            sum_p_dp += p * dp
+
+        grad_q = tl.zeros((int(BLOCK_HD),), tl.float32)
+        for j in tl.static_range(0, J):
+            meta = row_j_base + j
+            valid = tl.load(cand_mask_ptr + meta).to(tl.int1)
+            tok = tl.load(cand_token_ptr + meta)
+            ctype = tl.load(cand_type_ptr + meta)
+            source_id = tl.load(cand_source_ptr + meta)
+            tok = tl.maximum(0, tl.minimum(tok, N - 1))
+            src_base = ((b * N + tok) * H + h) * HD + offs
+            k = tl.zeros((int(BLOCK_HD),), tl.float32)
+            k += tl.load(k_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+            k += tl.load(k_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+            k += tl.load(k_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+            role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+            score += tl.load(type_bias_ptr + ctype * H + h, mask=valid, other=0.0).to(tl.float32)
+            score += tl.load(source_bias_ptr + source_id * H + h, mask=valid, other=0.0).to(tl.float32)
+            if USE_SCORE_BIAS:
+                score += tl.load(score_bias_ptr + meta, mask=valid, other=0.0).to(tl.float32)
+            if USE_QTB:
+                score += tl.load(qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, mask=valid, other=0.0).to(tl.float32)
+            p = tl.where(valid, tl.exp(score - lse), 0.0)
+
+            v = tl.zeros((int(BLOCK_HD),), tl.float32)
+            v += tl.load(v_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+            v += tl.load(v_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+            v += tl.load(v_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+            grad_slot0 = tl.load(grad_slots_ptr + ((b * N + n) * READ_SLOTS + 0) * D + h * HD + offs, mask=hd_mask, other=0.0).to(tl.float32)
+            type_slot = tl.load(type_slot_map_ptr + ctype, mask=valid & (ctype >= 0) & (ctype < N_TYPES), other=-1)
+            grad_type = tl.load(
+                grad_slots_ptr + ((b * N + n) * READ_SLOTS + type_slot) * D + h * HD + offs,
+                mask=hd_mask & valid & (type_slot > 0) & (type_slot < READ_SLOTS),
+                other=0.0,
+            ).to(tl.float32)
+            dcontrib = grad_slot0 + grad_type
+            dp = tl.sum(dcontrib * v, axis=0)
+            ds = tl.where(valid, p * (dp - sum_p_dp), 0.0)
+            d_k_eff = ds * q * inv_sqrt
+            d_v = p * dcontrib
+            grad_q += ds * (k + role + src_role) * inv_sqrt
+
+            final_src = (source_id == 1) | (source_id == 5)
+            l3_src = (source_id == 2) | (source_id == 3)
+            summary_src = source_id == 4
+            tl.atomic_add(grad_k_final_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & final_src)
+            tl.atomic_add(grad_v_final_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & final_src)
+            tl.atomic_add(grad_k_l3_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & l3_src)
+            tl.atomic_add(grad_v_l3_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & l3_src)
+            tl.atomic_add(grad_k_summary_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & summary_src)
+            tl.atomic_add(grad_v_summary_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & summary_src)
+            tl.atomic_add(grad_role_key_ptr + ctype * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+            tl.atomic_add(grad_source_key_ptr + source_id * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+            tl.atomic_add(grad_type_bias_ptr + ctype * H + h, ds, sem="relaxed", mask=valid)
+            tl.atomic_add(grad_source_bias_ptr + source_id * H + h, ds, sem="relaxed", mask=valid)
+            if USE_QTB:
+                tl.atomic_add(grad_qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, ds, sem="relaxed", mask=valid)
+
+        tl.store(grad_q_ptr + q_base, grad_q, mask=hd_mask)
 
 
 def _dsqg_w_sourcewise_functional_recompute(
@@ -1510,6 +1674,9 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
         ctx.n_heads = int(n_heads)
         ctx.dh = int(dh)
         ctx.read_slots = int(read_slots)
+        bsz, seq_len = q.shape[:2]
+        read_slots_out = torch.empty((bsz, seq_len, int(read_slots), int(d)), device=q.device, dtype=q.dtype)
+        lse_out = torch.empty((bsz, seq_len, int(n_heads)), device=q.device, dtype=torch.float32)
         ctx.save_for_backward(
             q,
             k_final,
@@ -1529,9 +1696,8 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
             cand_sources,
             cand_mask,
             type_slot_map,
+            lse_out,
         )
-        bsz, seq_len = q.shape[:2]
-        read_slots_out = torch.empty((bsz, seq_len, int(read_slots), int(d)), device=q.device, dtype=q.dtype)
         empty = torch.empty((0,), device=q.device, dtype=q.dtype)
         _dsqg_w_sourcewise_read_slots_kernel[(bsz * seq_len * int(n_heads),)](
             q.contiguous(),
@@ -1553,6 +1719,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
             cand_mask.contiguous(),
             type_slot_map.contiguous(),
             read_slots_out,
+            lse_out,
             empty,
             B=bsz,
             N=seq_len,
@@ -1566,6 +1733,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
             BLOCK_HD=int(block_hd),
             USE_QTB=bool(use_qtb),
             USE_SCORE_BIAS=bool(use_score_bias),
+            STORE_LSE=True,
             STORE_PROBS=False,
             num_warps=1 if int(block_hd) <= 64 else 2,
         )
@@ -1593,11 +1761,100 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
             cand_sources,
             cand_mask,
             type_slot_map,
+            lse,
         ) = saved
         bsz, seq_len, j_count = cand_mask.shape
         h = ctx.n_heads
         dh = ctx.dh
         d = ctx.d
+        if os.getenv("DWARF_DSQG_W_TRITON_COMPACT_READ_BACKWARD", "triton").lower() != "pytorch":
+            grad_q = torch.zeros_like(q)
+            grad_k_final = torch.zeros_like(k_final)
+            grad_v_final = torch.zeros_like(v_final)
+            grad_k_l3 = torch.zeros_like(k_l3)
+            grad_v_l3 = torch.zeros_like(v_l3)
+            grad_k_summary = torch.zeros_like(k_summary)
+            grad_v_summary = torch.zeros_like(v_summary)
+            grad_role_key = torch.zeros_like(role_key_weight)
+            grad_source_key = torch.zeros_like(source_key_weight)
+            grad_type_bias = torch.zeros_like(type_bias)
+            grad_source_bias = torch.zeros_like(source_bias)
+            grad_qtb = torch.zeros_like(qtb) if ctx.use_qtb else None
+            empty = torch.empty((0,), device=q.device, dtype=q.dtype)
+            _dsqg_w_sourcewise_read_slots_backward_kernel[(bsz * seq_len * h,)](
+                q.contiguous(),
+                k_final.contiguous(),
+                v_final.contiguous(),
+                k_l3.contiguous(),
+                v_l3.contiguous(),
+                k_summary.contiguous(),
+                v_summary.contiguous(),
+                role_key_weight.contiguous(),
+                source_key_weight.contiguous(),
+                type_bias.contiguous(),
+                source_bias.contiguous(),
+                qtb.contiguous() if ctx.use_qtb else empty,
+                score_bias.contiguous() if ctx.use_score_bias else empty,
+                cand_token_indices.contiguous(),
+                cand_types.contiguous(),
+                cand_sources.contiguous(),
+                cand_mask.contiguous(),
+                type_slot_map.contiguous(),
+                lse.contiguous(),
+                grad_read_slots.contiguous(),
+                grad_q,
+                grad_k_final,
+                grad_v_final,
+                grad_k_l3,
+                grad_v_l3,
+                grad_k_summary,
+                grad_v_summary,
+                grad_role_key,
+                grad_source_key,
+                grad_type_bias,
+                grad_source_bias,
+                grad_qtb if grad_qtb is not None else empty,
+                B=bsz,
+                N=seq_len,
+                H=h,
+                HD=dh,
+                D=d,
+                J=j_count,
+                N_TYPES=type_bias.shape[0],
+                READ_SLOTS=ctx.read_slots,
+                BLOCK_HD=int(triton.next_power_of_2(dh)),
+                USE_QTB=ctx.use_qtb,
+                USE_SCORE_BIAS=ctx.use_score_bias,
+                num_warps=1 if int(triton.next_power_of_2(dh)) <= 64 else 2,
+            )
+            return (
+                grad_q,
+                grad_k_final,
+                grad_v_final,
+                grad_k_l3,
+                grad_v_l3,
+                grad_k_summary,
+                grad_v_summary,
+                grad_role_key,
+                grad_source_key,
+                grad_type_bias,
+                grad_source_bias,
+                grad_qtb,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
         batch_offsets = torch.arange(bsz, device=q.device, dtype=torch.long).reshape(bsz, 1) * seq_len
         inv_sqrt = 1.0 / math.sqrt(float(dh))
@@ -2191,6 +2448,7 @@ class DSQGWBlock(nn.Module):
                         cand_mask.contiguous(),
                         type_slot_map.contiguous(),
                         torch.empty_like(read_slots),
+                        empty,
                         probs,
                         B=bsz,
                         N=seq_len,
@@ -2204,6 +2462,7 @@ class DSQGWBlock(nn.Module):
                         BLOCK_HD=block_hd,
                         USE_QTB=use_qtb,
                         USE_SCORE_BIAS=use_score_bias,
+                        STORE_LSE=False,
                         STORE_PROBS=True,
                         num_warps=1 if block_hd <= 64 else 2,
                     )
@@ -2229,6 +2488,7 @@ class DSQGWBlock(nn.Module):
                 cand_mask.contiguous(),
                 type_slot_map.contiguous(),
                 read_slots,
+                empty,
                 probs,
                 B=bsz,
                 N=seq_len,
@@ -2242,6 +2502,7 @@ class DSQGWBlock(nn.Module):
                 BLOCK_HD=block_hd,
                 USE_QTB=use_qtb,
                 USE_SCORE_BIAS=use_score_bias,
+                STORE_LSE=False,
                 STORE_PROBS=return_routing,
                 num_warps=1 if block_hd <= 64 else 2,
             )
@@ -2272,6 +2533,7 @@ class DSQGWBlock(nn.Module):
             for slot_idx, type_id in enumerate(self.read_type_ids, start=1):
                 if 0 <= int(type_id) < self.n_types:
                     typed_read_norms[int(type_id)] = read_slots[:, :, slot_idx, :].norm(dim=-1).mean()
+        true_backward = needs_backward and os.getenv("DWARF_DSQG_W_TRITON_COMPACT_READ_BACKWARD", "triton").lower() != "pytorch"
 
         telemetry: dict[str, torch.Tensor] = {
             "dsqg_w_entropy": entropy.detach(),
@@ -2297,6 +2559,10 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_triton_compact_read_slots_materialized": x.new_tensor(1.0).detach(),
             "dsqg_w_triton_compact_read_slots": x.new_tensor(float(read_slot_count)).detach(),
             "dsqg_w_triton_score_recompute_blocks": x.new_tensor(1.0).detach(),
+            "dsqg_w_triton_true_backward": x.new_tensor(1.0 if true_backward else 0.0).detach(),
+            "dsqg_w_triton_backward_probs_materialized": x.new_tensor(0.0 if true_backward else (1.0 if needs_backward else 0.0)).detach(),
+            "dsqg_w_triton_backward_lse_saved": x.new_tensor(1.0 if needs_backward else 0.0).detach(),
+            "dsqg_w_triton_backward_reduction_buffer_bytes": x.new_tensor(0.0).detach(),
         }
         if return_routing:
             for ctype in CandidateType:
