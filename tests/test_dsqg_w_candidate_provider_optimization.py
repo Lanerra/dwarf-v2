@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from kernels.dsqg_w.dsqg_w_mvp import CandidateProvider, CandidateType, DSQGWBlock, DSQGWConfig
@@ -151,6 +152,192 @@ def test_sourcewise_path_does_not_build_candidate_state_or_projected_kv_surfaces
     assert telemetry["dsqg_w_sourcewise"].item() == 1.0
     assert projected_input_shapes
     assert all(len(shape) == 3 for shape in projected_input_shapes)
+
+
+def _require_cuda_triton() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Triton DSQG-W sourcewise tests")
+    pytest.importorskip("triton")
+
+
+def _cuda_sourcewise_metadata(config: DSQGWConfig, *, seq_len: int):
+    device = torch.device("cuda")
+    x = torch.randn(1, seq_len, config.d, device=device)
+    l3 = torch.randn(1, seq_len, config.d, device=device)
+    positions = torch.arange(seq_len, device=device)
+    question_base = torch.tensor([[0, 3, 7, 11]], device=device, dtype=torch.long)
+    question = question_base[:, : config.k_question].contiguous()
+    hisa = torch.stack(
+        [
+            (positions - 1).clamp_min(0),
+            (positions - 5).clamp_min(0),
+            (positions - 9).clamp_min(0),
+            (positions - 17).clamp_min(0),
+        ],
+        dim=-1,
+    )[:, : config.k_hisa_evidence].unsqueeze(0).contiguous()
+    hisa_scores = torch.linspace(-0.4, 0.4, steps=seq_len * config.k_hisa_evidence, device=device).reshape(
+        1, seq_len, config.k_hisa_evidence
+    )
+    l3_skip = torch.stack(
+        [(positions - 2).clamp_min(0), (positions - 6).clamp_min(0)], dim=-1
+    )[:, : config.k_l3_skip].unsqueeze(0).contiguous()
+    metadata = CandidateProvider(config).build_metadata(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+    return x, l3, metadata
+
+
+def test_triton_sourcewise_matches_eager_sourcewise_on_cuda(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607011)
+    config = DSQGWConfig(
+        d=512,
+        n_heads=8,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        gate_init=-2.0,
+        fuse_init_std=0.02,
+        use_query_type_bias=True,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=32)
+    eager_block = DSQGWBlock.from_config(config).cuda().eval()
+    triton_block = DSQGWBlock.from_config(config).cuda().eval()
+    triton_block.load_state_dict(eager_block.state_dict())
+
+    with torch.no_grad():
+        eager_out, eager_telemetry = eager_block.forward_sourcewise(
+            x,
+            metadata.cand_token_indices,
+            metadata.cand_types,
+            metadata.cand_sources,
+            metadata.cand_mask,
+            l3_states=l3,
+            cand_scores=metadata.cand_scores,
+            return_routing=True,
+        )
+        monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
+        triton_out, triton_telemetry = triton_block.forward_sourcewise(
+            x,
+            metadata.cand_token_indices,
+            metadata.cand_types,
+            metadata.cand_sources,
+            metadata.cand_mask,
+            l3_states=l3,
+            cand_scores=metadata.cand_scores,
+            return_routing=True,
+        )
+
+    torch.cuda.synchronize()
+    assert metadata.cand_states.numel() == 0
+    assert triton_telemetry["dsqg_w_triton_sourcewise"].item() == 1.0
+    assert torch.allclose(triton_out, eager_out, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(triton_telemetry["dsqg_w_probs"], eager_telemetry["dsqg_w_probs"], atol=2e-5, rtol=2e-5)
+    for key in ("dsqg_w_read_norm", "dsqg_w_hisa_source_mass", "dsqg_w_l3_source_mass"):
+        assert torch.allclose(triton_telemetry[key], eager_telemetry[key], atol=2e-5, rtol=2e-5)
+
+
+def test_triton_sourcewise_avoids_forbidden_candidate_surfaces_with_padded_hd(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607012)
+    config = DSQGWConfig(
+        d=20,
+        n_heads=4,
+        max_candidates=8,
+        local_offsets=(1,),
+        long_offsets=(),
+        k_question=2,
+        k_hisa_evidence=2,
+        k_l3_skip=1,
+        k_chunk=0,
+        gate_init=-2.0,
+        fuse_init_std=0.02,
+        use_query_type_bias=True,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=9)
+    block = DSQGWBlock.from_config(config).cuda().eval()
+    projected_input_shapes: list[tuple[int, ...]] = []
+    original_k = block.k_proj.forward
+    original_v = block.v_proj.forward
+
+    def k_spy(arg):
+        projected_input_shapes.append(tuple(arg.shape))
+        assert arg.ndim == 3
+        return original_k(arg)
+
+    def v_spy(arg):
+        projected_input_shapes.append(tuple(arg.shape))
+        assert arg.ndim == 3
+        return original_v(arg)
+
+    def forbidden_gather(*args, **kwargs):
+        raise AssertionError("Triton sourcewise must not use eager per-candidate gather rows")
+
+    monkeypatch.setattr(block.k_proj, "forward", k_spy)
+    monkeypatch.setattr(block.v_proj, "forward", v_spy)
+    monkeypatch.setattr(block, "_gather_source_rows", forbidden_gather)
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
+
+    with torch.no_grad():
+        out, telemetry = block.forward_sourcewise(
+            x,
+            metadata.cand_token_indices,
+            metadata.cand_types,
+            metadata.cand_sources,
+            metadata.cand_mask,
+            l3_states=l3,
+            cand_scores=metadata.cand_scores,
+        )
+
+    torch.cuda.synchronize()
+    assert metadata.cand_states.numel() == 0
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert telemetry["dsqg_w_triton_sourcewise"].item() == 1.0
+    assert projected_input_shapes
+    assert all(len(shape) == 3 for shape in projected_input_shapes)
+
+
+def test_triton_sourcewise_training_backward_is_explicitly_unsupported(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607013)
+    config = DSQGWConfig(
+        d=20,
+        n_heads=4,
+        max_candidates=8,
+        local_offsets=(1,),
+        long_offsets=(),
+        k_question=2,
+        k_hisa_evidence=2,
+        k_l3_skip=1,
+        k_chunk=0,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=9)
+    x.requires_grad_(True)
+    l3.requires_grad_(True)
+    block = DSQGWBlock.from_config(config).cuda()
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
+
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        block.forward_sourcewise(
+            x,
+            metadata.cand_token_indices,
+            metadata.cand_types,
+            metadata.cand_sources,
+            metadata.cand_mask,
+            l3_states=l3,
+            cand_scores=metadata.cand_scores,
+        )
 
 
 def test_vectorized_candidate_provider_skips_unused_summary_gather(monkeypatch) -> None:

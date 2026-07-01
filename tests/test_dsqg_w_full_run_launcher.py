@@ -88,6 +88,21 @@ def test_full_run_launcher_can_enable_sourcewise_env(tmp_path: Path) -> None:
     )
 
     assert cfg["env"]["DWARF_DSQG_W_SOURCEWISE"] == "1"
+    assert cfg["env"]["DWARF_DSQG_W_TRITON_SOURCEWISE"] == "0"
+
+
+def test_full_run_launcher_can_enable_triton_sourcewise_prototype_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "triton_sourcewise_run",
+        run_name="triton_sourcewise_unit",
+        sourcewise=True,
+        triton_sourcewise=True,
+    )
+
+    assert cfg["env"]["DWARF_DSQG_W_SOURCEWISE"] == "1"
+    assert cfg["env"]["DWARF_DSQG_W_TRITON_SOURCEWISE"] == "1"
 
 
 def test_full_run_launcher_can_disable_dsqg_w_for_backbone_controls(tmp_path: Path) -> None:

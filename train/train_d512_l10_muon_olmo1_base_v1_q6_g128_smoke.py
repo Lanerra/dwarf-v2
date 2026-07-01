@@ -348,6 +348,7 @@ def _parse_int_tuple_env(name, default):
 
 DSQG_W_ENABLED = os.getenv('DWARF_DSQG_W', '0') == '1'
 DSQG_W_SOURCEWISE = os.getenv('DWARF_DSQG_W_SOURCEWISE', '0') == '1'
+DSQG_W_TRITON_SOURCEWISE = os.getenv('DWARF_DSQG_W_TRITON_SOURCEWISE', '0') == '1'
 DSQG_W_MAX_CANDIDATES = int(os.environ.get('DWARF_DSQG_W_MAX_CANDIDATES', '32'))
 DSQG_W_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_BOTTLENECK', '256'))
 DSQG_W_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_GATE_INIT', '-5.0'))
@@ -3476,6 +3477,7 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
             'dsqg_w': {
                 'enabled': DSQG_W_ENABLED,
                 'sourcewise': DSQG_W_SOURCEWISE,
+                'triton_sourcewise': DSQG_W_TRITON_SOURCEWISE,
                 'insertion': 'after_final_trunk_before_final_norm',
                 'max_candidates': DSQG_W_MAX_CANDIDATES,
                 'bottleneck': DSQG_W_BOTTLENECK,
@@ -4041,6 +4043,7 @@ def train():
         print(f'  DSQG-W recomposer sites={site_text}: enabled J<={DSQG_W_MAX_CANDIDATES} '
               f'bottleneck={DSQG_W_BOTTLENECK} gate_init={DSQG_W_GATE_INIT} '
               f'fuse_init_std={DSQG_W_FUSE_INIT_STD} sourcewise={DSQG_W_SOURCEWISE} '
+              f'triton_sourcewise={DSQG_W_TRITON_SOURCEWISE} '
               f'width_cell={DSQG_W_WIDTH_CELL} width_bottleneck={DSQG_W_WIDTH_BOTTLENECK} '
               f'width_gate_init={DSQG_W_WIDTH_GATE_INIT} width_aux_weight={DSQG_W_WIDTH_AUX_WEIGHT} '
               f'width_entropy_floor={DSQG_W_WIDTH_ENTROPY_FLOOR} width_entropy_weight={DSQG_W_WIDTH_ENTROPY_WEIGHT} '

@@ -40,6 +40,7 @@ def build_run_config(
     gate_init: float = -2.5,
     fuse_init_std: float = 0.02,
     sourcewise: bool = False,
+    triton_sourcewise: bool = False,
     width_cell: bool = False,
     width_bottleneck: int = 64,
     width_gate_init: float = -2.5,
@@ -66,6 +67,7 @@ def build_run_config(
     stdout_path = out / "trainer.stdout.log"
     stderr_path = out / "trainer.stderr.log"
     py = str(python or sys.executable)
+    sourcewise = bool(sourcewise or triton_sourcewise)
     env: dict[str, str] = {
         "CUDA_VISIBLE_DEVICES": str(gpu),
         "PYTHONPATH": ".",
@@ -88,6 +90,7 @@ def build_run_config(
         "DWARF_DSQG_W_GATE_INIT": str(float(gate_init)),
         "DWARF_DSQG_W_FUSE_INIT_STD": str(float(fuse_init_std)),
         "DWARF_DSQG_W_SOURCEWISE": "1" if sourcewise else "0",
+        "DWARF_DSQG_W_TRITON_SOURCEWISE": "1" if triton_sourcewise else "0",
         "DWARF_DSQG_W_WIDTH_CELL": "1" if width_cell else "0",
         "DWARF_DSQG_W_WIDTH_BOTTLENECK": str(int(width_bottleneck)),
         "DWARF_DSQG_W_WIDTH_GATE_INIT": str(float(width_gate_init)),
@@ -190,6 +193,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gate-init", type=float, default=-2.5)
     parser.add_argument("--fuse-init-std", type=float, default=0.02)
     parser.add_argument("--sourcewise", action="store_true", help="Enable opt-in source-wise DSQG-W score/read accumulation.")
+    parser.add_argument(
+        "--triton-sourcewise",
+        action="store_true",
+        help="Enable the forward-only Triton DSQG-W sourcewise prototype; requires --sourcewise and is not a training/backward path.",
+    )
     parser.add_argument("--width-cell", action="store_true", help="Enable the opt-in DSQG-W candidate lateral width cell.")
     parser.add_argument("--width-bottleneck", type=int, default=64)
     parser.add_argument("--width-gate-init", type=float, default=-2.5)
@@ -236,6 +244,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         gate_init=args.gate_init,
         fuse_init_std=args.fuse_init_std,
         sourcewise=args.sourcewise,
+        triton_sourcewise=args.triton_sourcewise,
         width_cell=args.width_cell,
         width_bottleneck=args.width_bottleneck,
         width_gate_init=args.width_gate_init,
