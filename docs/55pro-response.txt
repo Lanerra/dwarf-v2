@@ -1,0 +1,277 @@
+According to the July 1, 2026 DSQG-W measurement notes, the compact-read kernel is no longer the dominant throughput problem: standalone Triton compact-read true backward is faster than dense DSQG-W, while full-trainer Triton DSQG-W remains close to dense-W speed and far from the no-W baseline. The optimization target should move up one level: per-site W integration, metadata/packing, launch fragmentation, and read-slot/read-mix traffic.
+
+## Verdict
+
+**Do not port V20 overlap-slab wholesale.** For the current `DSR_SELECTED_QUESTION_L3_SKIP_NULL` path, fixed-offset slab geometry has not been proven and is unlikely to hold globally. The code builds QUESTION, HISA/DSR, L3_SKIP, LOCAL/LONG, CHUNK, and NULL candidates through token metadata, then deduplicates and sorts by priority, score, token, and source; metadata mode deliberately avoids `[B,T,J,D]` state materialization but still uses arbitrary token indices.   V20 itself warns that overlap-slab only wins when offsets cluster; otherwise baseline rowwise traversal is cheaper, and the DSQG-W V20 scheduling note explicitly says not to assume V20 fixed-offset topology over arbitrary DSQG-W metadata.
+
+The concrete path to higher throughput is: **profile per-site W integration, cache/reuse candidate metadata where legal, remove unnecessary source/projection/control overhead, reduce read-slot traffic, then consider a fixed-offset subset kernel only after a geometry audit proves it.**
+
+---
+
+## 1. Ranked bottleneck diagnosis
+
+### 1) Per-site DSQG-W PyTorch integration is the top suspect
+
+The DSQG-W block is not just the compact read kernel. Each site still performs `norm_x`, `q_proj`, source `norm_c/k_proj/v_proj`, role/source embeddings and biases, query-type bias, read-mix, `z = [x, read, x*read, read-x]`, `norm_z`, fuse MLP, gate, and their backward graphs. The block definition includes the main outside-kernel layers: `norm_x`, `norm_c`, `q_proj`, `k_proj`, `v_proj`, embeddings/biases, `query_type_bias`, `read_mix`, `norm_z`, and `fuse`.  The Triton path still computes query projection and source projection cache in PyTorch before entering the compact-read kernel.  After the Triton read, it still applies read-mix linears, concatenation, norm, fuse MLP, sigmoid gate, and residual in PyTorch.
+
+**Predicted signature:** `torch.profiler` shows substantial CUDA time in `native_layer_norm`, `addmm/mm`, GELU backward, `cat`, elementwise `mul/sub`, and read_mix/fuse gradients. The compact read kernel is visible but not dominant. Dense-W and Triton-W are close in trainer timing because they share most of this integration work.
+
+### 2) The three-site multiplier is probably the largest simple multiplier
+
+The launcher default is `sites="2,6,final"` with `J<=16`, bottleneck 64, and DSR/question/L3 evidence enabled.  The trainer applies DSQG-W at layer sites during the trunk and again at the final site when configured.   Tests also assert the configured multi-site path is `layer_2, layer_6, final`.
+
+**Predicted signature:** `--sites final`, `--sites 6,final`, and `--sites 2,6,final` scale roughly additively. If one site costs ~80–100 ms steady, three sites explain most of the ~250–290 ms DSQG-W overhead over the no-W baseline.
+
+### 3) Candidate metadata build/packing is a serious open suspect
+
+In sourcewise mode, `_apply_dsqg_w_recomposer` calls `CandidateProvider.build_metadata(...)` per site, then passes token/type/source/mask/scores into `forward_sourcewise`.  The vectorized provider still constructs raw token/type/source/valid/score tensors, adds null fallback, performs pairwise duplicate checks, builds a float64 sort key, runs `argsort`, and gathers the selected `J` slots.  It avoids candidate state materialization when `materialize_states=False`, but the metadata work remains.
+
+The DSR-selected path is especially important: after the DSR layer, the trainer pulls `_last_token_idx_packed` and `_last_token_scores_packed` from HISA and packs them for DSQG-W.  Tests explicitly verify that DSQG-W packs actual DSR-selected candidates for W, not merely fallback offsets.
+
+**Predicted signature:** profiler rows show `aten::cat`, `aten::where`, comparisons, `amin/amax`, `argsort`, `gather`, and possible CPU syncs from `bool(tensor.any())`. Disabling DSR candidates or caching metadata across sites changes step time more than changing compact-read scheduling.
+
+### 4) Autograd and launch fragmentation around W likely matters at batch size 1
+
+The eager sourcewise path loops over candidate slots and sources in Python/Torch, but even the Triton path retains many small PyTorch operations around one custom autograd node. The sourcewise fallback loops over `j_count` for scores and reads, with source masks and gathers per candidate.   The Triton path is better, but it still has separate kernels for projection, compact read, read_mix, concat/norm/fuse, and their backward.
+
+**Predicted signature:** Nsight Systems shows many short kernels and host gaps around each DSQG-W site. CPU self-time and kernel launch count are high relative to math. Static-shape CUDA Graphs or targeted `torch.compile` on the W integration reduce time even if compact-read kernel time is unchanged.
+
+### 5) Inside the compact-read kernel, source atomics and read-slot traffic are the next local bottleneck
+
+The current true backward saves LSE, recomputes scores/probabilities, and accumulates `dQ`, source-projected `dK/dV`, role/source key grads, type/source bias grads, and query-type-bias grads.  The measurement note says the next local bottleneck is no longer backward probability materialization; it is direct atomic pressure plus compact read-slot storage bandwidth.  The Triton telemetry confirms compact read slots are materialized and read-mix is not fused.
+
+**Predicted signature:** microbench-only improvements from reducing atomics or read slots, but smaller full-trainer gains unless per-site PyTorch work is also reduced.
+
+### 6) Split backward is useful for profiling, not for default speed
+
+The split mode launches query and source kernels separately, but the measurement note shows it is slower because it recomputes score/probability twice.  The code keeps fused monolithic launch as default and only enables split through `DWARF_DSQG_W_TRITON_BACKWARD_ORGANIZATION=v20_split`.
+
+**Predicted signature:** split mode shows `dsqg_w_triton_score_recompute_blocks=2.0`, more compact-read backward time, and no trainer win.
+
+---
+
+## 2. Minimal profiler plan
+
+Add NVTX or `record_function` ranges at these boundaries:
+
+```text
+step
+  forward_trunk
+    dsqg_w/site=layer_2
+      candidate_metadata_build
+      source_projection_cache
+      compact_read_forward
+      read_mix
+      fuse_norm_mlp_gate
+    dsqg_w/site=layer_6
+      ...
+    dsqg_w/site=final
+      ...
+  loss
+  backward
+    compact_read_backward
+    read_mix_backward
+    fuse_backward
+    source_projection_backward
+  optimizer_step
+```
+
+The smallest useful profiler run is a 3×3 matrix:
+
+```bash
+# Site scaling
+--disable-dsqg-w
+--triton-sourcewise --sites final
+--triton-sourcewise --sites 6,final
+--triton-sourcewise --sites 2,6,final
+
+# Metadata/DSR isolation
+--triton-sourcewise --no-dsr-candidates
+--triton-sourcewise              # DSR_SELECTED path
+
+# Kernel organization
+--triton-sourcewise
+DWARF_DSQG_W_TRITON_BACKWARD_ORGANIZATION=v20_split --triton-sourcewise
+```
+
+Use:
+
+```python
+with torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA],
+    schedule=torch.profiler.schedule(wait=2, warmup=2, active=3, repeat=1),
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=False,
+    on_trace_ready=torch.profiler.tensorboard_trace_handler("traces/dsqg_w"),
+) as prof:
+    for step in range(num_steps):
+        train_step()
+        prof.step()
+```
+
+For Nsight:
+
+```bash
+nsys profile -t cuda,nvtx,osrt -o traces/dsqg_w_sites3 \
+  env DWARF_BENCH_ONLY=1 PYTHONPATH=. \
+  /home/dlewis3/Desktop/AI/DWARF/.venv/bin/python \
+  scripts/run_dsqg_w_full_training.py \
+  --max-acc-steps 8 --train-seqs 16 --val-seqs 4 \
+  --batch-size 1 --grad-accum 1 --passkey-trials 0 \
+  --execute --triton-sourcewise
+```
+
+Add a **candidate geometry audit** to `CandidateProvider.build_metadata` or the trainer call site:
+
+```python
+# For each site and each selected slot j:
+pos = torch.arange(N, device=tokens.device).view(1, N)
+delta = pos[..., None] - cand_token_indices  # [B,N,J]
+valid = cand_mask & (cand_token_indices >= 0)
+
+# Emit per slot:
+# - source/type constancy
+# - unique delta count
+# - mode delta fraction
+# - min/max delta and spread per BLOCK_N=64 window
+# - whether token == position - fixed_delta except prefix invalids
+```
+
+Only call a slot “fixed-offset” if, excluding prefix invalids, `delta[:, :, j]` has exactly one value and `(type, source)` are constant. Only call a group “slab-compatible” if all slots in the group have bounded spread per query block and stable source layout.
+
+---
+
+## 3. PR-sized optimization plan
+
+### PR 0 — Instrumentation and geometry audit
+
+Add `DWARF_PROFILE_DSQG_W=1` ranges and telemetry:
+
+```text
+dsqg_w/{site}/metadata_ms
+dsqg_w/{site}/source_proj_ms
+dsqg_w/{site}/compact_read_ms
+dsqg_w/{site}/read_mix_ms
+dsqg_w/{site}/fuse_ms
+dsqg_w/{site}/geometry_fixed_slots
+dsqg_w/{site}/geometry_slab_groups
+```
+
+Correctness tests: telemetry-only forward parity; no output change; existing trainer smoke; geometry audit must not touch autograd.
+
+### PR 1 — Cache metadata across legal sites
+
+Right now `_apply_dsqg_w_recomposer` rebuilds metadata per site in sourcewise mode.  Candidate token/type/source/mask ordering is independent of the current hidden values when `cand_states` are not materialized; it depends on sequence positions, question indices, HISA/DSR selected indices/scores, L3 skip indices, config, and causal masking. Cache metadata once per compatible phase and reuse it across sites.
+
+Important caveat: layer sites before DSR cannot use DSR-selected evidence that does not exist yet. Use at least two cache domains: pre-DSR metadata and post-DSR metadata. The trainer already obtains DSR-selected indices after the DSR layer.
+
+Expected signature: removes repeated `argsort/gather/where/cat` metadata cost. If metadata is a top-3 contributor, expect a meaningful trainer win without changing math.
+
+Correctness tests: candidate metadata equality against uncached per-site build; forward parity; grad parity; site-order parity harness for `layer_2,layer_6,final`; causality/prefix perturbation; no `[B,N,J,D]` materialization; trainer smoke.
+
+### PR 2 — Static source-set and no-sync source projection path
+
+`_source_projection_cache` can project only needed source bases, but the Triton path determines needed sources using `bool(((cand_sources == source) & cand_mask).any())`, which can induce synchronization and per-call dynamic control.  Replace this with a static source set derived from the candidate path/config or cached metadata summary, not a live tensor `.any()` in the hot path.
+
+Expected signature: fewer CPU stalls and fewer small ops around each W site.
+
+Correctness tests: source mass telemetry parity; final/L3/HISA/SUMMARY/NULL cases; DSR-selected path; forward/grad parity; no forbidden materialization.
+
+### PR 3 — Compact active read slots
+
+The current fast path materializes compact read slots `[B,N,S,D]`, where `S=1+len(read_type_ids)`, then applies one `F.linear` per slot into the full `read_mix` weight.   The benchmark note reports `S=5` and ~2.6 MB of fp32 compact slots for the small `N=256` bench; at trainer `N=2048`, this scales directly.
+
+Specialize `read_type_ids` per config or per cached metadata active type set. Absent types contribute exactly zero, so skipping their slots preserves semantics.
+
+Expected signature: lower read-slot memory bandwidth and fewer read_mix GEMMs.
+
+Correctness tests: forward/grad parity for every candidate type; absent-type batch parity; `read_mix.weight.grad` parity; no `[B,N,J,H]` probs; no `[B,N,J,D]` states; trainer smoke.
+
+### PR 4 — Fuse compact read with read_mix
+
+This is the first high-value fusion boundary. Instead of producing `[B,N,S,D]` and then applying `read_mix`, the Triton forward can accumulate directly into `read [B,N,D]` using the relevant all-slot and typed-slot read_mix weight slices. The older score/read kernel already has a fused-read-mix style boundary, while the current compact read-slots path explicitly reports `dsqg_w_triton_read_mix_fused=0.0`.
+
+Backward should either compute `d_read_mix` inside the same custom autograd boundary or use a bounded reduction buffer for read_mix gradients. Keep the existing slot path behind an env flag until parity is stable.
+
+Expected signature: removes read-slot write/read traffic and separate read_mix backward kernels.
+
+Correctness tests: forward parity versus current Triton; grad parity for `q_proj`, `k_proj`, `v_proj`, role/source embeddings, type/source bias, query-type-bias, `read_mix.weight`, `norm_z`, fuse weights, and gate; non-power-of-two HD coverage; no forbidden materialization; trainer smoke.
+
+### PR 5 — Two-stage bounded reductions for small parameter atomics
+
+The current backward allocates grad buffers and the kernel directly accumulates grads for source K/V and small embedding/bias/query-type-bias parameters.  The measurement note specifically calls out direct atomic pressure as the next local bottleneck.  Use bounded per-block reductions for role/source key, type/source bias, and query-type-bias. Leave source K/V atomics alone initially unless profiling proves they dominate.
+
+Expected signature: microbench backward improves; full trainer improves only if compact-read backward is still a substantial share after PRs 1–4.
+
+Correctness tests: grad parity with relaxed atomic tolerances; no backward probs; no `[B,N,J,D]`; bounded buffer telemetry; stress repeated candidate collisions; trainer smoke.
+
+### PR 6 — Compile or graph the stable W integration path
+
+Once dynamic `.any()` and metadata rebuilds are removed, try `torch.compile` on only DSQGWBlock integration or a CUDA graph for the fixed-shape bench-only trainer window. The launcher currently forces `DWARF_TORCH_COMPILE=0`, so this should be a separate opt-in experiment.
+
+Expected signature: fewer CPU gaps and lower launch overhead without changing individual kernel math.
+
+Correctness tests: forward/grad parity eager vs compiled; cache invalidation across site count and DSR/no-DSR modes; trainer smoke; no silent graph capture of stale metadata.
+
+### PR 7 — Fixed-offset subset kernel only after geometry proof
+
+Add a hybrid kernel only for slots that pass the geometry audit. Candidate subsets that may pass: local offsets, long offsets, fallback HISA offsets, and L3 skip offsets. Current launcher defaults local/long offsets to `none`, enables DSR candidates, question, HISA_L3, and L3 skip.   QUESTION and DSR-selected slots should be treated as arbitrary unless the audit proves otherwise.
+
+Expected signature: useful only if fixed-offset slots are a large fraction of mass/time. It is not a route to 20K tok/s by itself.
+
+Correctness tests: mixed fixed/arbitrary slot parity; candidate ordering preservation; prefix consistency; no future token access; no forbidden materialization; trainer smoke.
+
+---
+
+## 4. V20 overlap-slab verdict
+
+**Do not port it as the next main optimization.** The evidence says the compact-read kernel is already good: microbench default monolithic Triton is `3.996 ms` fwd+bwd versus dense `5.509 ms`, and split is slower at `4.268 ms` because it recomputes score/probability twice.  In the trainer, Triton is near dense-W speed (`5293 tok/s` vs dense `5638 tok/s`) but both are far below the no-W baseline you measured.  That gap cannot be explained by the compact read kernel alone.
+
+The right fusion boundary is **DSQG-W integration**, not a wholesale V20 slab:
+
+* cache candidate metadata,
+* remove dynamic source-set syncs,
+* reduce/fuse compact read slots and read_mix,
+* reduce small-parameter atomics,
+* only then implement fixed-offset subset slab if geometry audit proves reusable offsets.
+
+A valid slab port requires a per-slot proof like:
+
+```text
+for every valid row n in slot j:
+    cand_token_indices[b,n,j] == n - fixed_delta[j]
+and cand_sources[b,n,j], cand_types[b,n,j] are constant,
+except prefix invalid rows.
+```
+
+For grouped slab reuse, also require:
+
+```text
+max(delta_group) - min(delta_group) <= slab_threshold
+within each query block, with stable slot ordering.
+```
+
+Current DSR-selected metadata is packed from HISA-selected token indices and scores, so it should be assumed arbitrary until measured.
+
+---
+
+## 5. Correctness gate matrix
+
+| Change                   | Required tests                                                                                                                                                                              |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Instrumentation          | Forward parity with profiling off/on; telemetry presence; no added synchronization in default mode.                                                                                         |
+| Metadata cache           | Candidate token/type/source/mask/scores equality versus uncached; forward parity; grad parity; causality/prefix perturbation; multi-site parity for `layer_2,layer_6,final`; trainer smoke. |
+| Static source set        | Source mass telemetry parity; final/L3/HISA/SUMMARY/NULL source coverage; forward/grad parity; no `[B,N,J,D]` or projected `[B,N,J,H,HD]`.                                                  |
+| Active read slots        | Forward parity for all candidate type combinations; `read_mix.weight.grad` parity; no probs in no-routing mode; no candidate state materialization; trainer smoke.                          |
+| Read_mix fusion          | Forward parity; full parameter grad parity; non-power-of-two HD test; no `[B,N,S,D]` in fused mode; no `[B,N,J,H]` backward probs; trainer smoke.                                           |
+| Two-stage reductions     | Grad parity with atomic tolerances; stress duplicate tokens and sources; bounded reduction buffer telemetry; no forbidden materialization; trainer smoke.                                   |
+| Fixed-offset subset slab | Geometry audit test; mixed fixed/arbitrary candidate parity; candidate ordering preservation; prefix consistency; no future access; trainer smoke.                                          |
+| Compile/CUDA graph       | Eager vs compiled/graph forward and grad parity; metadata cache invalidation; site-count variants; trainer smoke.                                                                           |
+
+The existing test suite already covers many critical invariants: true compact-read backward must not materialize backward probs and must match gradients for the relevant parameters; no-routing Triton must avoid routing probs/read_accum and expose compact-read-slot telemetry; and the parity harness checks all configured W sites.
+
+## Bottom line
+
+The remaining DSQG-W overhead is very likely dominated by **three repeated W integration blocks**, not by the compact read kernel. The first high-confidence work items are profiler ranges, metadata caching, static source-set removal of syncs, and read-slot/read_mix fusion. V20 overlap-slab should only be a later hybrid path for audited fixed-offset subsets, not the main answer for `DSR_SELECTED_QUESTION_L3_SKIP_NULL`.

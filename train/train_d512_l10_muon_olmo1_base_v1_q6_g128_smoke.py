@@ -266,6 +266,12 @@ SCREEN_EPOCHS  = int(os.environ.get('DWARF_EPOCHS', '2'))
 TRAIN_LOG_INTERVAL = int(os.environ.get('DWARF_LOG_INTERVAL', '100'))
 MAX_ACC_STEPS = int(os.environ.get('DWARF_MAX_ACC_STEPS', '0'))
 BENCH_ONLY = os.getenv('DWARF_BENCH_ONLY', '0') == '1'
+PROFILE_DSQG_W = os.getenv('DWARF_PROFILE_DSQG_W', '0') == '1'
+PROFILE_DSQG_W_TRACE_DIR = os.getenv('DWARF_PROFILE_DSQG_W_TRACE_DIR', 'traces/dsqg_w')
+PROFILE_DSQG_W_TABLE = os.getenv('DWARF_PROFILE_DSQG_W_TABLE', '')
+PROFILE_DSQG_W_WAIT = int(os.environ.get('DWARF_PROFILE_DSQG_W_WAIT', '1'))
+PROFILE_DSQG_W_WARMUP = int(os.environ.get('DWARF_PROFILE_DSQG_W_WARMUP', '1'))
+PROFILE_DSQG_W_ACTIVE = int(os.environ.get('DWARF_PROFILE_DSQG_W_ACTIVE', '3'))
 _compile_env = os.getenv('DWARF_TORCH_COMPILE')
 if _compile_env is None:
     # Custom Triton/autograd + checkpointing paths are benchmark axes, not a safe default.
@@ -430,6 +436,12 @@ DSQG_W_SITE_SPECS = _parse_dsqg_w_site_specs(os.getenv('DWARF_DSQG_W_SITES'))
 
 def _dsqg_w_site_key(site):
     return 'final' if site == 'final' else f'layer_{int(site)}'
+
+
+def _profile_range(name):
+    if PROFILE_DSQG_W:
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
 
 
 def _dsqg_w_candidate_path_label():
@@ -3036,6 +3048,7 @@ class TriadicJ96Dsr(nn.Module):
         }
         self.dsqg_w_has_final_site = 'final' in self.dsqg_w_site_specs
         self.dsqg_w_last_telemetry = {}
+        self._dsqg_w_metadata_cache = {}
         self._init_weights(scale_embed_init_val)
         if self.dsqg_w_enabled:
             self.dsqg_w_config = DSQGWConfig(
@@ -3189,6 +3202,68 @@ class TriadicJ96Dsr(nn.Module):
             max_candidates=int(DSQG_W_K_HISA_EVIDENCE),
         )
 
+    @staticmethod
+    def _dsqg_w_tensor_cache_key(tensor):
+        if tensor is None:
+            return None
+        return (
+            int(tensor.data_ptr()),
+            tuple(tensor.shape),
+            str(tensor.dtype),
+            str(tensor.device),
+        )
+
+    def _dsqg_w_metadata_cache_key(
+        self,
+        x,
+        *,
+        question_indices=None,
+        hisa_evidence_indices=None,
+        hisa_evidence_scores=None,
+        l3_skip_indices=None,
+    ):
+        return (
+            tuple(x.shape),
+            str(x.dtype),
+            str(x.device),
+            self._dsqg_w_tensor_cache_key(question_indices),
+            self._dsqg_w_tensor_cache_key(hisa_evidence_indices),
+            self._dsqg_w_tensor_cache_key(hisa_evidence_scores),
+            self._dsqg_w_tensor_cache_key(l3_skip_indices),
+        )
+
+    def _get_or_build_dsqg_w_metadata(
+        self,
+        x,
+        *,
+        l3_states=None,
+        question_indices=None,
+        hisa_evidence_indices=None,
+        hisa_evidence_scores=None,
+        l3_skip_indices=None,
+    ):
+        key = self._dsqg_w_metadata_cache_key(
+            x,
+            question_indices=question_indices,
+            hisa_evidence_indices=hisa_evidence_indices,
+            hisa_evidence_scores=hisa_evidence_scores,
+            l3_skip_indices=l3_skip_indices,
+        )
+        cached = self._dsqg_w_metadata_cache.get(key)
+        if cached is not None:
+            return cached, True
+        with _profile_range('dsqg_w/candidate_metadata_build'):
+            candidates = self.dsqg_w_candidate_provider.build_metadata(
+                x,
+                l3_states=l3_states,
+                question_indices=question_indices,
+                hisa_evidence_indices=hisa_evidence_indices,
+                hisa_evidence_scores=hisa_evidence_scores,
+                l3_skip_indices=l3_skip_indices,
+            )
+        self._dsqg_w_metadata_cache[key] = candidates
+        return candidates, False
+
     def _apply_dsqg_w_recomposer(
         self,
         x,
@@ -3208,44 +3283,49 @@ class TriadicJ96Dsr(nn.Module):
         if site_key not in self.dsqg_w_blocks:
             return x
         block = self.dsqg_w_blocks[site_key]
-        if self.dsqg_w_sourcewise_enabled:
-            candidates = self.dsqg_w_candidate_provider.build_metadata(
-                x,
-                l3_states=l3_states,
-                question_indices=question_indices,
-                hisa_evidence_indices=hisa_evidence_indices,
-                hisa_evidence_scores=hisa_evidence_scores,
-                l3_skip_indices=l3_skip_indices,
-            )
-            x_out, telemetry = block.forward_sourcewise(
-                x,
-                candidates.cand_token_indices,
-                candidates.cand_types,
-                candidates.cand_sources,
-                candidates.cand_mask,
-                l3_states=l3_states,
-                cand_scores=candidates.cand_scores,
-            )
-        else:
-            candidates = self.dsqg_w_candidate_provider.build(
-                x,
-                l3_states=l3_states,
-                question_indices=question_indices,
-                hisa_evidence_indices=hisa_evidence_indices,
-                hisa_evidence_scores=hisa_evidence_scores,
-                l3_skip_indices=l3_skip_indices,
-            )
-            x_out, telemetry = block(
-                x,
-                candidates.cand_states,
-                candidates.cand_types,
-                candidates.cand_sources,
-                candidates.cand_mask,
-                cand_scores=candidates.cand_scores,
-            )
+        with _profile_range(f'dsqg_w/site={site_key}'):
+            if self.dsqg_w_sourcewise_enabled:
+                candidates, metadata_cache_hit = self._get_or_build_dsqg_w_metadata(
+                    x,
+                    l3_states=l3_states,
+                    question_indices=question_indices,
+                    hisa_evidence_indices=hisa_evidence_indices,
+                    hisa_evidence_scores=hisa_evidence_scores,
+                    l3_skip_indices=l3_skip_indices,
+                )
+                x_out, telemetry = block.forward_sourcewise(
+                    x,
+                    candidates.cand_token_indices,
+                    candidates.cand_types,
+                    candidates.cand_sources,
+                    candidates.cand_mask,
+                    l3_states=l3_states,
+                    cand_scores=candidates.cand_scores,
+                    needed_source_ids=candidates.active_source_ids,
+                )
+            else:
+                with _profile_range('dsqg_w/candidate_materialized_build'):
+                    candidates = self.dsqg_w_candidate_provider.build(
+                        x,
+                        l3_states=l3_states,
+                        question_indices=question_indices,
+                        hisa_evidence_indices=hisa_evidence_indices,
+                        hisa_evidence_scores=hisa_evidence_scores,
+                        l3_skip_indices=l3_skip_indices,
+                    )
+                metadata_cache_hit = False
+                x_out, telemetry = block(
+                    x,
+                    candidates.cand_states,
+                    candidates.cand_types,
+                    candidates.cand_sources,
+                    candidates.cand_mask,
+                    cand_scores=candidates.cand_scores,
+                )
         merged_telemetry = dict(candidates.telemetry)
         merged_telemetry.update(telemetry)
         merged_telemetry['dsqg_w_site_key'] = site_key
+        merged_telemetry['dsqg_w_metadata_cache_hit'] = x.new_tensor(1.0 if metadata_cache_hit else 0.0).detach()
         self.dsqg_w_last_telemetry = merged_telemetry
         return x_out
 
@@ -3257,6 +3337,7 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_hisa_evidence_indices=None,
         dsqg_w_l3_skip_indices=None,
     ):
+        self._dsqg_w_metadata_cache = {}
         if self.dsqg_w_enabled:
             trunk_out, l3_state, dsr_hisa_indices, dsr_hisa_scores = self._forward_trunk(
                 idx,
@@ -3293,6 +3374,7 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_hisa_evidence_indices=None,
         dsqg_w_l3_skip_indices=None,
     ):
+        self._dsqg_w_metadata_cache = {}
         if self.dsqg_w_enabled:
             trunk_out, l3_state, dsr_hisa_indices, dsr_hisa_scores = self._forward_trunk(
                 idx,
@@ -3898,6 +3980,47 @@ def _dsqg_w_width_aux_value(*models):
     return None
 
 
+def _start_dsqg_w_profiler():
+    if not PROFILE_DSQG_W:
+        return None
+    os.makedirs(PROFILE_DSQG_W_TRACE_DIR, exist_ok=True)
+    print(
+        f'  [DSQG-W profile] enabled trace_dir={PROFILE_DSQG_W_TRACE_DIR} '
+        f'wait={PROFILE_DSQG_W_WAIT} warmup={PROFILE_DSQG_W_WARMUP} active={PROFILE_DSQG_W_ACTIVE}',
+        flush=True,
+    )
+    profiler = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(
+            wait=PROFILE_DSQG_W_WAIT,
+            warmup=PROFILE_DSQG_W_WARMUP,
+            active=PROFILE_DSQG_W_ACTIVE,
+            repeat=1,
+        ),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(PROFILE_DSQG_W_TRACE_DIR),
+    )
+    profiler.start()
+    return profiler
+
+
+def _finish_dsqg_w_profiler(profiler):
+    if profiler is None:
+        return None
+    profiler.stop()
+    sort_by = 'cuda_time_total' if torch.cuda.is_available() else 'self_cpu_time_total'
+    table = profiler.key_averages().table(sort_by=sort_by, row_limit=80)
+    table_path = PROFILE_DSQG_W_TABLE or os.path.join(PROFILE_DSQG_W_TRACE_DIR, 'key_averages.txt')
+    os.makedirs(os.path.dirname(table_path) or '.', exist_ok=True)
+    with open(table_path, 'w', encoding='utf-8') as f:
+        f.write(table)
+        f.write('\n')
+    print(f'  [DSQG-W profile] key averages: {table_path}', flush=True)
+    return table_path
+
+
 @torch.inference_mode()
 def evaluate(model, data, device, loss_mask=None):
     model.eval()
@@ -4237,6 +4360,7 @@ def train():
     best_val_loss = float('inf')
     passkey_results = {}
     ppl_results = {}
+    dsqg_w_profiler = _start_dsqg_w_profiler()
 
     if USE_LIGER_CE:
         liger_ce_fn = LigerFusedLinearCrossEntropyLoss(accum_dtype=torch.float32)
@@ -4370,6 +4494,8 @@ def train():
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+            if dsqg_w_profiler is not None:
+                dsqg_w_profiler.step()
             step += 1
 
             step_ms = (time.time() - t0) * 1000
@@ -4421,6 +4547,10 @@ def train():
                         ('dsqg_w_candidate_score_bias_norm', 'w_score'),
                         ('dsqg_w_candidate_score_mean', 'w_smean'),
                         ('dsqg_w_typed_mixer_gate_mean', 'w_mix_gate'),
+                        ('dsqg_w_metadata_cache_hit', 'w_cache'),
+                        ('dsqg_w_static_source_count', 'w_srcs'),
+                        ('dsqg_w_geometry_fixed_slots', 'w_fixed'),
+                        ('dsqg_w_geometry_slab_candidate_slots', 'w_slab'),
                     ]:
                         _val = _tel_float(_name)
                         if _val is not None and math.isfinite(_val):
@@ -4467,6 +4597,7 @@ def train():
                       f'prob_scratch={int(bool(report.get("stage_f3_split_movt_prob_scratch_enabled", False)))} '
                       f'pair_direct={int(bool(report.get("stage_f3_sidecar_pair_direct_enabled", False)))} '
                       f'compression_vs_bf16={report.get("compression_vs_bf16", 0.0):.3f}')
+            _finish_dsqg_w_profiler(dsqg_w_profiler)
             return
 
         val_loss = evaluate(model, val_data, device, val_loss_mask)
@@ -4554,6 +4685,7 @@ def train():
         print(f'  Passkey mean={pk_mean * 100:.1f}%')
         print('  ' + format_passkey_results(pk))
 
+    _finish_dsqg_w_profiler(dsqg_w_profiler)
     elapsed_s = time.time() - t_start
     memory_mb = torch.cuda.max_memory_allocated() / 1e6
     passkey_final = passkey_results.get(SCREEN_EPOCHS, 0.0)

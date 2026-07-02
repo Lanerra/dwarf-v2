@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import IntEnum
 import torch
@@ -103,6 +104,80 @@ def _dsqg_w_triton_schedule(head_dim: int, device: torch.device | None = None) -
     return _DSQGWTritonSchedule(block_hd=block_hd, num_warps=base_warps, num_stages=num_stages)
 
 
+def _dsqg_w_profile_enabled() -> bool:
+    return os.getenv("DWARF_PROFILE_DSQG_W", "0") == "1"
+
+
+def _dsqg_w_geometry_audit_enabled() -> bool:
+    return os.getenv("DWARF_DSQG_W_GEOMETRY_AUDIT", "0") == "1" or _dsqg_w_profile_enabled()
+
+
+def _dsqg_w_profile_range(name: str):
+    if _dsqg_w_profile_enabled():
+        return torch.profiler.record_function(f"dsqg_w/{name}")
+    return nullcontext()
+
+
+def _dsqg_w_geometry_telemetry(
+    cand_token_indices: torch.Tensor,
+    cand_types: torch.Tensor,
+    cand_sources: torch.Tensor,
+    cand_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Lightweight candidate geometry audit for fixed-offset/slab eligibility.
+
+    Only called behind DWARF_DSQG_W_GEOMETRY_AUDIT/DWARF_PROFILE_DSQG_W because
+    unique/mode checks are diagnostic and may synchronize. Outputs are detached
+    tensors so telemetry never touches autograd.
+    """
+
+    if cand_token_indices.ndim != 3:
+        return {}
+    device = cand_token_indices.device
+    dtype = torch.float32
+    bsz, seq_len, j_count = cand_token_indices.shape
+    if j_count == 0:
+        zero = torch.zeros((), device=device, dtype=dtype)
+        return {
+            "dsqg_w_geometry_fixed_slots": zero,
+            "dsqg_w_geometry_fixed_slot_fraction": zero,
+            "dsqg_w_geometry_mode_delta_fraction": zero,
+            "dsqg_w_geometry_slab_candidate_slots": zero,
+        }
+    pos = torch.arange(seq_len, device=device, dtype=cand_token_indices.dtype).view(1, seq_len)
+    fixed_slots = 0
+    mode_fraction_total = 0.0
+    slab_candidate_slots = 0
+    for slot in range(int(j_count)):
+        valid = cand_mask[:, :, slot] & (cand_token_indices[:, :, slot] >= 0)
+        valid_count = int(valid.sum().detach().cpu().item())
+        if valid_count <= 0:
+            continue
+        delta = (pos - cand_token_indices[:, :, slot]).masked_select(valid)
+        source_vals = cand_sources[:, :, slot].masked_select(valid)
+        type_vals = cand_types[:, :, slot].masked_select(valid)
+        unique_delta, delta_counts = torch.unique(delta, return_counts=True)
+        unique_source = torch.unique(source_vals)
+        unique_type = torch.unique(type_vals)
+        max_count = int(delta_counts.max().detach().cpu().item()) if delta_counts.numel() else 0
+        mode_fraction_total += float(max_count) / float(valid_count)
+        is_const_source_type = unique_source.numel() == 1 and unique_type.numel() == 1
+        is_fixed = unique_delta.numel() == 1 and is_const_source_type
+        if is_fixed:
+            fixed_slots += 1
+        # A deliberately permissive first-pass slab proxy: mostly-one-delta slots
+        # with stable source/type are worth deeper Nsight/Triton treatment.
+        if is_const_source_type and (float(max_count) / float(valid_count)) >= 0.95:
+            slab_candidate_slots += 1
+    denom = float(max(int(j_count), 1))
+    return {
+        "dsqg_w_geometry_fixed_slots": torch.tensor(float(fixed_slots), device=device, dtype=dtype),
+        "dsqg_w_geometry_fixed_slot_fraction": torch.tensor(float(fixed_slots) / denom, device=device, dtype=dtype),
+        "dsqg_w_geometry_mode_delta_fraction": torch.tensor(mode_fraction_total / denom, device=device, dtype=dtype),
+        "dsqg_w_geometry_slab_candidate_slots": torch.tensor(float(slab_candidate_slots), device=device, dtype=dtype),
+    }
+
+
 @dataclass(frozen=True)
 class DSQGWConfig:
     d: int
@@ -175,9 +250,10 @@ class CandidateBatch:
     valid_candidate_count: torch.Tensor
     cand_scores: torch.Tensor | None = None
     telemetry: dict[str, torch.Tensor] = field(default_factory=dict)
-
+    active_source_ids: tuple[int, ...] = field(default_factory=tuple)
 
 class CandidateProvider:
+
     """Bounded causal heterogeneous candidate construction for DSQG-W.
 
     This is intentionally diagnostic and explicit, not fused.  It constructs only
@@ -297,6 +373,7 @@ class CandidateProvider:
         raw_sources: list[torch.Tensor] = []
         raw_valids: list[torch.Tensor] = []
         raw_scores: list[torch.Tensor] = []
+        active_source_ids: set[int] = set()
 
         def add(
             tokens: torch.Tensor,
@@ -305,6 +382,7 @@ class CandidateProvider:
             valid: torch.Tensor | None = None,
             score: torch.Tensor | None = None,
         ) -> None:
+            active_source_ids.add(int(source))
             tokens = tokens.to(device=device, dtype=torch.long)
             if tokens.ndim == 2:
                 tokens = tokens.unsqueeze(-1)
@@ -396,6 +474,7 @@ class CandidateProvider:
 
         had_valid = valid.any(dim=-1, keepdim=True)
         if self.config.null_fallback:
+            active_source_ids.add(int(CandidateSource.NULL))
             null_tokens = positions
             null_valid = ~had_valid
             tokens = torch.cat([tokens, null_tokens], dim=-1)
@@ -488,11 +567,21 @@ class CandidateProvider:
             "dsqg_w_valid_candidate_count": valid_count.float().mean(),
             "dsqg_w_candidate_score_mean": cand_scores.masked_select(cand_mask).mean() if cand_mask.any() else final_states.new_tensor(0.0),
             "dsqg_w_candidate_score_max": cand_scores.masked_select(cand_mask).max() if cand_mask.any() else final_states.new_tensor(0.0),
+            "dsqg_w_static_source_count": final_states.new_tensor(float(len(active_source_ids))),
         }
         mask_denom = cand_mask.float().sum().clamp_min(1.0)
         for ctype in CandidateType:
             mask = (cand_types == int(ctype)) & cand_mask
             telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
+        if _dsqg_w_geometry_audit_enabled():
+            telemetry.update(
+                _dsqg_w_geometry_telemetry(
+                    cand_token_indices,
+                    cand_types,
+                    cand_sources,
+                    cand_mask,
+                )
+            )
 
         return CandidateBatch(
             cand_states=cand_states,
@@ -503,6 +592,7 @@ class CandidateProvider:
             valid_candidate_count=valid_count,
             cand_scores=cand_scores,
             telemetry=telemetry,
+            active_source_ids=tuple(sorted(active_source_ids)),
         )
 
     @staticmethod
@@ -674,10 +764,20 @@ class CandidateProvider:
             "dsqg_w_candidate_duplicate_rate": final_states.new_tensor(float(duplicate_count) / float(denom)),
             "dsqg_w_candidate_invalid_rate": final_states.new_tensor(float(invalid_count) / float(denom)),
             "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+            "dsqg_w_static_source_count": final_states.new_tensor(float(torch.unique(cand_sources[cand_mask]).numel())),
         }
         for ctype in CandidateType:
             mask = (cand_types == int(ctype)) & cand_mask
             telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / cand_mask.float().sum().clamp_min(1.0)
+        if _dsqg_w_geometry_audit_enabled():
+            telemetry.update(
+                _dsqg_w_geometry_telemetry(
+                    cand_token_indices,
+                    cand_types,
+                    cand_sources,
+                    cand_mask,
+                )
+            )
 
         return CandidateBatch(
             cand_states=cand_states,
@@ -687,6 +787,7 @@ class CandidateProvider:
             cand_token_indices=cand_token_indices,
             valid_candidate_count=valid_count,
             telemetry=telemetry,
+            active_source_ids=tuple(int(v) for v in sorted(torch.unique(cand_sources[cand_mask]).detach().cpu().tolist())),
         )
 
     @staticmethod
@@ -2376,6 +2477,7 @@ class DSQGWBlock(nn.Module):
         chunk_rep_states: torch.Tensor | None = None,
         cand_scores: torch.Tensor | None = None,
         return_routing: bool = False,
+        needed_source_ids: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if not _TRITON_SOURCEWISE_AVAILABLE or triton is None:
             raise NotImplementedError("DWARF_DSQG_W_TRITON_SOURCEWISE=1 requires Triton")
@@ -2417,20 +2519,23 @@ class DSQGWBlock(nn.Module):
         if block_hd > 128:
             raise NotImplementedError("Triton DSQG-W sourcewise prototype supports head_dim <= 128")
 
-        x_n = self.norm_x(x)
-        q = self.q_proj(x_n).reshape(bsz, seq_len, h, dh).contiguous()
-        needed_source_ids = tuple(
-            int(source)
-            for source in CandidateSource
-            if bool(((cand_sources == int(source)) & cand_mask).any())
-        )
-        needed_with_final = tuple(sorted(set(needed_source_ids) | {int(CandidateSource.FINAL)}))
-        projected_sources = self._source_projection_cache(
-            x,
-            l3_states=l3_states,
-            chunk_rep_states=chunk_rep_states,
-            needed_source_ids=needed_with_final,
-        )
+        with _dsqg_w_profile_range("q_projection"):
+            x_n = self.norm_x(x)
+            q = self.q_proj(x_n).reshape(bsz, seq_len, h, dh).contiguous()
+        if needed_source_ids is None:
+            needed_source_ids = tuple(
+                int(source)
+                for source in CandidateSource
+                if bool(((cand_sources == int(source)) & cand_mask).any())
+            )
+        needed_with_final = tuple(sorted(set(int(s) for s in needed_source_ids) | {int(CandidateSource.FINAL)}))
+        with _dsqg_w_profile_range("source_projection_cache"):
+            projected_sources = self._source_projection_cache(
+                x,
+                l3_states=l3_states,
+                chunk_rep_states=chunk_rep_states,
+                needed_source_ids=needed_with_final,
+            )
         k_final, v_final = projected_sources[int(CandidateSource.FINAL)]
         k_l3, v_l3 = projected_sources.get(
             int(CandidateSource.L3),
@@ -2583,16 +2688,18 @@ class DSQGWBlock(nn.Module):
                 num_warps=schedule.num_warps,
                 num_stages=schedule.num_stages,
             )
-        weight = self.read_mix.weight
-        read = F.linear(read_slots[:, :, 0, :], weight[:, : self.d])
-        for slot_idx, type_id in enumerate(self.read_type_ids, start=1):
-            if 0 <= int(type_id) < self.n_types:
-                start = (int(type_id) + 1) * self.d
-                read = read + F.linear(read_slots[:, :, slot_idx, :], weight[:, start : start + self.d])
-        z = torch.cat([x, read, x * read, read - x], dim=-1)
-        delta = self.fuse(self.norm_z(z))
-        gate = torch.sigmoid(self.gate).reshape(1, 1, d)
-        x_out = x + gate * delta
+        with _dsqg_w_profile_range("read_mix"):
+            weight = self.read_mix.weight
+            read = F.linear(read_slots[:, :, 0, :], weight[:, : self.d])
+            for slot_idx, type_id in enumerate(self.read_type_ids, start=1):
+                if 0 <= int(type_id) < self.n_types:
+                    start = (int(type_id) + 1) * self.d
+                    read = read + F.linear(read_slots[:, :, slot_idx, :], weight[:, start : start + self.d])
+        with _dsqg_w_profile_range("fuse_norm_mlp_gate"):
+            z = torch.cat([x, read, x * read, read - x], dim=-1)
+            delta = self.fuse(self.norm_z(z))
+            gate = torch.sigmoid(self.gate).reshape(1, 1, d)
+            x_out = x + gate * delta
 
         if return_routing:
             p_mean = probs.mean(dim=-1)
@@ -2650,6 +2757,8 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_triton_schedule_block_hd": x.new_tensor(float(schedule.block_hd)).detach(),
             "dsqg_w_triton_schedule_num_warps": x.new_tensor(float(schedule.num_warps)).detach(),
             "dsqg_w_triton_schedule_num_stages": x.new_tensor(float(schedule.num_stages)).detach(),
+            "dsqg_w_static_source_count": x.new_tensor(float(len(needed_source_ids or ()))).detach(),
+            "dsqg_w_static_source_set_used": x.new_tensor(1.0).detach(),
         }
         if return_routing:
             for ctype in CandidateType:
@@ -2684,6 +2793,7 @@ class DSQGWBlock(nn.Module):
         chunk_rep_states: torch.Tensor | None = None,
         cand_scores: torch.Tensor | None = None,
         return_routing: bool = False,
+        needed_source_ids: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.width_cell is not None or self.typed_mixer is not None:
             raise NotImplementedError("sourcewise DSQG-W does not implement width_cell or typed_mixer")
@@ -2716,17 +2826,19 @@ class DSQGWBlock(nn.Module):
                 chunk_rep_states=chunk_rep_states,
                 cand_scores=cand_scores,
                 return_routing=return_routing,
+                needed_source_ids=needed_source_ids,
             )
 
         h = self.n_heads
         dh = self.dh
         x_n = self.norm_x(x)
         q = self.q_proj(x_n).reshape(bsz, seq_len, h, dh)
-        needed_source_ids = tuple(
-            int(source)
-            for source in CandidateSource
-            if bool(((cand_sources == int(source)) & cand_mask).any())
-        )
+        if needed_source_ids is None:
+            needed_source_ids = tuple(
+                int(source)
+                for source in CandidateSource
+                if bool(((cand_sources == int(source)) & cand_mask).any())
+            )
         projected_sources = self._source_projection_cache(
             x,
             l3_states=l3_states,
