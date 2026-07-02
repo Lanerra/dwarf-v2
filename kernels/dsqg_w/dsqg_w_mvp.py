@@ -327,6 +327,21 @@ class CandidateProvider:
             l3_skip_indices=l3_skip_indices,
         ):
             raise ValueError("build_metadata requires tensor candidate indices/scores")
+        if self._can_use_dsr_selected_metadata_fast_path(
+            question_indices=question_indices,
+            hisa_evidence_indices=hisa_evidence_indices,
+            hisa_evidence_scores=hisa_evidence_scores,
+            chunk_rep_indices=chunk_rep_indices,
+            l3_skip_indices=l3_skip_indices,
+        ):
+            return self._build_dsr_selected_metadata_fast(
+                final_states,
+                l3_states=l3_states,
+                question_indices=question_indices,
+                hisa_evidence_indices=hisa_evidence_indices,
+                hisa_evidence_scores=hisa_evidence_scores,
+                l3_skip_indices=l3_skip_indices,
+            )
         return self._build_vectorized(
             final_states,
             l3_states=l3_states,
@@ -342,6 +357,184 @@ class CandidateProvider:
     @staticmethod
     def _can_use_vectorized(**kwargs) -> bool:
         return all(value is None or isinstance(value, torch.Tensor) for value in kwargs.values())
+
+    def _can_use_dsr_selected_metadata_fast_path(
+        self,
+        *,
+        question_indices: torch.Tensor | None,
+        hisa_evidence_indices: torch.Tensor | None,
+        hisa_evidence_scores: torch.Tensor | None,
+        chunk_rep_indices: torch.Tensor | None,
+        l3_skip_indices: torch.Tensor | None,
+    ) -> bool:
+        if os.getenv("DWARF_DSQG_W_SPECIALIZED_METADATA", "1") == "0":
+            return False
+        return (
+            not self.config.local_offsets
+            and not self.config.long_offsets
+            and self.config.k_chunk <= 0
+            and not self.config.typed_hisa_reps
+            and chunk_rep_indices is None
+            and question_indices is not None
+            and hisa_evidence_indices is not None
+            and hisa_evidence_scores is not None
+            and l3_skip_indices is not None
+            and self.config.k_hisa_evidence > 0
+            and self.config.k_question > 0
+            and self.config.k_l3_skip > 0
+        )
+
+    @staticmethod
+    def _dedupe_same_source_group(
+        tokens: torch.Tensor,
+        scores: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Keep at most one candidate per token inside a same-source/type group."""
+        same_key = (tokens.unsqueeze(-1) == tokens.unsqueeze(-2)) & valid.unsqueeze(-1) & valid.unsqueeze(-2)
+        k_count = tokens.shape[-1]
+        order = torch.arange(k_count, device=tokens.device, dtype=torch.long)
+        score_j = scores.unsqueeze(-2)
+        max_score_same_key = score_j.masked_fill(~same_key, float("-inf")).amax(dim=-1)
+        earlier_same_key = same_key & (order.reshape(1, 1, 1, k_count) < order.reshape(1, 1, k_count, 1))
+        earlier_higher_or_equal_score = earlier_same_key & (score_j >= scores.unsqueeze(-1))
+        keep = valid & (scores >= max_score_same_key) & ~earlier_higher_or_equal_score.any(dim=-1)
+        duplicate_count = (valid & earlier_same_key.any(dim=-1)).sum()
+        return keep, duplicate_count
+
+    def _build_dsr_selected_metadata_fast(
+        self,
+        final_states: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        question_indices: torch.Tensor,
+        hisa_evidence_indices: torch.Tensor,
+        hisa_evidence_scores: torch.Tensor,
+        l3_skip_indices: torch.Tensor,
+    ) -> CandidateBatch:
+        if final_states.ndim != 3:
+            raise ValueError("final_states must have shape [B, T, D]")
+        bsz, seq_len, d = final_states.shape
+        if d != self.config.d:
+            raise ValueError(f"final_states last dim {d} does not match config.d {self.config.d}")
+        if l3_states is not None and l3_states.shape != final_states.shape:
+            raise ValueError("l3_states must match final_states shape")
+        device = final_states.device
+        positions = torch.arange(seq_len, device=device, dtype=torch.long).reshape(1, seq_len, 1).expand(bsz, -1, -1)
+        q_idx = self._normalize_index_tensor(question_indices, bsz, seq_len, self.config.k_question, device)
+        h_idx = self._normalize_index_tensor(hisa_evidence_indices, bsz, seq_len, self.config.k_hisa_evidence, device)
+        h_scores = self._normalize_score_tensor(hisa_evidence_scores, bsz, seq_len, 0 if h_idx is None else h_idx.shape[-1], device)
+        s_idx = self._normalize_index_tensor(l3_skip_indices, bsz, seq_len, self.config.k_l3_skip, device)
+        if q_idx is None or h_idx is None or h_scores is None or s_idx is None:
+            return self._build_vectorized(
+                final_states,
+                l3_states=l3_states,
+                question_indices=question_indices,
+                hisa_evidence_indices=hisa_evidence_indices,
+                hisa_evidence_scores=hisa_evidence_scores,
+                l3_skip_indices=l3_skip_indices,
+                materialize_states=False,
+            )
+
+        def group(tokens: torch.Tensor, ctype: int, source: int, scores: torch.Tensor | None = None):
+            valid = (tokens >= 0) & (tokens <= positions)
+            score_values = torch.zeros(tokens.shape, device=device, dtype=final_states.dtype) if scores is None else torch.nan_to_num(
+                scores.to(device=device, dtype=final_states.dtype), nan=0.0, neginf=0.0, posinf=0.0
+            )
+            keep, dup = self._dedupe_same_source_group(tokens, score_values, valid)
+            types = torch.full(tokens.shape, int(ctype), device=device, dtype=torch.long)
+            sources = torch.full(tokens.shape, int(source), device=device, dtype=torch.long)
+            return tokens, types, sources, keep, score_values, dup
+
+        groups = [
+            group(h_idx, int(CandidateType.HISA_EVIDENCE), int(CandidateSource.HISA), h_scores),
+            group(q_idx, int(CandidateType.QUESTION), int(CandidateSource.FINAL), None),
+            group(s_idx, int(CandidateType.L3_SKIP), int(CandidateSource.L3), None),
+        ]
+        tokens = torch.cat([g[0] for g in groups], dim=-1)
+        types = torch.cat([g[1] for g in groups], dim=-1)
+        sources = torch.cat([g[2] for g in groups], dim=-1)
+        valid = torch.cat([g[3] for g in groups], dim=-1)
+        scores = torch.cat([g[4] for g in groups], dim=-1)
+        duplicate_count = sum((g[5] for g in groups), torch.zeros((), device=device, dtype=torch.long))
+        had_valid = valid.any(dim=-1, keepdim=True)
+        active_source_ids = {
+            int(CandidateSource.FINAL),
+            int(CandidateSource.HISA),
+            int(CandidateSource.L3),
+        }
+        if self.config.null_fallback:
+            active_source_ids.add(int(CandidateSource.NULL))
+            null_tokens = positions
+            null_valid = ~had_valid
+            tokens = torch.cat([tokens, null_tokens], dim=-1)
+            types = torch.cat([types, torch.full_like(null_tokens, int(CandidateType.NULL))], dim=-1)
+            sources = torch.cat([sources, torch.full_like(null_tokens, int(CandidateSource.NULL))], dim=-1)
+            valid = torch.cat([valid, null_valid], dim=-1)
+            scores = torch.cat([scores, final_states.new_zeros(null_tokens.shape)], dim=-1)
+        if tokens.shape[-1] == 0 or not valid.any(dim=-1).all():
+            raise RuntimeError("CandidateProvider produced an all-invalid DSQG-W candidate row")
+
+        priority_table = torch.full((max(self.config.n_types, len(CandidateType)),), 99, device=device, dtype=torch.long)
+        for ctype, priority_value in _CANDIDATE_PRIORITY.items():
+            priority_table[int(ctype)] = int(priority_value)
+        priority = priority_table[types.clamp_min(0)]
+        sort_stride_source = max(self.config.n_sources, len(CandidateSource)) + 1
+        sort_stride_token = (seq_len + 1) * sort_stride_source
+        sort_key = (
+            priority.to(torch.float32) * float(sort_stride_token * 1_000_000)
+            - scores.to(torch.float32) * float(sort_stride_token)
+            + tokens.clamp_min(0).to(torch.float32) * float(sort_stride_source)
+            + sources.clamp_min(0).to(torch.float32)
+        )
+        sort_key = sort_key.masked_fill(~valid, float("inf"))
+        order_idx = sort_key.argsort(dim=-1)
+        order_valid = torch.ones_like(order_idx, dtype=torch.bool)
+        j_max = min(int(self.config.max_candidates), int(tokens.shape[-1]))
+        order_idx = order_idx[..., :j_max]
+        order_valid = order_valid[..., :j_max]
+
+        cand_token_indices = tokens.gather(-1, order_idx)
+        cand_types = types.gather(-1, order_idx)
+        cand_sources = sources.gather(-1, order_idx)
+        cand_scores = scores.gather(-1, order_idx)
+        cand_mask = valid.gather(-1, order_idx) & order_valid
+        valid_count = cand_mask.sum(dim=-1).to(torch.long)
+        cand_token_indices = cand_token_indices.masked_fill(~cand_mask, -1)
+        cand_types = cand_types.masked_fill(~cand_mask, int(CandidateType.NULL))
+        cand_sources = cand_sources.masked_fill(~cand_mask, int(CandidateSource.NULL))
+        cand_scores = cand_scores.masked_fill(~cand_mask, 0.0)
+
+        raw_count = max(int(tokens.shape[-1]), 1)
+        invalid_count = (~valid).sum()
+        denom = torch.tensor(float(raw_count * bsz * seq_len), device=device, dtype=final_states.dtype).clamp_min(1.0)
+        telemetry = {
+            "dsqg_w_candidate_duplicate_rate": duplicate_count.to(final_states.dtype) / denom,
+            "dsqg_w_candidate_invalid_rate": invalid_count.to(final_states.dtype) / denom,
+            "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+            "dsqg_w_candidate_score_mean": cand_scores.masked_select(cand_mask).mean() if cand_mask.any() else final_states.new_tensor(0.0),
+            "dsqg_w_candidate_score_max": cand_scores.masked_select(cand_mask).max() if cand_mask.any() else final_states.new_tensor(0.0),
+            "dsqg_w_static_source_count": final_states.new_tensor(float(len(active_source_ids))),
+            "dsqg_w_candidate_specialized_metadata": final_states.new_tensor(1.0),
+            "dsqg_w_candidate_slot_count": final_states.new_tensor(float(j_max)),
+        }
+        mask_denom = cand_mask.float().sum().clamp_min(1.0)
+        for ctype in CandidateType:
+            mask = (cand_types == int(ctype)) & cand_mask
+            telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
+        if _dsqg_w_geometry_audit_enabled():
+            telemetry.update(_dsqg_w_geometry_telemetry(cand_token_indices, cand_types, cand_sources, cand_mask))
+        return CandidateBatch(
+            cand_states=final_states.new_empty((0,)),
+            cand_types=cand_types,
+            cand_sources=cand_sources,
+            cand_mask=cand_mask,
+            cand_token_indices=cand_token_indices,
+            valid_candidate_count=valid_count,
+            cand_scores=cand_scores,
+            telemetry=telemetry,
+            active_source_ids=tuple(sorted(active_source_ids)),
+        )
 
     def _build_vectorized(
         self,
@@ -518,17 +711,20 @@ class CandidateProvider:
         )
         sort_key = sort_key.masked_fill(~keep, float("inf"))
         order_idx = sort_key.argsort(dim=-1)
+        order_valid = torch.ones_like(order_idx, dtype=torch.bool)
         j_max = self.config.max_candidates
         if order_idx.shape[-1] < j_max:
             pad = order_idx.new_zeros((*order_idx.shape[:-1], j_max - order_idx.shape[-1]))
             order_idx = torch.cat([order_idx, pad], dim=-1)
+            order_valid = torch.cat([order_valid, torch.zeros_like(pad, dtype=torch.bool)], dim=-1)
         order_idx = order_idx[..., :j_max]
+        order_valid = order_valid[..., :j_max]
 
         cand_token_indices = tokens.gather(-1, order_idx)
         cand_types = types.gather(-1, order_idx)
         cand_sources = sources.gather(-1, order_idx)
         cand_scores = scores.gather(-1, order_idx)
-        cand_mask = keep.gather(-1, order_idx)
+        cand_mask = keep.gather(-1, order_idx) & order_valid
         valid_count = cand_mask.sum(dim=-1).to(torch.long)
         cand_token_indices = cand_token_indices.masked_fill(~cand_mask, -1)
         cand_types = cand_types.masked_fill(~cand_mask, int(CandidateType.NULL))
@@ -568,6 +764,8 @@ class CandidateProvider:
             "dsqg_w_candidate_score_mean": cand_scores.masked_select(cand_mask).mean() if cand_mask.any() else final_states.new_tensor(0.0),
             "dsqg_w_candidate_score_max": cand_scores.masked_select(cand_mask).max() if cand_mask.any() else final_states.new_tensor(0.0),
             "dsqg_w_static_source_count": final_states.new_tensor(float(len(active_source_ids))),
+            "dsqg_w_candidate_specialized_metadata": final_states.new_tensor(0.0),
+            "dsqg_w_candidate_slot_count": final_states.new_tensor(float(j_max)),
         }
         mask_denom = cand_mask.float().sum().clamp_min(1.0)
         for ctype in CandidateType:
@@ -2419,6 +2617,33 @@ class DSQGWBlock(nn.Module):
             typed_read_norms[type_id] = r_type.norm(dim=-1).mean()
         return read, typed_read_norms
 
+    def _mix_compact_read_slots(self, read_slots: torch.Tensor, *, batched: bool | None = None) -> torch.Tensor:
+        if read_slots.ndim != 4:
+            raise ValueError("read_slots must have shape [B, T, S, D]")
+        if read_slots.shape[-1] != self.d:
+            raise ValueError("read_slots last dim must match block d")
+        expected_slots = len(self.read_type_ids) + 1
+        if read_slots.shape[2] != expected_slots:
+            raise ValueError(f"read_slots slot count {read_slots.shape[2]} does not match expected {expected_slots}")
+        if batched is None:
+            batched = os.getenv("DWARF_DSQG_W_BATCHED_READ_MIX", "0") == "1"
+        weight = self.read_mix.weight
+        if not batched:
+            read = F.linear(read_slots[:, :, 0, :], weight[:, : self.d])
+            for slot_idx, type_id in enumerate(self.read_type_ids, start=1):
+                if 0 <= int(type_id) < self.n_types:
+                    start = (int(type_id) + 1) * self.d
+                    read = read + F.linear(read_slots[:, :, slot_idx, :], weight[:, start : start + self.d])
+            return read
+        slices = [weight[:, : self.d]]
+        for type_id in self.read_type_ids:
+            start = (int(type_id) + 1) * self.d
+            slices.append(weight[:, start : start + self.d])
+        weight_by_slot = torch.stack(slices, dim=0)  # [S, D_out, D_in]
+        slots_by_slot = read_slots.reshape(-1, expected_slots, self.d).transpose(0, 1)  # [S, B*T, D]
+        mixed = torch.bmm(slots_by_slot, weight_by_slot.transpose(1, 2)).sum(dim=0)
+        return mixed.reshape(read_slots.shape[0], read_slots.shape[1], self.d)
+
     @staticmethod
     def _gather_source_rows(states: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
         bsz, seq_len = states.shape[:2]
@@ -2688,13 +2913,9 @@ class DSQGWBlock(nn.Module):
                 num_warps=schedule.num_warps,
                 num_stages=schedule.num_stages,
             )
+        batched_read_mix = os.getenv("DWARF_DSQG_W_BATCHED_READ_MIX", "0") == "1"
         with _dsqg_w_profile_range("read_mix"):
-            weight = self.read_mix.weight
-            read = F.linear(read_slots[:, :, 0, :], weight[:, : self.d])
-            for slot_idx, type_id in enumerate(self.read_type_ids, start=1):
-                if 0 <= int(type_id) < self.n_types:
-                    start = (int(type_id) + 1) * self.d
-                    read = read + F.linear(read_slots[:, :, slot_idx, :], weight[:, start : start + self.d])
+            read = self._mix_compact_read_slots(read_slots, batched=batched_read_mix)
         with _dsqg_w_profile_range("fuse_norm_mlp_gate"):
             z = torch.cat([x, read, x * read, read - x], dim=-1)
             delta = self.fuse(self.norm_z(z))
@@ -2743,6 +2964,7 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_triton_probs_materialized": x.new_tensor(1.0 if return_routing else 0.0).detach(),
             "dsqg_w_triton_read_accum_materialized": x.new_tensor(0.0).detach(),
             "dsqg_w_triton_read_mix_fused": x.new_tensor(0.0).detach(),
+            "dsqg_w_batched_read_mix": x.new_tensor(1.0 if batched_read_mix else 0.0).detach(),
             "dsqg_w_triton_compact_read_slots_materialized": x.new_tensor(1.0).detach(),
             "dsqg_w_triton_compact_read_slots": x.new_tensor(float(read_slot_count)).detach(),
             "dsqg_w_triton_score_recompute_blocks": x.new_tensor(2.0 if split_backward else 1.0).detach(),

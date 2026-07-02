@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kernels.dsqg_w.dsqg_w_mvp import CandidateProvider, CandidateType, DSQGWBlock, DSQGWConfig
+from kernels.dsqg_w.dsqg_w_mvp import CandidateProvider, CandidateSource, CandidateType, DSQGWBlock, DSQGWConfig
 
 
 def _sourcewise_fixture():
@@ -152,6 +152,84 @@ def test_sourcewise_path_does_not_build_candidate_state_or_projected_kv_surfaces
     assert telemetry["dsqg_w_sourcewise"].item() == 1.0
     assert projected_input_shapes
     assert all(len(shape) == 3 for shape in projected_input_shapes)
+
+
+def test_dsr_selected_metadata_specialization_matches_generic_path(monkeypatch) -> None:
+    torch.manual_seed(202607020)
+    config = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        null_fallback=True,
+        typed_hisa_reps=False,
+    )
+    provider = CandidateProvider(config)
+    final_states = torch.randn(2, 7, 16)
+    l3_states = torch.randn(2, 7, 16)
+    positions = torch.arange(7)
+    question = torch.tensor([[0, 3, 3, 9], [0, 2, 5, 9]], dtype=torch.long)
+    hisa = torch.stack(
+        [
+            (positions - 1).clamp_min(0),
+            (positions - 1).clamp_min(0),
+            (positions - 3).clamp_min(0),
+            torch.full_like(positions, 99),
+        ],
+        dim=-1,
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    hisa_scores = torch.tensor([0.1, 0.9, -0.2, 4.0], dtype=final_states.dtype).reshape(1, 1, 4).expand(2, 7, -1)
+    l3_skip = torch.stack(
+        [(positions - 2).clamp_min(0), (positions - 2).clamp_min(0)], dim=-1
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+
+    monkeypatch.setenv("DWARF_DSQG_W_SPECIALIZED_METADATA", "0")
+    generic = provider.build_metadata(
+        final_states,
+        l3_states=l3_states,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+    monkeypatch.setenv("DWARF_DSQG_W_SPECIALIZED_METADATA", "1")
+    specialized = provider.build_metadata(
+        final_states,
+        l3_states=l3_states,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+
+    assert specialized.cand_states.numel() == 0
+    assert specialized.cand_token_indices.shape[-1] == 11
+
+    def valid_rows(batch):
+        return torch.stack(
+            [batch.cand_token_indices, batch.cand_types, batch.cand_sources],
+            dim=-1,
+        )[batch.cand_mask]
+
+    assert torch.equal(valid_rows(specialized), valid_rows(generic))
+    assert torch.allclose(specialized.cand_scores[specialized.cand_mask], generic.cand_scores[generic.cand_mask])
+    assert specialized.valid_candidate_count.float().mean() == generic.valid_candidate_count.float().mean()
+    assert specialized.active_source_ids == generic.active_source_ids
+    assert specialized.telemetry["dsqg_w_candidate_specialized_metadata"].item() == 1.0
+    assert specialized.telemetry["dsqg_w_candidate_slot_count"].item() == 11.0
+    assert generic.telemetry.get("dsqg_w_candidate_specialized_metadata", torch.tensor(0.0)).item() == 0.0
+    assert generic.telemetry["dsqg_w_candidate_slot_count"].item() == 16.0
+    assert set(specialized.active_source_ids) == {
+        int(CandidateSource.FINAL),
+        int(CandidateSource.HISA),
+        int(CandidateSource.L3),
+        int(CandidateSource.NULL),
+    }
 
 
 def _require_cuda_triton() -> None:
@@ -728,6 +806,40 @@ def test_dsqg_w_block_read_mix_matches_dense_typed_read_reference() -> None:
     assert len(norms) == block.n_types
     assert norms[int(CandidateType.LOCAL)].item() > 0.0
     assert norms[int(CandidateType.LONG_OFFSET)].item() == 0.0
+
+
+def test_dsqg_w_compact_read_slot_batched_read_mix_matches_slot_linears(monkeypatch) -> None:
+    torch.manual_seed(202607021)
+    block = DSQGWBlock.from_config(
+        DSQGWConfig(
+            d=16,
+            n_heads=4,
+            max_candidates=6,
+            local_offsets=(),
+            long_offsets=(),
+            k_question=1,
+            k_hisa_evidence=1,
+            k_l3_skip=1,
+            k_chunk=0,
+            null_fallback=True,
+        )
+    )
+    read_slots = torch.randn(2, 5, len(block.read_type_ids) + 1, 16, requires_grad=True)
+
+    expected = block._mix_compact_read_slots(read_slots, batched=False)
+    monkeypatch.setenv("DWARF_DSQG_W_BATCHED_READ_MIX", "1")
+    actual = block._mix_compact_read_slots(read_slots)
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    grad = torch.randn_like(actual)
+    expected.backward(grad, retain_graph=True)
+    grad_slots_expected = read_slots.grad.detach().clone()
+    grad_weight_expected = block.read_mix.weight.grad.detach().clone()
+    read_slots.grad.zero_()
+    block.read_mix.weight.grad.zero_()
+    actual.backward(grad)
+    assert torch.allclose(read_slots.grad, grad_slots_expected, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(block.read_mix.weight.grad, grad_weight_expected, atol=1e-6, rtol=1e-6)
 
 
 def test_dsqg_w_block_from_config_limits_read_mix_to_possible_candidate_types() -> None:

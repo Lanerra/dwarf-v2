@@ -4549,6 +4549,7 @@ def train():
                         ('dsqg_w_typed_mixer_gate_mean', 'w_mix_gate'),
                         ('dsqg_w_metadata_cache_hit', 'w_cache'),
                         ('dsqg_w_static_source_count', 'w_srcs'),
+                        ('dsqg_w_candidate_slot_count', 'w_j'),
                         ('dsqg_w_geometry_fixed_slots', 'w_fixed'),
                         ('dsqg_w_geometry_slab_candidate_slots', 'w_slab'),
                     ]:
