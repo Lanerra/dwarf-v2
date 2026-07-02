@@ -41,6 +41,8 @@ def build_run_config(
     fuse_init_std: float = 0.02,
     sourcewise: bool = False,
     triton_sourcewise: bool = False,
+    detach_recomposer: bool = False,
+    fast_evidence_mean: bool = False,
     width_cell: bool = False,
     width_bottleneck: int = 64,
     width_gate_init: float = -2.5,
@@ -56,6 +58,9 @@ def build_run_config(
     local_offsets: str = "none",
     long_offsets: str = "none",
     hisa_stage2_rep_r: int = 4,
+    k_question: int = 4,
+    k_hisa_evidence: int = 4,
+    k_l3_skip: int = 2,
     pure_dsqg: bool = False,
     lr: float | None = None,
     dataset: Path | str = DEFAULT_DATASET,
@@ -91,6 +96,8 @@ def build_run_config(
         "DWARF_DSQG_W_FUSE_INIT_STD": str(float(fuse_init_std)),
         "DWARF_DSQG_W_SOURCEWISE": "1" if sourcewise else "0",
         "DWARF_DSQG_W_TRITON_SOURCEWISE": "1" if triton_sourcewise else "0",
+        "DWARF_DSQG_W_DETACH_RECOMPOSER": "1" if detach_recomposer else "0",
+        "DWARF_DSQG_W_FAST_EVIDENCE_MEAN": "1" if fast_evidence_mean else "0",
         "DWARF_DSQG_W_WIDTH_CELL": "1" if width_cell else "0",
         "DWARF_DSQG_W_WIDTH_BOTTLENECK": str(int(width_bottleneck)),
         "DWARF_DSQG_W_WIDTH_GATE_INIT": str(float(width_gate_init)),
@@ -108,9 +115,9 @@ def build_run_config(
         "DWARF_HISA_STAGE2_REP_R": str(int(hisa_stage2_rep_r)),
         "DWARF_DSQG_W_QUESTION": "1",
         "DWARF_DSQG_W_HISA_L3": "1",
-        "DWARF_DSQG_W_K_QUESTION": "4",
-        "DWARF_DSQG_W_K_HISA_EVIDENCE": "4",
-        "DWARF_DSQG_W_K_L3_SKIP": "2",
+        "DWARF_DSQG_W_K_QUESTION": str(int(k_question)),
+        "DWARF_DSQG_W_K_HISA_EVIDENCE": str(int(k_hisa_evidence)),
+        "DWARF_DSQG_W_K_L3_SKIP": str(int(k_l3_skip)),
         "DWARF_TORCH_COMPILE": "0",
         "DWARF_LIGER": "0",
         "DWARF_Q6_G128": "0",
@@ -198,6 +205,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable the opt-in Triton DSQG-W sourcewise path with recompute backward; requires --sourcewise.",
     )
+    parser.add_argument("--detach-recomposer", action="store_true", help="Run DSQG-W recomposition as a detached forward perturbation to avoid W backward cost.")
+    parser.add_argument("--fast-evidence-mean", action="store_true", help="Use the experimental fast evidence-mean DSQG-W path instead of score/read kernels.")
     parser.add_argument("--width-cell", action="store_true", help="Enable the opt-in DSQG-W candidate lateral width cell.")
     parser.add_argument("--width-bottleneck", type=int, default=64)
     parser.add_argument("--width-gate-init", type=float, default=-2.5)
@@ -213,6 +222,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-offsets", default="none", help="Comma-separated DSQG-W local offset candidates; default none for D-fed W runs.")
     parser.add_argument("--long-offsets", default="none", help="Comma-separated DSQG-W long offset candidates; default none for D-fed W runs.")
     parser.add_argument("--hisa-stage2-rep-r", type=int, default=4, help="Query-representative HISA Stage-2 selector representatives; use 0 for legacy row-max diagnostic fallback.")
+    parser.add_argument("--k-question", type=int, default=4, help="Number of DSQG-W question candidates; use 0 to disable.")
+    parser.add_argument("--k-hisa-evidence", type=int, default=4, help="Number of DSQG-W HISA evidence candidates; use 0 to disable.")
+    parser.add_argument("--k-l3-skip", type=int, default=2, help="Number of DSQG-W L3 skip candidates; use 0 to disable.")
     parser.add_argument("--pure-dsqg", action="store_true", help="Disable HISA/DSR and run the pure DSQG-D v1 control layout.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
@@ -245,6 +257,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         fuse_init_std=args.fuse_init_std,
         sourcewise=args.sourcewise,
         triton_sourcewise=args.triton_sourcewise,
+        detach_recomposer=args.detach_recomposer,
+        fast_evidence_mean=args.fast_evidence_mean,
         width_cell=args.width_cell,
         width_bottleneck=args.width_bottleneck,
         width_gate_init=args.width_gate_init,
@@ -260,6 +274,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         local_offsets=args.local_offsets,
         long_offsets=args.long_offsets,
         hisa_stage2_rep_r=args.hisa_stage2_rep_r,
+        k_question=args.k_question,
+        k_hisa_evidence=args.k_hisa_evidence,
+        k_l3_skip=args.k_l3_skip,
         pure_dsqg=args.pure_dsqg,
         lr=args.lr,
         dataset=args.dataset,

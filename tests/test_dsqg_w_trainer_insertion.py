@@ -12,7 +12,18 @@ ROOT = Path(__file__).resolve().parents[1]
 TRAINER = ROOT / "train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py"
 
 
-def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: bool = False, sites: str | None = None, sourcewise: bool = False, triton_sourcewise: bool = False):
+def load_trainer(
+    monkeypatch,
+    *,
+    dsqg_w: bool,
+    question: bool = False,
+    hisa_l3: bool = False,
+    sites: str | None = None,
+    sourcewise: bool = False,
+    triton_sourcewise: bool = False,
+    detach_recomposer: bool = False,
+    fast_evidence_mean: bool = False,
+):
     monkeypatch.setenv("DWARF_DISABLE_BNB", "1")
     monkeypatch.setenv("DWARF_LIGER", "0")
     monkeypatch.setenv("DWARF_TORCH_COMPILE", "0")
@@ -28,6 +39,14 @@ def load_trainer(monkeypatch, *, dsqg_w: bool, question: bool = False, hisa_l3: 
             monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
         else:
             monkeypatch.delenv("DWARF_DSQG_W_TRITON_SOURCEWISE", raising=False)
+        if detach_recomposer:
+            monkeypatch.setenv("DWARF_DSQG_W_DETACH_RECOMPOSER", "1")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_DETACH_RECOMPOSER", raising=False)
+        if fast_evidence_mean:
+            monkeypatch.setenv("DWARF_DSQG_W_FAST_EVIDENCE_MEAN", "1")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_FAST_EVIDENCE_MEAN", raising=False)
         if sites is not None:
             monkeypatch.setenv("DWARF_DSQG_W_SITES", sites)
         else:
@@ -338,6 +357,114 @@ def test_dsqg_w_sourcewise_env_uses_metadata_recomposer(monkeypatch) -> None:
     assert out.shape == x.shape
     assert calls == ["metadata"]
     assert model.dsqg_w_last_telemetry["dsqg_w_sourcewise"].item() == 1.0
+
+
+def test_dsqg_w_detach_recomposer_keeps_forward_delta_but_blocks_w_backward(monkeypatch) -> None:
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        sourcewise=True,
+        detach_recomposer=True,
+    )
+    model = make_model(mod).train()
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    l3_states = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    question_indices = torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)
+    hisa_indices = torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)
+    l3_skip_indices = torch.tensor([[0, 4], [1, 5]], dtype=torch.long)
+
+    out = model._apply_dsqg_w_recomposer(
+        x,
+        l3_states=l3_states,
+        question_indices=question_indices,
+        hisa_evidence_indices=hisa_indices,
+        l3_skip_indices=l3_skip_indices,
+    )
+    loss = out.sum()
+    loss.backward()
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert (out - x).detach().abs().max().item() > 0.0
+    assert torch.allclose(x.grad, torch.ones_like(x))
+    assert l3_states.grad is None
+    assert model.dsqg_w_last_telemetry["dsqg_w_detached_recomposer"].item() == 1.0
+    assert all(param.grad is None for param in model.dsqg_w.parameters())
+
+
+def test_dsqg_w_fast_evidence_mean_uses_candidates_without_qkv_backward(monkeypatch) -> None:
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        sourcewise=True,
+        detach_recomposer=True,
+        fast_evidence_mean=True,
+    )
+    model = make_model(mod).train()
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    l3_states = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    question_indices = torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)
+    positions = torch.arange(8)
+    hisa_indices = torch.stack(
+        [(positions - 1).clamp_min(0), (positions - 2).clamp_min(0), (positions - 3).clamp_min(0), (positions - 4).clamp_min(0)],
+        dim=-1,
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    l3_skip_indices = torch.stack(
+        [(positions - 2).clamp_min(0), (positions - 4).clamp_min(0)], dim=-1
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+
+    out = model._apply_dsqg_w_recomposer(
+        x,
+        l3_states=l3_states,
+        question_indices=question_indices,
+        hisa_evidence_indices=hisa_indices,
+        l3_skip_indices=l3_skip_indices,
+    )
+    out.sum().backward()
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert (out - x).detach().abs().max().item() > 0.0
+    assert torch.allclose(x.grad, torch.ones_like(x))
+    assert l3_states.grad is None
+    telemetry = model.dsqg_w_last_telemetry
+    assert telemetry["dsqg_w_fast_evidence_mean"].item() == 1.0
+    assert telemetry["dsqg_w_detached_recomposer"].item() == 1.0
+    assert telemetry["dsqg_w_candidate_slot_count"].item() == 10.0
+    assert all(param.grad is None for param in model.dsqg_w.parameters())
+
+
+def test_dsqg_w_fast_evidence_mean_uses_aligned_l3_when_candidates_are_empty(monkeypatch) -> None:
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        sourcewise=True,
+        detach_recomposer=True,
+        fast_evidence_mean=True,
+    )
+    model = make_model(mod).train()
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    l3_states = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+
+    out = model._apply_dsqg_w_recomposer(x, l3_states=l3_states)
+    out.sum().backward()
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert (out - x).detach().abs().max().item() > 0.0
+    assert torch.allclose(x.grad, torch.ones_like(x))
+    assert l3_states.grad is None
+    telemetry = model.dsqg_w_last_telemetry
+    assert telemetry["dsqg_w_fast_evidence_mean"].item() == 1.0
+    assert telemetry["dsqg_w_candidate_slot_count"].item() == 1.0
+    assert telemetry["dsqg_w_valid_candidate_count"].item() == 1.0
+    assert all(param.grad is None for param in model.dsqg_w.parameters())
 
 
 def test_dsqg_w_triton_sourcewise_env_is_training_smoke_accepted_on_cuda(monkeypatch) -> None:

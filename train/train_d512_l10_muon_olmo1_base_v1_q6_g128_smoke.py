@@ -355,6 +355,8 @@ def _parse_int_tuple_env(name, default):
 DSQG_W_ENABLED = os.getenv('DWARF_DSQG_W', '0') == '1'
 DSQG_W_SOURCEWISE = os.getenv('DWARF_DSQG_W_SOURCEWISE', '0') == '1'
 DSQG_W_TRITON_SOURCEWISE = os.getenv('DWARF_DSQG_W_TRITON_SOURCEWISE', '0') == '1'
+DSQG_W_DETACH_RECOMPOSER = os.getenv('DWARF_DSQG_W_DETACH_RECOMPOSER', '0') == '1'
+DSQG_W_FAST_EVIDENCE_MEAN = os.getenv('DWARF_DSQG_W_FAST_EVIDENCE_MEAN', '0') == '1'
 DSQG_W_MAX_CANDIDATES = int(os.environ.get('DWARF_DSQG_W_MAX_CANDIDATES', '32'))
 DSQG_W_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_BOTTLENECK', '256'))
 DSQG_W_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_GATE_INIT', '-5.0'))
@@ -3264,6 +3266,94 @@ class TriadicJ96Dsr(nn.Module):
         self._dsqg_w_metadata_cache[key] = candidates
         return candidates, False
 
+    @staticmethod
+    def _dsqg_w_expand_candidate_indices(indices, *, bsz, seq_len, device):
+        if indices is None:
+            return None
+        values = indices.to(device=device, dtype=torch.long)
+        if values.ndim == 1:
+            values = values.reshape(1, 1, -1).expand(bsz, seq_len, -1)
+        elif values.ndim == 2:
+            values = values.reshape(values.shape[0], 1, values.shape[1]).expand(-1, seq_len, -1)
+        elif values.ndim != 3:
+            raise ValueError('DSQG-W fast evidence indices must be rank 1, 2, or 3')
+        if values.shape[0] == 1 and bsz != 1:
+            values = values.expand(bsz, -1, -1)
+        if values.shape[1] == 1 and seq_len != 1:
+            values = values.expand(-1, seq_len, -1)
+        if values.shape[:2] != (bsz, seq_len):
+            raise ValueError('DSQG-W fast evidence indices must broadcast to [B,T,K]')
+        return values
+
+    @staticmethod
+    def _dsqg_w_gather_fast_evidence(states, indices, positions):
+        if indices is None or indices.shape[-1] == 0:
+            return None, None
+        bsz, seq_len = states.shape[:2]
+        valid = (indices >= 0) & (indices <= positions)
+        gather_tokens = indices.clamp(0, max(seq_len - 1, 0))
+        batch_offsets = torch.arange(bsz, device=states.device, dtype=torch.long).reshape(bsz, 1, 1) * seq_len
+        flat_indices = (batch_offsets + gather_tokens).reshape(-1)
+        gathered = states.reshape(bsz * seq_len, states.shape[-1]).index_select(0, flat_indices)
+        gathered = gathered.reshape(bsz, seq_len, indices.shape[-1], states.shape[-1])
+        return gathered * valid[..., None].to(gathered.dtype), valid
+
+    def _apply_dsqg_w_fast_evidence_mean(
+        self,
+        x,
+        *,
+        block,
+        l3_states=None,
+        question_indices=None,
+        hisa_evidence_indices=None,
+        l3_skip_indices=None,
+    ):
+        bsz, seq_len, d = x.shape
+        device = x.device
+        positions = torch.arange(seq_len, device=device, dtype=torch.long).reshape(1, seq_len, 1).expand(bsz, -1, -1)
+        final_base = x
+        l3_base = l3_states if l3_states is not None else x
+        groups = []
+        masks = []
+        for states, indices in (
+            (final_base, question_indices),
+            (l3_base, hisa_evidence_indices),
+            (l3_base, l3_skip_indices),
+        ):
+            expanded = self._dsqg_w_expand_candidate_indices(indices, bsz=bsz, seq_len=seq_len, device=device)
+            gathered, valid = self._dsqg_w_gather_fast_evidence(states, expanded, positions) if expanded is not None else (None, None)
+            if gathered is not None and valid is not None:
+                groups.append(gathered)
+                masks.append(valid)
+        if groups:
+            evidence = torch.cat(groups, dim=2)
+            evidence_mask = torch.cat(masks, dim=2)
+            count = evidence_mask.sum(dim=2, keepdim=True).clamp_min(1).to(evidence.dtype)
+            read = evidence.sum(dim=2) / count
+            slot_count = float(evidence.shape[2])
+            valid_mean = evidence_mask.sum(dim=2).float().mean()
+        elif l3_states is not None:
+            read = l3_base
+            slot_count = 1.0
+            valid_mean = x.new_tensor(1.0)
+        else:
+            read = x
+            slot_count = 0.0
+            valid_mean = x.new_tensor(0.0)
+        gate = torch.sigmoid(block.gate).reshape(1, 1, d)
+        out = x + gate * (read - x)
+        telemetry = {
+            'dsqg_w_fast_evidence_mean': x.new_tensor(1.0).detach(),
+            'dsqg_w_valid_candidate_count': valid_mean.detach(),
+            'dsqg_w_candidate_slot_count': x.new_tensor(slot_count).detach(),
+            'dsqg_w_gate_mean': gate.mean().detach(),
+            'dsqg_w_delta_norm': (read - x).norm(dim=-1).mean().detach(),
+            'dsqg_w_x_norm': x.norm(dim=-1).mean().detach(),
+            'dsqg_w_delta_to_x_ratio': ((read - x).norm(dim=-1).mean() / x.norm(dim=-1).mean().clamp_min(1e-8)).detach(),
+            'dsqg_w_read_norm': read.norm(dim=-1).mean().detach(),
+        }
+        return out, telemetry
+
     def _apply_dsqg_w_recomposer(
         self,
         x,
@@ -3283,50 +3373,76 @@ class TriadicJ96Dsr(nn.Module):
         if site_key not in self.dsqg_w_blocks:
             return x
         block = self.dsqg_w_blocks[site_key]
+        recomposer_x = x.detach() if DSQG_W_DETACH_RECOMPOSER else x
+        recomposer_l3_states = l3_states.detach() if DSQG_W_DETACH_RECOMPOSER and l3_states is not None else l3_states
+        grad_context = torch.no_grad() if DSQG_W_DETACH_RECOMPOSER else contextlib.nullcontext()
+        if DSQG_W_FAST_EVIDENCE_MEAN:
+            with _profile_range(f'dsqg_w/site={site_key}'):
+                with grad_context:
+                    x_out, telemetry = self._apply_dsqg_w_fast_evidence_mean(
+                        recomposer_x,
+                        block=block,
+                        l3_states=recomposer_l3_states,
+                        question_indices=question_indices,
+                        hisa_evidence_indices=hisa_evidence_indices,
+                        l3_skip_indices=l3_skip_indices,
+                    )
+            merged_telemetry = dict(telemetry)
+            merged_telemetry['dsqg_w_site_key'] = site_key
+            merged_telemetry['dsqg_w_metadata_cache_hit'] = x.new_tensor(0.0).detach()
+            merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if DSQG_W_DETACH_RECOMPOSER else 0.0).detach()
+            self.dsqg_w_last_telemetry = merged_telemetry
+            if DSQG_W_DETACH_RECOMPOSER:
+                return x + (x_out - recomposer_x).detach()
+            return x_out
         with _profile_range(f'dsqg_w/site={site_key}'):
-            if self.dsqg_w_sourcewise_enabled:
-                candidates, metadata_cache_hit = self._get_or_build_dsqg_w_metadata(
-                    x,
-                    l3_states=l3_states,
-                    question_indices=question_indices,
-                    hisa_evidence_indices=hisa_evidence_indices,
-                    hisa_evidence_scores=hisa_evidence_scores,
-                    l3_skip_indices=l3_skip_indices,
-                )
-                x_out, telemetry = block.forward_sourcewise(
-                    x,
-                    candidates.cand_token_indices,
-                    candidates.cand_types,
-                    candidates.cand_sources,
-                    candidates.cand_mask,
-                    l3_states=l3_states,
-                    cand_scores=candidates.cand_scores,
-                    needed_source_ids=candidates.active_source_ids,
-                )
-            else:
-                with _profile_range('dsqg_w/candidate_materialized_build'):
-                    candidates = self.dsqg_w_candidate_provider.build(
-                        x,
-                        l3_states=l3_states,
+            with grad_context:
+                if self.dsqg_w_sourcewise_enabled:
+                    candidates, metadata_cache_hit = self._get_or_build_dsqg_w_metadata(
+                        recomposer_x,
+                        l3_states=recomposer_l3_states,
                         question_indices=question_indices,
                         hisa_evidence_indices=hisa_evidence_indices,
                         hisa_evidence_scores=hisa_evidence_scores,
                         l3_skip_indices=l3_skip_indices,
                     )
-                metadata_cache_hit = False
-                x_out, telemetry = block(
-                    x,
-                    candidates.cand_states,
-                    candidates.cand_types,
-                    candidates.cand_sources,
-                    candidates.cand_mask,
-                    cand_scores=candidates.cand_scores,
-                )
+                    x_out, telemetry = block.forward_sourcewise(
+                        recomposer_x,
+                        candidates.cand_token_indices,
+                        candidates.cand_types,
+                        candidates.cand_sources,
+                        candidates.cand_mask,
+                        l3_states=recomposer_l3_states,
+                        cand_scores=candidates.cand_scores,
+                        needed_source_ids=candidates.active_source_ids,
+                    )
+                else:
+                    with _profile_range('dsqg_w/candidate_materialized_build'):
+                        candidates = self.dsqg_w_candidate_provider.build(
+                            recomposer_x,
+                            l3_states=recomposer_l3_states,
+                            question_indices=question_indices,
+                            hisa_evidence_indices=hisa_evidence_indices,
+                            hisa_evidence_scores=hisa_evidence_scores,
+                            l3_skip_indices=l3_skip_indices,
+                        )
+                    metadata_cache_hit = False
+                    x_out, telemetry = block(
+                        recomposer_x,
+                        candidates.cand_states,
+                        candidates.cand_types,
+                        candidates.cand_sources,
+                        candidates.cand_mask,
+                        cand_scores=candidates.cand_scores,
+                    )
         merged_telemetry = dict(candidates.telemetry)
         merged_telemetry.update(telemetry)
         merged_telemetry['dsqg_w_site_key'] = site_key
         merged_telemetry['dsqg_w_metadata_cache_hit'] = x.new_tensor(1.0 if metadata_cache_hit else 0.0).detach()
+        merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if DSQG_W_DETACH_RECOMPOSER else 0.0).detach()
         self.dsqg_w_last_telemetry = merged_telemetry
+        if DSQG_W_DETACH_RECOMPOSER:
+            return x + (x_out - recomposer_x).detach()
         return x_out
 
     def forward(
@@ -4550,6 +4666,8 @@ def train():
                         ('dsqg_w_metadata_cache_hit', 'w_cache'),
                         ('dsqg_w_static_source_count', 'w_srcs'),
                         ('dsqg_w_candidate_slot_count', 'w_j'),
+                        ('dsqg_w_detached_recomposer', 'w_det'),
+                        ('dsqg_w_fast_evidence_mean', 'w_fast'),
                         ('dsqg_w_geometry_fixed_slots', 'w_fixed'),
                         ('dsqg_w_geometry_slab_candidate_slots', 'w_slab'),
                     ]:

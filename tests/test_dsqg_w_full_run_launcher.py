@@ -105,6 +105,31 @@ def test_full_run_launcher_can_enable_triton_sourcewise_prototype_env(tmp_path: 
     assert cfg["env"]["DWARF_DSQG_W_TRITON_SOURCEWISE"] == "1"
 
 
+def test_full_run_launcher_can_enable_fast_detached_evidence_mean_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "fast_mean_run",
+        run_name="fast_mean_unit",
+        sourcewise=True,
+        triton_sourcewise=True,
+        detach_recomposer=True,
+        fast_evidence_mean=True,
+        k_question=0,
+        k_hisa_evidence=0,
+        k_l3_skip=0,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W_SOURCEWISE"] == "1"
+    assert env["DWARF_DSQG_W_TRITON_SOURCEWISE"] == "1"
+    assert env["DWARF_DSQG_W_DETACH_RECOMPOSER"] == "1"
+    assert env["DWARF_DSQG_W_FAST_EVIDENCE_MEAN"] == "1"
+    assert env["DWARF_DSQG_W_K_QUESTION"] == "0"
+    assert env["DWARF_DSQG_W_K_HISA_EVIDENCE"] == "0"
+    assert env["DWARF_DSQG_W_K_L3_SKIP"] == "0"
+
+
 def test_full_run_launcher_can_disable_dsqg_w_for_backbone_controls(tmp_path: Path) -> None:
     mod = load_launcher_module()
 
