@@ -359,9 +359,21 @@ def main():
                 triton_train_tel["dsqg_w_triton_backward_probs_materialized"].item()
             ),
             "triton_backward_lse_saved": float(triton_train_tel["dsqg_w_triton_backward_lse_saved"].item()),
+            "triton_backward_v20_split_kernels": float(
+                triton_train_tel["dsqg_w_triton_backward_v20_split_kernels"].item()
+            ),
+            "triton_backward_query_kernel": float(
+                triton_train_tel["dsqg_w_triton_backward_query_kernel"].item()
+            ),
+            "triton_backward_source_kernel": float(
+                triton_train_tel["dsqg_w_triton_backward_source_kernel"].item()
+            ),
             "triton_backward_reduction_buffer_bytes": float(
                 triton_train_tel["dsqg_w_triton_backward_reduction_buffer_bytes"].item()
             ),
+            "triton_schedule_block_hd": float(triton_train_tel["dsqg_w_triton_schedule_block_hd"].item()),
+            "triton_schedule_num_warps": float(triton_train_tel["dsqg_w_triton_schedule_num_warps"].item()),
+            "triton_schedule_num_stages": float(triton_train_tel["dsqg_w_triton_schedule_num_stages"].item()),
         },
         "forward_timings": [
             bench_forward("dense_forward_no_routing", lambda: dense_forward(False)),

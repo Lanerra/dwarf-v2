@@ -60,6 +60,50 @@ _CANDIDATE_PRIORITY: dict[int, int] = {
 
 
 @dataclass(frozen=True)
+class _DSQGWTritonSchedule:
+    """Centralized launch schedule for DSQG-W Triton row/head kernels.
+
+    Mirrors V20's discipline of deriving launch shape from head dimension and
+    SM family in one place. Values are adapted to DSQG-W's one-row/one-head
+    programs rather than copied from V20's BLOCK_N x HD tile kernels.
+    """
+
+    block_hd: int
+    num_warps: int
+    num_stages: int
+
+
+def _next_pow2_int(n: int) -> int:
+    n = int(n)
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _dsqg_w_triton_schedule(head_dim: int, device: torch.device | None = None) -> _DSQGWTritonSchedule:
+    block_hd = _next_pow2_int(int(head_dim))
+    if block_hd <= 64:
+        base_warps = 1
+    elif block_hd <= 128:
+        base_warps = 2
+    else:
+        base_warps = 4
+
+    num_stages = 2
+    if device is not None and torch.cuda.is_available():
+        try:
+            major, minor = torch.cuda.get_device_capability(device)
+        except Exception:
+            major, minor = (0, 0)
+        if major >= 9:
+            base_warps = min(max(base_warps, 2), 4)
+            num_stages = 3
+        elif major == 8 and minor == 9:
+            num_stages = 2
+    return _DSQGWTritonSchedule(block_hd=block_hd, num_warps=base_warps, num_stages=num_stages)
+
+
+@dataclass(frozen=True)
 class DSQGWConfig:
     d: int
     n_heads: int
@@ -1297,6 +1341,8 @@ if _TRITON_SOURCEWISE_AVAILABLE:
         BLOCK_HD: tl.constexpr,
         USE_QTB: tl.constexpr,
         USE_SCORE_BIAS: tl.constexpr,
+        COMPUTE_QUERY: tl.constexpr,
+        COMPUTE_SOURCE: tl.constexpr,
     ):
         pid = tl.program_id(0)
         h = pid % H
@@ -1390,25 +1436,29 @@ if _TRITON_SOURCEWISE_AVAILABLE:
             ds = tl.where(valid, p * (dp - sum_p_dp), 0.0)
             d_k_eff = ds * q * inv_sqrt
             d_v = p * dcontrib
-            grad_q += ds * (k + role + src_role) * inv_sqrt
+            if COMPUTE_QUERY:
+                grad_q += ds * (k + role + src_role) * inv_sqrt
 
             final_src = (source_id == 1) | (source_id == 5)
             l3_src = (source_id == 2) | (source_id == 3)
             summary_src = source_id == 4
-            tl.atomic_add(grad_k_final_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & final_src)
-            tl.atomic_add(grad_v_final_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & final_src)
-            tl.atomic_add(grad_k_l3_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & l3_src)
-            tl.atomic_add(grad_v_l3_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & l3_src)
-            tl.atomic_add(grad_k_summary_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & summary_src)
-            tl.atomic_add(grad_v_summary_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & summary_src)
-            tl.atomic_add(grad_role_key_ptr + ctype * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
-            tl.atomic_add(grad_source_key_ptr + source_id * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
-            tl.atomic_add(grad_type_bias_ptr + ctype * H + h, ds, sem="relaxed", mask=valid)
-            tl.atomic_add(grad_source_bias_ptr + source_id * H + h, ds, sem="relaxed", mask=valid)
-            if USE_QTB:
-                tl.atomic_add(grad_qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, ds, sem="relaxed", mask=valid)
+            if COMPUTE_SOURCE:
+                tl.atomic_add(grad_k_final_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & final_src)
+                tl.atomic_add(grad_v_final_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & final_src)
+                tl.atomic_add(grad_k_l3_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & l3_src)
+                tl.atomic_add(grad_v_l3_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & l3_src)
+                tl.atomic_add(grad_k_summary_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & summary_src)
+                tl.atomic_add(grad_v_summary_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & summary_src)
+            if COMPUTE_QUERY:
+                tl.atomic_add(grad_role_key_ptr + ctype * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+                tl.atomic_add(grad_source_key_ptr + source_id * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+                tl.atomic_add(grad_type_bias_ptr + ctype * H + h, ds, sem="relaxed", mask=valid)
+                tl.atomic_add(grad_source_bias_ptr + source_id * H + h, ds, sem="relaxed", mask=valid)
+                if USE_QTB:
+                    tl.atomic_add(grad_qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, ds, sem="relaxed", mask=valid)
 
-        tl.store(grad_q_ptr + q_base, grad_q, mask=hd_mask)
+        if COMPUTE_QUERY:
+            tl.store(grad_q_ptr + q_base, grad_q, mask=hd_mask)
 
 
 def _dsqg_w_sourcewise_functional_recompute(
@@ -1675,6 +1725,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
         ctx.dh = int(dh)
         ctx.read_slots = int(read_slots)
         bsz, seq_len = q.shape[:2]
+        schedule = _dsqg_w_triton_schedule(dh, q.device)
         read_slots_out = torch.empty((bsz, seq_len, int(read_slots), int(d)), device=q.device, dtype=q.dtype)
         lse_out = torch.empty((bsz, seq_len, int(n_heads)), device=q.device, dtype=torch.float32)
         ctx.save_for_backward(
@@ -1730,12 +1781,13 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
             N_TYPES=int(n_types),
             READ_SLOTS=int(read_slots),
             MAX_READ_SLOTS=int(triton.next_power_of_2(int(read_slots))),
-            BLOCK_HD=int(block_hd),
+            BLOCK_HD=schedule.block_hd,
             USE_QTB=bool(use_qtb),
             USE_SCORE_BIAS=bool(use_score_bias),
             STORE_LSE=True,
             STORE_PROBS=False,
-            num_warps=1 if int(block_hd) <= 64 else 2,
+            num_warps=schedule.num_warps,
+            num_stages=schedule.num_stages,
         )
         return read_slots_out
 
@@ -1781,52 +1833,74 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
             grad_source_bias = torch.zeros_like(source_bias)
             grad_qtb = torch.zeros_like(qtb) if ctx.use_qtb else None
             empty = torch.empty((0,), device=q.device, dtype=q.dtype)
-            _dsqg_w_sourcewise_read_slots_backward_kernel[(bsz * seq_len * h,)](
-                q.contiguous(),
-                k_final.contiguous(),
-                v_final.contiguous(),
-                k_l3.contiguous(),
-                v_l3.contiguous(),
-                k_summary.contiguous(),
-                v_summary.contiguous(),
-                role_key_weight.contiguous(),
-                source_key_weight.contiguous(),
-                type_bias.contiguous(),
-                source_bias.contiguous(),
-                qtb.contiguous() if ctx.use_qtb else empty,
-                score_bias.contiguous() if ctx.use_score_bias else empty,
-                cand_token_indices.contiguous(),
-                cand_types.contiguous(),
-                cand_sources.contiguous(),
-                cand_mask.contiguous(),
-                type_slot_map.contiguous(),
-                lse.contiguous(),
-                grad_read_slots.contiguous(),
-                grad_q,
-                grad_k_final,
-                grad_v_final,
-                grad_k_l3,
-                grad_v_l3,
-                grad_k_summary,
-                grad_v_summary,
-                grad_role_key,
-                grad_source_key,
-                grad_type_bias,
-                grad_source_bias,
-                grad_qtb if grad_qtb is not None else empty,
-                B=bsz,
-                N=seq_len,
-                H=h,
-                HD=dh,
-                D=d,
-                J=j_count,
-                N_TYPES=type_bias.shape[0],
-                READ_SLOTS=ctx.read_slots,
-                BLOCK_HD=int(triton.next_power_of_2(dh)),
-                USE_QTB=ctx.use_qtb,
-                USE_SCORE_BIAS=ctx.use_score_bias,
-                num_warps=1 if int(triton.next_power_of_2(dh)) <= 64 else 2,
-            )
+            schedule = _dsqg_w_triton_schedule(dh, q.device)
+            grid = (bsz * seq_len * h,)
+
+            def launch_split_kernel(*, compute_query: bool, compute_source: bool) -> None:
+                _dsqg_w_sourcewise_read_slots_backward_kernel[grid](
+                    q.contiguous(),
+                    k_final.contiguous(),
+                    v_final.contiguous(),
+                    k_l3.contiguous(),
+                    v_l3.contiguous(),
+                    k_summary.contiguous(),
+                    v_summary.contiguous(),
+                    role_key_weight.contiguous(),
+                    source_key_weight.contiguous(),
+                    type_bias.contiguous(),
+                    source_bias.contiguous(),
+                    qtb.contiguous() if ctx.use_qtb else empty,
+                    score_bias.contiguous() if ctx.use_score_bias else empty,
+                    cand_token_indices.contiguous(),
+                    cand_types.contiguous(),
+                    cand_sources.contiguous(),
+                    cand_mask.contiguous(),
+                    type_slot_map.contiguous(),
+                    lse.contiguous(),
+                    grad_read_slots.contiguous(),
+                    grad_q,
+                    grad_k_final,
+                    grad_v_final,
+                    grad_k_l3,
+                    grad_v_l3,
+                    grad_k_summary,
+                    grad_v_summary,
+                    grad_role_key,
+                    grad_source_key,
+                    grad_type_bias,
+                    grad_source_bias,
+                    grad_qtb if grad_qtb is not None else empty,
+                    B=bsz,
+                    N=seq_len,
+                    H=h,
+                    HD=dh,
+                    D=d,
+                    J=j_count,
+                    N_TYPES=type_bias.shape[0],
+                    READ_SLOTS=ctx.read_slots,
+                    BLOCK_HD=schedule.block_hd,
+                    USE_QTB=ctx.use_qtb,
+                    USE_SCORE_BIAS=ctx.use_score_bias,
+                    COMPUTE_QUERY=compute_query,
+                    COMPUTE_SOURCE=compute_source,
+                    num_warps=schedule.num_warps,
+                    num_stages=schedule.num_stages,
+                )
+
+            # V20-style organization can be enabled for profiling, but keep the
+            # fused monolithic launch as the default until split scheduling wins in
+            # full trainer windows rather than only as a code-organization pattern.
+            split_backward = os.getenv("DWARF_DSQG_W_TRITON_BACKWARD_ORGANIZATION", "monolithic").lower() in {
+                "1",
+                "true",
+                "split",
+                "v20_split",
+            }
+            if split_backward:
+                launch_split_kernel(compute_query=True, compute_source=False)
+                launch_split_kernel(compute_query=False, compute_source=True)
+            else:
+                launch_split_kernel(compute_query=True, compute_source=True)
             return (
                 grad_q,
                 grad_k_final,
@@ -2338,7 +2412,8 @@ class DSQGWBlock(nn.Module):
         j_count = cand_mask.shape[-1]
         h = self.n_heads
         dh = self.dh
-        block_hd = triton.next_power_of_2(dh)
+        schedule = _dsqg_w_triton_schedule(dh, x.device)
+        block_hd = schedule.block_hd
         if block_hd > 128:
             raise NotImplementedError("Triton DSQG-W sourcewise prototype supports head_dim <= 128")
 
@@ -2464,7 +2539,8 @@ class DSQGWBlock(nn.Module):
                         USE_SCORE_BIAS=use_score_bias,
                         STORE_LSE=False,
                         STORE_PROBS=True,
-                        num_warps=1 if block_hd <= 64 else 2,
+                        num_warps=schedule.num_warps,
+                        num_stages=schedule.num_stages,
                     )
         else:
             read_slots = torch.empty((bsz, seq_len, read_slot_count, d), device=x.device, dtype=x.dtype)
@@ -2504,7 +2580,8 @@ class DSQGWBlock(nn.Module):
                 USE_SCORE_BIAS=use_score_bias,
                 STORE_LSE=False,
                 STORE_PROBS=return_routing,
-                num_warps=1 if block_hd <= 64 else 2,
+                num_warps=schedule.num_warps,
+                num_stages=schedule.num_stages,
             )
         weight = self.read_mix.weight
         read = F.linear(read_slots[:, :, 0, :], weight[:, : self.d])
@@ -2534,6 +2611,9 @@ class DSQGWBlock(nn.Module):
                 if 0 <= int(type_id) < self.n_types:
                     typed_read_norms[int(type_id)] = read_slots[:, :, slot_idx, :].norm(dim=-1).mean()
         true_backward = needs_backward and os.getenv("DWARF_DSQG_W_TRITON_COMPACT_READ_BACKWARD", "triton").lower() != "pytorch"
+        split_backward = true_backward and os.getenv(
+            "DWARF_DSQG_W_TRITON_BACKWARD_ORGANIZATION", "monolithic"
+        ).lower() in {"1", "true", "split", "v20_split"}
 
         telemetry: dict[str, torch.Tensor] = {
             "dsqg_w_entropy": entropy.detach(),
@@ -2558,11 +2638,18 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_triton_read_mix_fused": x.new_tensor(0.0).detach(),
             "dsqg_w_triton_compact_read_slots_materialized": x.new_tensor(1.0).detach(),
             "dsqg_w_triton_compact_read_slots": x.new_tensor(float(read_slot_count)).detach(),
-            "dsqg_w_triton_score_recompute_blocks": x.new_tensor(1.0).detach(),
+            "dsqg_w_triton_score_recompute_blocks": x.new_tensor(2.0 if split_backward else 1.0).detach(),
             "dsqg_w_triton_true_backward": x.new_tensor(1.0 if true_backward else 0.0).detach(),
+            "dsqg_w_triton_backward_v20_split_kernels": x.new_tensor(1.0 if split_backward else 0.0).detach(),
+            "dsqg_w_triton_backward_monolithic_kernel": x.new_tensor(1.0 if true_backward and not split_backward else 0.0).detach(),
+            "dsqg_w_triton_backward_query_kernel": x.new_tensor(1.0 if split_backward else 0.0).detach(),
+            "dsqg_w_triton_backward_source_kernel": x.new_tensor(1.0 if split_backward else 0.0).detach(),
             "dsqg_w_triton_backward_probs_materialized": x.new_tensor(0.0 if true_backward else (1.0 if needs_backward else 0.0)).detach(),
             "dsqg_w_triton_backward_lse_saved": x.new_tensor(1.0 if needs_backward else 0.0).detach(),
             "dsqg_w_triton_backward_reduction_buffer_bytes": x.new_tensor(0.0).detach(),
+            "dsqg_w_triton_schedule_block_hd": x.new_tensor(float(schedule.block_hd)).detach(),
+            "dsqg_w_triton_schedule_num_warps": x.new_tensor(float(schedule.num_warps)).detach(),
+            "dsqg_w_triton_schedule_num_stages": x.new_tensor(float(schedule.num_stages)).detach(),
         }
         if return_routing:
             for ctype in CandidateType:
