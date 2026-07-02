@@ -251,12 +251,52 @@ def main():
             )
         out.float().square().mean().backward()
 
+    def triton_fwd_bwd_pytorch_vjp():
+        triton_block.zero_grad(set_to_none=True)
+        bx = x.detach().clone().requires_grad_(True)
+        bl3 = l3.detach().clone().requires_grad_(True)
+        candidates = provider.build_metadata(
+            bx,
+            l3_states=bl3,
+            question_indices=question,
+            hisa_evidence_indices=hisa,
+            hisa_evidence_scores=hisa_scores,
+            l3_skip_indices=l3_skip,
+        )
+        with env_flag("DWARF_DSQG_W_TRITON_SOURCEWISE", "1"):
+            with env_flag("DWARF_DSQG_W_TRITON_COMPACT_READ_BACKWARD", "pytorch"):
+                out, _ = triton_block.forward_sourcewise(
+                    bx,
+                    candidates.cand_token_indices,
+                    candidates.cand_types,
+                    candidates.cand_sources,
+                    candidates.cand_mask,
+                    l3_states=bl3,
+                    cand_scores=candidates.cand_scores,
+                )
+                out.float().square().mean().backward()
+
     with torch.no_grad():
         dense_out, dense_tel = dense_forward(return_routing=True)
         eager_out, eager_tel = eager_forward(return_routing=True)
         triton_out, triton_tel = triton_forward(return_routing=True)
         triton_no_route_out, triton_no_route_tel = triton_forward(return_routing=False)
         torch.cuda.synchronize()
+
+    probe_x = x.detach().clone().requires_grad_(True)
+    probe_l3 = l3.detach().clone().requires_grad_(True)
+    with env_flag("DWARF_DSQG_W_TRITON_SOURCEWISE", "1"):
+        _, triton_train_tel = triton_block.forward_sourcewise(
+            probe_x,
+            metadata.cand_token_indices,
+            metadata.cand_types,
+            metadata.cand_sources,
+            metadata.cand_mask,
+            l3_states=probe_l3,
+            cand_scores=metadata.cand_scores,
+            return_routing=False,
+        )
+    del probe_x, probe_l3
 
     result = {
         "device": torch.cuda.get_device_name(0),
@@ -270,9 +310,12 @@ def main():
         },
         "features": {
             "sourcewise": True,
-            "triton_recompute_backward": True,
+            "triton_full_recompute_backward": False,
+            "triton_compact_read_backward": True,
+            "triton_true_compact_read_backward": True,
+            "triton_pytorch_vjp_fallback_env": "DWARF_DSQG_W_TRITON_COMPACT_READ_BACKWARD=pytorch",
             "triton_no_routing": True,
-            "triton_read_mix_fused": True,
+            "triton_compact_read_slots": True,
             "local_offsets": list(config.local_offsets),
             "long_offsets": list(config.long_offsets),
             "k_question": config.k_question,
@@ -306,6 +349,31 @@ def main():
             "triton_no_route_probs_materialized": float(triton_no_route_tel["dsqg_w_triton_probs_materialized"].item()),
             "triton_read_accum_materialized": float(triton_no_route_tel["dsqg_w_triton_read_accum_materialized"].item()),
             "triton_read_mix_fused": float(triton_no_route_tel["dsqg_w_triton_read_mix_fused"].item()),
+            "triton_compact_read_slots_materialized": float(
+                triton_no_route_tel["dsqg_w_triton_compact_read_slots_materialized"].item()
+            ),
+            "triton_compact_read_slots": float(triton_no_route_tel["dsqg_w_triton_compact_read_slots"].item()),
+            "triton_score_recompute_blocks": float(triton_no_route_tel["dsqg_w_triton_score_recompute_blocks"].item()),
+            "triton_true_backward": float(triton_train_tel["dsqg_w_triton_true_backward"].item()),
+            "triton_backward_probs_materialized": float(
+                triton_train_tel["dsqg_w_triton_backward_probs_materialized"].item()
+            ),
+            "triton_backward_lse_saved": float(triton_train_tel["dsqg_w_triton_backward_lse_saved"].item()),
+            "triton_backward_v20_split_kernels": float(
+                triton_train_tel["dsqg_w_triton_backward_v20_split_kernels"].item()
+            ),
+            "triton_backward_query_kernel": float(
+                triton_train_tel["dsqg_w_triton_backward_query_kernel"].item()
+            ),
+            "triton_backward_source_kernel": float(
+                triton_train_tel["dsqg_w_triton_backward_source_kernel"].item()
+            ),
+            "triton_backward_reduction_buffer_bytes": float(
+                triton_train_tel["dsqg_w_triton_backward_reduction_buffer_bytes"].item()
+            ),
+            "triton_schedule_block_hd": float(triton_train_tel["dsqg_w_triton_schedule_block_hd"].item()),
+            "triton_schedule_num_warps": float(triton_train_tel["dsqg_w_triton_schedule_num_warps"].item()),
+            "triton_schedule_num_stages": float(triton_train_tel["dsqg_w_triton_schedule_num_stages"].item()),
         },
         "forward_timings": [
             bench_forward("dense_forward_no_routing", lambda: dense_forward(False)),
@@ -317,6 +385,7 @@ def main():
             bench_fwd_bwd("dense_fwd_bwd", dense_fwd_bwd),
             bench_fwd_bwd("eager_sourcewise_fwd_bwd", eager_fwd_bwd),
             bench_fwd_bwd("triton_sourcewise_fwd_bwd", triton_fwd_bwd),
+            bench_fwd_bwd("triton_sourcewise_pytorch_vjp_fwd_bwd", triton_fwd_bwd_pytorch_vjp, warmup=1, iters=3),
         ],
     }
     print(json.dumps(result, indent=2, sort_keys=True))
