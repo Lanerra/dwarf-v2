@@ -51,7 +51,7 @@ def build_run_config(
     width_entropy_weight: float = 0.25,
     typed_mixer: bool = False,
     typed_mixer_bottleneck: int = 64,
-    typed_mixer_gate_init: float = -5.0,
+    typed_mixer_gate_init: float = -2.5,
     query_type_bias: bool = False,
     typed_hisa_reps: bool = False,
     dsr_candidates: bool = True,
@@ -215,7 +215,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width-entropy-weight", type=float, default=0.25)
     parser.add_argument("--typed-mixer", action="store_true", help="Enable the typed candidate-set mixer before DSQG-W scoring.")
     parser.add_argument("--typed-mixer-bottleneck", type=int, default=64)
-    parser.add_argument("--typed-mixer-gate-init", type=float, default=-5.0)
+    parser.add_argument("--typed-mixer-gate-init", type=float, default=-2.5)
     parser.add_argument("--query-type-bias", action="store_true", help="Enable query-conditioned candidate-type score bias.")
     parser.add_argument("--typed-hisa-reps", action="store_true", help="Label first four HISA evidence candidates as representative evidence slots.")
     parser.add_argument("--no-dsr-candidates", action="store_true", help="Disable direct HISA/DSR selected-token candidates and use fallback offset candidates only.")

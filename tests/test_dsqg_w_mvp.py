@@ -357,6 +357,50 @@ def test_dsqg_w_width_cell_pair_bias_can_directionally_route_question_to_evidenc
     assert telemetry["dsqg_w_width_self_mass"].item() < 0.60
 
 
+def test_dsqg_w_width_cell_relation_features_can_affect_lateral_routing() -> None:
+    cand_states = torch.zeros(1, 1, 3, 16)
+    cand_states[0, 0, 0, 0] = 1.0
+    cand_states[0, 0, 1, 0] = 1.0
+    cand_states[0, 0, 2, 0] = -1.0
+    cand_types = torch.tensor([[[
+        int(CandidateType.QUESTION),
+        int(CandidateType.HISA_EVIDENCE),
+        int(CandidateType.LOCAL),
+    ]]])
+    cand_sources = torch.tensor([[[
+        int(CandidateSource.FINAL),
+        int(CandidateSource.HISA),
+        int(CandidateSource.FINAL),
+    ]]])
+    cand_mask = torch.ones(1, 1, 3, dtype=torch.bool)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=3,
+        use_width_cell=True,
+        width_bottleneck=8,
+        width_gate_init=6.0,
+    )
+    block = DSQGWBlock.from_config(cfg).eval()
+    assert block.width_cell is not None
+    with torch.no_grad():
+        block.width_cell.q_proj.weight.zero_()
+        block.width_cell.k_proj.weight.zero_()
+        block.width_cell.type_pair_bias.zero_()
+        block.width_cell.source_pair_bias.zero_()
+        block.width_cell.self_bias.fill_(-8.0)
+        block.width_cell.rel_diff_proj.weight.zero_()
+        block.width_cell.rel_prod_proj.weight.zero_()
+        block.width_cell.rel_prod_proj.weight[0, 0] = 1.0
+        block.width_cell.rel_score.zero_()
+        block.width_cell.rel_score[0] = 8.0
+
+    _, telemetry = block.width_cell(cand_states, cand_types, cand_sources, cand_mask)
+
+    assert telemetry["dsqg_w_width_question_to_hisa_evidence_mass"].item() > 0.80
+    assert telemetry["dsqg_w_width_self_mass"].item() < 0.20
+
+
 def test_candidate_provider_can_label_hisa_evidence_slots_as_query_representatives() -> None:
     x = make_hidden(batch=1, seq=6, d=16)
     cfg = DSQGWConfig(
@@ -381,6 +425,43 @@ def test_candidate_provider_can_label_hisa_evidence_slots_as_query_representativ
     assert int(CandidateType.HISA_EVIDENCE_REP3) in valid_types
     assert int(CandidateType.HISA_EVIDENCE) not in valid_types
     assert batch.telemetry["dsqg_w_candidate_fraction_hisa_evidence_rep0"].item() > 0.0
+
+
+def test_specialized_metadata_fast_path_preserves_typed_hisa_representatives() -> None:
+    x = make_hidden(batch=1, seq=6, d=16)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=8,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=2,
+        k_hisa_evidence=4,
+        k_l3_skip=1,
+        k_chunk=0,
+        typed_hisa_reps=True,
+    )
+    provider = CandidateProvider(cfg)
+    positions = torch.arange(6)
+    question = torch.tensor([[0, 3]])
+    hisa = torch.stack([(positions - i).clamp_min(0) for i in [1, 2, 3, 4]], dim=-1).unsqueeze(0)
+    scores = torch.arange(24, dtype=x.dtype).reshape(1, 6, 4)
+    l3_skip = (positions - 5).clamp_min(0).reshape(1, 6, 1)
+
+    batch = provider.build_metadata(
+        x,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=scores,
+        l3_skip_indices=l3_skip,
+    )
+
+    valid_types = batch.cand_types[batch.cand_mask].tolist()
+    assert batch.telemetry["dsqg_w_candidate_specialized_metadata"].item() == 1.0
+    assert int(CandidateType.HISA_EVIDENCE_REP0) in valid_types
+    assert int(CandidateType.HISA_EVIDENCE_REP1) in valid_types
+    assert int(CandidateType.HISA_EVIDENCE_REP2) in valid_types
+    assert int(CandidateType.HISA_EVIDENCE_REP3) in valid_types
 
 
 def test_typed_candidate_mixer_is_bounded_and_near_identity_when_closed() -> None:
@@ -414,6 +495,66 @@ def test_typed_candidate_mixer_is_bounded_and_near_identity_when_closed() -> Non
     assert telemetry["dsqg_w_typed_mixer_gate_mean"].item() < 1e-4
     assert telemetry["dsqg_w_typed_mixer_entropy"].item() > 0.0
     assert telemetry["dsqg_w_typed_mixer_delta_norm"].item() >= 0.0
+
+
+def test_sourcewise_path_materializes_semantic_candidate_machinery_instead_of_rejecting() -> None:
+    torch.manual_seed(57)
+    x = make_hidden(batch=1, seq=6, d=16).requires_grad_(True)
+    l3 = (x * 1.25).clone()
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=8,
+        bottleneck=32,
+        gate_init=-2.5,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=2,
+        k_hisa_evidence=4,
+        k_l3_skip=1,
+        use_width_cell=True,
+        width_bottleneck=8,
+        width_gate_init=-4.0,
+        use_typed_mixer=True,
+        typed_mixer_bottleneck=8,
+        typed_mixer_gate_init=-4.0,
+        typed_hisa_reps=True,
+    )
+    provider = CandidateProvider(cfg)
+    positions = torch.arange(6)
+    question = torch.tensor([[0, 3]])
+    hisa = torch.stack([(positions - i).clamp_min(0) for i in [1, 2, 3, 4]], dim=-1).unsqueeze(0)
+    scores = torch.arange(24, dtype=x.dtype).reshape(1, 6, 4)
+    l3_skip = (positions - 5).clamp_min(0).reshape(1, 6, 1)
+    metadata = provider.build_metadata(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=scores,
+        l3_skip_indices=l3_skip,
+    )
+    block = DSQGWBlock.from_config(cfg)
+
+    out, telemetry = block.forward_sourcewise(
+        x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=l3,
+        cand_scores=metadata.cand_scores,
+        return_routing=True,
+    )
+    out.square().mean().backward()
+
+    assert out.shape == x.shape
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    assert telemetry["dsqg_w_sourcewise_semantic_materialized"].item() == 1.0
+    assert telemetry["dsqg_w_triton_sourcewise_semantic_bypass"].item() == 0.0
+    assert "dsqg_w_width_gate_mean" in telemetry
+    assert "dsqg_w_typed_mixer_gate_mean" in telemetry
 
 
 def test_query_conditioned_type_bias_can_route_scores_to_hisa_rep_candidate() -> None:

@@ -3067,7 +3067,15 @@ class TriadicJ96Dsr(nn.Module):
                 k_question=DSQG_W_K_QUESTION,
                 k_hisa_evidence=DSQG_W_K_HISA_EVIDENCE,
                 k_chunk=0,
-                k_l3_skip=DSQG_W_K_L3_SKIP,
+                k_l3_skip=(
+                    1
+                    if (
+                        DSQG_W_FAST_EVIDENCE_MEAN
+                        and os.getenv('DWARF_DSQG_W_ALLOW_FAST_EVIDENCE_MEAN_BYPASS', '0') != '1'
+                        and DSQG_W_K_L3_SKIP <= 0
+                    )
+                    else DSQG_W_K_L3_SKIP
+                ),
                 use_width_cell=DSQG_W_WIDTH_CELL,
                 width_bottleneck=DSQG_W_WIDTH_BOTTLENECK,
                 width_gate_init=DSQG_W_WIDTH_GATE_INIT,
@@ -3373,10 +3381,16 @@ class TriadicJ96Dsr(nn.Module):
         if site_key not in self.dsqg_w_blocks:
             return x
         block = self.dsqg_w_blocks[site_key]
-        recomposer_x = x.detach() if DSQG_W_DETACH_RECOMPOSER else x
-        recomposer_l3_states = l3_states.detach() if DSQG_W_DETACH_RECOMPOSER and l3_states is not None else l3_states
-        grad_context = torch.no_grad() if DSQG_W_DETACH_RECOMPOSER else contextlib.nullcontext()
-        if DSQG_W_FAST_EVIDENCE_MEAN:
+        allow_fast_mean_bypass = os.getenv('DWARF_DSQG_W_ALLOW_FAST_EVIDENCE_MEAN_BYPASS', '0') == '1'
+        force_trainable_candidate_path = DSQG_W_FAST_EVIDENCE_MEAN and not allow_fast_mean_bypass
+        if force_trainable_candidate_path and l3_states is not None and l3_skip_indices is None and self.dsqg_w_config.k_l3_skip > 0:
+            seq_len = int(x.shape[1])
+            l3_skip_indices = torch.arange(seq_len, device=x.device, dtype=torch.long).reshape(1, seq_len, 1)
+        effective_detach_recomposer = DSQG_W_DETACH_RECOMPOSER and not force_trainable_candidate_path
+        recomposer_x = x.detach() if effective_detach_recomposer else x
+        recomposer_l3_states = l3_states.detach() if effective_detach_recomposer and l3_states is not None else l3_states
+        grad_context = torch.no_grad() if effective_detach_recomposer else contextlib.nullcontext()
+        if DSQG_W_FAST_EVIDENCE_MEAN and allow_fast_mean_bypass:
             with _profile_range(f'dsqg_w/site={site_key}'):
                 with grad_context:
                     x_out, telemetry = self._apply_dsqg_w_fast_evidence_mean(
@@ -3390,9 +3404,10 @@ class TriadicJ96Dsr(nn.Module):
             merged_telemetry = dict(telemetry)
             merged_telemetry['dsqg_w_site_key'] = site_key
             merged_telemetry['dsqg_w_metadata_cache_hit'] = x.new_tensor(0.0).detach()
-            merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if DSQG_W_DETACH_RECOMPOSER else 0.0).detach()
+            merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if effective_detach_recomposer else 0.0).detach()
+            merged_telemetry['dsqg_w_fast_evidence_mean_bypass'] = x.new_tensor(1.0).detach()
             self.dsqg_w_last_telemetry = merged_telemetry
-            if DSQG_W_DETACH_RECOMPOSER:
+            if effective_detach_recomposer:
                 return x + (x_out - recomposer_x).detach()
             return x_out
         with _profile_range(f'dsqg_w/site={site_key}'):
@@ -3439,9 +3454,12 @@ class TriadicJ96Dsr(nn.Module):
         merged_telemetry.update(telemetry)
         merged_telemetry['dsqg_w_site_key'] = site_key
         merged_telemetry['dsqg_w_metadata_cache_hit'] = x.new_tensor(1.0 if metadata_cache_hit else 0.0).detach()
-        merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if DSQG_W_DETACH_RECOMPOSER else 0.0).detach()
+        merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if effective_detach_recomposer else 0.0).detach()
+        merged_telemetry['dsqg_w_fast_evidence_mean_requested'] = x.new_tensor(1.0 if DSQG_W_FAST_EVIDENCE_MEAN else 0.0).detach()
+        merged_telemetry['dsqg_w_fast_evidence_mean_bypass'] = x.new_tensor(0.0).detach()
+        merged_telemetry['dsqg_w_force_trainable_candidate_path'] = x.new_tensor(1.0 if force_trainable_candidate_path else 0.0).detach()
         self.dsqg_w_last_telemetry = merged_telemetry
-        if DSQG_W_DETACH_RECOMPOSER:
+        if effective_detach_recomposer:
             return x + (x_out - recomposer_x).detach()
         return x_out
 

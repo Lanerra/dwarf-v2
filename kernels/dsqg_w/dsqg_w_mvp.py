@@ -373,7 +373,6 @@ class CandidateProvider:
             not self.config.local_offsets
             and not self.config.long_offsets
             and self.config.k_chunk <= 0
-            and not self.config.typed_hisa_reps
             and chunk_rep_indices is None
             and question_indices is not None
             and hisa_evidence_indices is not None
@@ -436,18 +435,37 @@ class CandidateProvider:
                 materialize_states=False,
             )
 
-        def group(tokens: torch.Tensor, ctype: int, source: int, scores: torch.Tensor | None = None):
+        def group(tokens: torch.Tensor, ctype: int | torch.Tensor, source: int, scores: torch.Tensor | None = None):
             valid = (tokens >= 0) & (tokens <= positions)
             score_values = torch.zeros(tokens.shape, device=device, dtype=final_states.dtype) if scores is None else torch.nan_to_num(
                 scores.to(device=device, dtype=final_states.dtype), nan=0.0, neginf=0.0, posinf=0.0
             )
             keep, dup = self._dedupe_same_source_group(tokens, score_values, valid)
-            types = torch.full(tokens.shape, int(ctype), device=device, dtype=torch.long)
+            if torch.is_tensor(ctype):
+                types = ctype.to(device=device, dtype=torch.long).expand_as(tokens)
+            else:
+                types = torch.full(tokens.shape, int(ctype), device=device, dtype=torch.long)
             sources = torch.full(tokens.shape, int(source), device=device, dtype=torch.long)
             return tokens, types, sources, keep, score_values, dup
 
+        if self.config.typed_hisa_reps:
+            rep_type_ids = torch.tensor(
+                [
+                    int(CandidateType.HISA_EVIDENCE_REP0),
+                    int(CandidateType.HISA_EVIDENCE_REP1),
+                    int(CandidateType.HISA_EVIDENCE_REP2),
+                    int(CandidateType.HISA_EVIDENCE_REP3),
+                ],
+                device=device,
+                dtype=torch.long,
+            )
+            slot_ids = torch.arange(h_idx.shape[-1], device=device, dtype=torch.long)
+            h_types = rep_type_ids[slot_ids.clamp_max(rep_type_ids.numel() - 1)].reshape(1, 1, -1).expand_as(h_idx)
+        else:
+            h_types = int(CandidateType.HISA_EVIDENCE)
+
         groups = [
-            group(h_idx, int(CandidateType.HISA_EVIDENCE), int(CandidateSource.HISA), h_scores),
+            group(h_idx, h_types, int(CandidateSource.HISA), h_scores),
             group(q_idx, int(CandidateType.QUESTION), int(CandidateSource.FINAL), None),
             group(s_idx, int(CandidateType.L3_SKIP), int(CandidateSource.L3), None),
         ]
@@ -1098,6 +1116,9 @@ class DSQGWWidthCell(nn.Module):
         self.q_proj = nn.Linear(d, self.width_dim, bias=False)
         self.k_proj = nn.Linear(d, self.width_dim, bias=False)
         self.v_proj = nn.Linear(d, self.width_dim, bias=False)
+        self.rel_diff_proj = nn.Linear(d, self.width_dim, bias=False)
+        self.rel_prod_proj = nn.Linear(d, self.width_dim, bias=False)
+        self.rel_score = nn.Parameter(torch.zeros(self.width_dim))
         self.lateral_up = nn.Linear(self.width_dim, d, bias=False)
         self.type_pair_bias = nn.Parameter(torch.zeros(n_types, n_types))
         self.source_pair_bias = nn.Parameter(torch.zeros(n_sources, n_sources))
@@ -1127,6 +1148,13 @@ class DSQGWWidthCell(nn.Module):
         v = self.v_proj(c_n)
 
         scores = (q[:, :, :, None, :] * k[:, :, None, :, :]).sum(dim=-1) / math.sqrt(float(self.width_dim))
+        rel_diff = self.rel_diff_proj(c_n)
+        rel_prod = self.rel_prod_proj(c_n)
+        rel_hidden = torch.tanh(
+            (rel_diff[:, :, :, None, :] - rel_diff[:, :, None, :, :])
+            + (rel_prod[:, :, :, None, :] * rel_prod[:, :, None, :, :])
+        )
+        scores = scores + (rel_hidden * self.rel_score.reshape(1, 1, 1, 1, self.width_dim)).sum(dim=-1) / math.sqrt(float(self.width_dim))
         scores = scores + self.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
         scores = scores + self.source_pair_bias[cand_sources[:, :, :, None], cand_sources[:, :, None, :]]
         eye = torch.eye(j_count, device=cand_states.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
@@ -2653,6 +2681,57 @@ class DSQGWBlock(nn.Module):
             bsz, seq_len, *states.shape[2:]
         )
 
+    @staticmethod
+    def _gather_source_candidate_states(states: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
+        """Gather [B,T,J] causal token indices from a [B,T,D] source surface."""
+        if states.ndim != 3 or token_indices.ndim != 3:
+            raise ValueError("expected states [B,T,D] and token_indices [B,T,J]")
+        bsz, seq_len, d = states.shape
+        if token_indices.shape[:2] != (bsz, seq_len):
+            raise ValueError("candidate token index shape must align with states [B,T]")
+        gather_tokens = token_indices.clamp(0, max(seq_len - 1, 0)).to(torch.long)
+        batch_offsets = torch.arange(bsz, device=states.device, dtype=torch.long).reshape(bsz, 1, 1) * seq_len
+        flat_indices = (batch_offsets + gather_tokens).reshape(-1)
+        gathered = states.reshape(bsz * seq_len, d).index_select(0, flat_indices)
+        return gathered.reshape(bsz, seq_len, token_indices.shape[-1], d)
+
+    def _materialize_sourcewise_candidate_states(
+        self,
+        x: torch.Tensor,
+        cand_token_indices: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Materialize compact metadata only when semantic candidate machinery needs it.
+
+        Sourcewise/Triton normally avoids [B,T,J,D] candidates.  Width-cell and
+        typed-mixer semantics operate over candidate states themselves, so they
+        must gather the same causal source surfaces instead of rejecting or
+        bypassing those mechanisms.
+        """
+        final_states = x
+        l3_base = l3_states if l3_states is not None else final_states
+        summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
+        zero_base = torch.zeros_like(final_states)
+        bases: dict[int, torch.Tensor] = {
+            int(CandidateSource.FINAL): final_states,
+            int(CandidateSource.QUESTION_CACHE): final_states,
+            int(CandidateSource.L3): l3_base,
+            int(CandidateSource.HISA): l3_base,
+            int(CandidateSource.SUMMARY): summary_base,
+            int(CandidateSource.NULL): zero_base,
+        }
+        cand_states = x.new_zeros((*cand_token_indices.shape, x.shape[-1]))
+        for source_id, states in bases.items():
+            source_mask = (cand_sources == int(source_id)) & cand_mask
+            if bool(source_mask.any()):
+                gathered = self._gather_source_candidate_states(states, cand_token_indices)
+                cand_states = cand_states + gathered * source_mask[..., None].to(gathered.dtype)
+        return cand_states
+
     def _source_projection_cache(
         self,
         x: torch.Tensor,
@@ -3017,8 +3096,6 @@ class DSQGWBlock(nn.Module):
         return_routing: bool = False,
         needed_source_ids: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if self.width_cell is not None or self.typed_mixer is not None:
-            raise NotImplementedError("sourcewise DSQG-W does not implement width_cell or typed_mixer")
         bsz, seq_len, d = x.shape
         if d != self.d:
             raise ValueError(f"x last dim {d} does not match block d {self.d}")
@@ -3037,6 +3114,27 @@ class DSQGWBlock(nn.Module):
             raise ValueError("l3_states must match x shape")
         if chunk_rep_states is not None and chunk_rep_states.shape != x.shape:
             raise ValueError("chunk_rep_states must match x shape")
+        if self.width_cell is not None or self.typed_mixer is not None:
+            cand_states = self._materialize_sourcewise_candidate_states(
+                x,
+                cand_token_indices,
+                cand_sources,
+                cand_mask,
+                l3_states=l3_states,
+                chunk_rep_states=chunk_rep_states,
+            )
+            x_out, telemetry = self.forward(
+                x,
+                cand_states,
+                cand_types,
+                cand_sources,
+                cand_mask,
+                cand_scores=cand_scores,
+                return_routing=return_routing,
+            )
+            telemetry["dsqg_w_sourcewise_semantic_materialized"] = x.new_tensor(1.0).detach()
+            telemetry["dsqg_w_triton_sourcewise_semantic_bypass"] = x.new_tensor(0.0).detach()
+            return x_out, telemetry
         if os.getenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "0") == "1":
             return self._forward_sourcewise_triton(
                 x,

@@ -32,7 +32,7 @@ def test_parse_trainer_stdout_extracts_health_and_w_metrics(tmp_path: Path) -> N
                 "  HISA Stage-2 selector: rep_r=4 (0=rowmax baseline)",
                 "  train: 128 seqs  val: 64 seqs  host_dtype=torch.int32 train_real=161/262,016 (0.06%) val_real=82/131,008 (0.06%)",
                 "  [ep1 step 8/16] ce=9.5 se_max=0.1 grad_norm=1.0 lr=1.0e-4 1234 tok/s routing_ent=2.5 w_gate=0.119 w_dx=0.101 w_hisa=0.62 w_score=0.002 w_smean=0.21 w_mix_gate=0.119",
-                "  [ep1 step 16/16] ce=8.5 se_max=0.1 grad_norm=1.0 lr=1.0e-4 2345 tok/s routing_ent=2.4 w_gate=0.120 w_dx=0.111 w_hisa=0.61 w_score=0.003 w_smean=0.22 w_mix_gate=0.121",
+                "  [ep1 step 16/16] ce=8.5 se_max=0.1 grad_norm=1.0 lr=1.0e-4 2345 tok/s routing_ent=2.4 w_gate=0.120 w_dx=0.111 w_hisa=0.61 w_score=0.003 w_smean=0.22 w_mix_gate=0.121 w_fast=1.000 w_det=1.000 w_j=1.000",
                 "Ep 1/1 | Val PPL 12345.67 *",
                 "  Passkey mean=12.5%",
                 "  peak_vram=3456MB  elapsed=42s",
@@ -58,6 +58,9 @@ def test_parse_trainer_stdout_extracts_health_and_w_metrics(tmp_path: Path) -> N
     assert metrics["val_ppl"] == 12345.67
     assert metrics["peak_vram_mb"] == 3456
     assert metrics["w_dx"] == 0.111
+    assert metrics["w_fast"] == 1.0
+    assert metrics["w_det"] == 1.0
+    assert metrics["w_j"] == 1.0
     assert metrics["avg_logged_tok_s"] == (1234 + 2345) / 2
 
 
@@ -141,6 +144,61 @@ def test_ladder_runner_variant_ids_filter_tighter_attribution_set(tmp_path: Path
     assert (out_root / "same_family/B_dsr_rep4/run_config.json").exists()
     assert (out_root / "same_family/C_dfed_w_min/run_config.json").exists()
     assert (out_root / "same_family/D_dfed_w_full/run_config.json").exists()
+
+
+def test_ladder_runner_can_select_fast_aligned_l3_reset_variants(tmp_path: Path) -> None:
+    mod = load_module(RUNNER_SCRIPT, "run_dsqg_w_ladder_fast_l3_test")
+    dataset = tmp_path / "pretrain.pt"
+    dataset.write_bytes(b"not loaded during dry-run")
+    out_root = tmp_path / "fast_l3_ladder"
+
+    result = mod.main(
+        [
+            "--out-root",
+            str(out_root),
+            "--lanes",
+            "pretrain",
+            "--pretrain-dataset",
+            str(dataset),
+            "--variant-ids",
+            "B_dsr_rep4,E_fast_l3_3site,F_fast_l3_final",
+            "--max-acc-steps",
+            "3",
+            "--train-seqs",
+            "4",
+            "--val-seqs",
+            "2",
+            "--dry-run",
+        ]
+    )
+
+    assert result["pass"] is True
+    manifest = json.loads((out_root / "ladder_manifest.json").read_text(encoding="utf-8"))
+    assert [v["variant_id"] for v in manifest["variants"]] == [
+        "B_dsr_rep4",
+        "E_fast_l3_3site",
+        "F_fast_l3_final",
+    ]
+    cfg_b = json.loads((out_root / "pretrain/B_dsr_rep4/run_config.json").read_text(encoding="utf-8"))
+    cfg_e = json.loads((out_root / "pretrain/E_fast_l3_3site/run_config.json").read_text(encoding="utf-8"))
+    cfg_f = json.loads((out_root / "pretrain/F_fast_l3_final/run_config.json").read_text(encoding="utf-8"))
+    assert cfg_b["env"]["DWARF_DSQG_W"] == "0"
+    assert cfg_b["env"]["DWARF_HISA_STAGE2_REP_R"] == "4"
+    for cfg in (cfg_e, cfg_f):
+        env = cfg["env"]
+        assert env["DWARF_DSQG_W"] == "1"
+        assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
+        assert env["DWARF_DSQG_W_SOURCEWISE"] == "1"
+        assert env["DWARF_DSQG_W_TRITON_SOURCEWISE"] == "1"
+        assert env["DWARF_DSQG_W_DETACH_RECOMPOSER"] == "1"
+        assert env["DWARF_DSQG_W_FAST_EVIDENCE_MEAN"] == "1"
+        assert env["DWARF_DSQG_W_K_QUESTION"] == "0"
+        assert env["DWARF_DSQG_W_K_HISA_EVIDENCE"] == "0"
+        assert env["DWARF_DSQG_W_K_L3_SKIP"] == "0"
+        assert env["DWARF_DSQG_W_LOCAL_OFFSETS"] == "none"
+        assert env["DWARF_DSQG_W_LONG_OFFSETS"] == "none"
+    assert cfg_e["env"]["DWARF_DSQG_W_SITES"] == "2,6,final"
+    assert cfg_f["env"]["DWARF_DSQG_W_SITES"] == "final"
 
 
 def test_ladder_runner_can_select_pure_dsqg_control(tmp_path: Path) -> None:

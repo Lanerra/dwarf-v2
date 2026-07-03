@@ -394,7 +394,7 @@ def test_dsqg_w_detach_recomposer_keeps_forward_delta_but_blocks_w_backward(monk
     assert all(param.grad is None for param in model.dsqg_w.parameters())
 
 
-def test_dsqg_w_fast_evidence_mean_uses_candidates_without_qkv_backward(monkeypatch) -> None:
+def test_dsqg_w_fast_evidence_mean_default_uses_trainable_scored_candidate_path(monkeypatch) -> None:
     mod = load_trainer(
         monkeypatch,
         dsqg_w=True,
@@ -413,6 +413,7 @@ def test_dsqg_w_fast_evidence_mean_uses_candidates_without_qkv_backward(monkeypa
         [(positions - 1).clamp_min(0), (positions - 2).clamp_min(0), (positions - 3).clamp_min(0), (positions - 4).clamp_min(0)],
         dim=-1,
     ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    hisa_scores = torch.arange(2 * 8 * 4, dtype=x.dtype).reshape(2, 8, 4)
     l3_skip_indices = torch.stack(
         [(positions - 2).clamp_min(0), (positions - 4).clamp_min(0)], dim=-1
     ).unsqueeze(0).expand(2, -1, -1).contiguous()
@@ -422,6 +423,7 @@ def test_dsqg_w_fast_evidence_mean_uses_candidates_without_qkv_backward(monkeypa
         l3_states=l3_states,
         question_indices=question_indices,
         hisa_evidence_indices=hisa_indices,
+        hisa_evidence_scores=hisa_scores,
         l3_skip_indices=l3_skip_indices,
     )
     out.sum().backward()
@@ -429,16 +431,49 @@ def test_dsqg_w_fast_evidence_mean_uses_candidates_without_qkv_backward(monkeypa
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
     assert (out - x).detach().abs().max().item() > 0.0
-    assert torch.allclose(x.grad, torch.ones_like(x))
-    assert l3_states.grad is None
+    assert x.grad is not None
+    assert l3_states.grad is not None
     telemetry = model.dsqg_w_last_telemetry
-    assert telemetry["dsqg_w_fast_evidence_mean"].item() == 1.0
-    assert telemetry["dsqg_w_detached_recomposer"].item() == 1.0
-    assert telemetry["dsqg_w_candidate_slot_count"].item() == 10.0
-    assert all(param.grad is None for param in model.dsqg_w.parameters())
+    assert telemetry["dsqg_w_fast_evidence_mean_requested"].item() == 1.0
+    assert telemetry["dsqg_w_fast_evidence_mean_bypass"].item() == 0.0
+    assert telemetry["dsqg_w_force_trainable_candidate_path"].item() == 1.0
+    assert telemetry["dsqg_w_detached_recomposer"].item() == 0.0
+    assert telemetry["dsqg_w_candidate_slot_count"].item() >= 1.0
+    assert any(param.grad is not None for param in model.dsqg_w.parameters())
 
 
-def test_dsqg_w_fast_evidence_mean_uses_aligned_l3_when_candidates_are_empty(monkeypatch) -> None:
+def test_dsqg_w_fast_evidence_mean_empty_candidates_become_trainable_aligned_l3_candidate(monkeypatch) -> None:
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        sourcewise=True,
+        detach_recomposer=True,
+        fast_evidence_mean=True,
+    )
+    model = make_model(mod).train()
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    l3_states = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+
+    out = model._apply_dsqg_w_recomposer(x, l3_states=l3_states)
+    out.sum().backward()
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert model.dsqg_w_config.k_l3_skip >= 1
+    assert x.grad is not None
+    assert l3_states.grad is not None
+    telemetry = model.dsqg_w_last_telemetry
+    assert telemetry["dsqg_w_fast_evidence_mean_bypass"].item() == 0.0
+    assert telemetry["dsqg_w_force_trainable_candidate_path"].item() == 1.0
+    assert telemetry["dsqg_w_candidate_fraction_l3_skip"].item() > 0.0
+    assert telemetry["dsqg_w_l3_source_mass"].item() > 0.0
+    assert any(param.grad is not None for param in model.dsqg_w.parameters())
+
+
+def test_dsqg_w_fast_evidence_mean_legacy_bypass_requires_explicit_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("DWARF_DSQG_W_ALLOW_FAST_EVIDENCE_MEAN_BYPASS", "1")
     mod = load_trainer(
         monkeypatch,
         dsqg_w=True,

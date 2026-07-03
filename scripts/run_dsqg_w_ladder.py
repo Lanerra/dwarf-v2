@@ -40,12 +40,20 @@ class Variant:
     label: str
     dsqg_w: bool
     hisa_stage2_rep_r: int
+    sites: str | None = None
     typed_mixer: bool = False
     query_type_bias: bool = False
     typed_hisa_reps: bool = False
     dsr_candidates: bool = True
     local_offsets: str = "none"
     long_offsets: str = "none"
+    sourcewise: bool = False
+    triton_sourcewise: bool = False
+    detach_recomposer: bool = False
+    fast_evidence_mean: bool = False
+    k_question: int = 4
+    k_hisa_evidence: int = 4
+    k_l3_skip: int = 2
     pure_dsqg: bool = False
     gate_init: float = -2.0
     fuse_init_std: float = 0.02
@@ -64,6 +72,13 @@ class Variant:
             "dsr_candidates": self.dsr_candidates,
             "local_offsets": self.local_offsets,
             "long_offsets": self.long_offsets,
+            "sourcewise": self.sourcewise,
+            "triton_sourcewise": self.triton_sourcewise,
+            "detach_recomposer": self.detach_recomposer,
+            "fast_evidence_mean": self.fast_evidence_mean,
+            "k_question": self.k_question,
+            "k_hisa_evidence": self.k_hisa_evidence,
+            "k_l3_skip": self.k_l3_skip,
             "pure_dsqg": self.pure_dsqg,
             "gate_init": self.gate_init,
             "fuse_init_std": self.fuse_init_std,
@@ -95,6 +110,42 @@ VARIANTS: tuple[Variant, ...] = (
         dsqg_w=False,
         hisa_stage2_rep_r=4,
         notes="Backbone only; isolates HISA query-representative Stage-2.",
+    ),
+    Variant(
+        variant_id="E_fast_l3_3site",
+        label="Fast aligned-L3 detached W at L2/L6/final",
+        dsqg_w=True,
+        hisa_stage2_rep_r=4,
+        sites="2,6,final",
+        sourcewise=True,
+        triton_sourcewise=True,
+        detach_recomposer=True,
+        fast_evidence_mean=True,
+        k_question=0,
+        k_hisa_evidence=0,
+        k_l3_skip=0,
+        notes=(
+            "Production-candidate fast semantic-W screen: no per-token candidate gathers; "
+            "uses aligned L3/DSR state as J=1 read vector with forward-only detached perturbation."
+        ),
+    ),
+    Variant(
+        variant_id="F_fast_l3_final",
+        label="Fast aligned-L3 detached W at final only",
+        dsqg_w=True,
+        hisa_stage2_rep_r=4,
+        sites="final",
+        sourcewise=True,
+        triton_sourcewise=True,
+        detach_recomposer=True,
+        fast_evidence_mean=True,
+        k_question=0,
+        k_hisa_evidence=0,
+        k_l3_skip=0,
+        notes=(
+            "Placement control for the fast aligned-L3 W path; expected as lower-bound/final-only evidence, "
+            "not the preferred promoted architecture if 3-site is healthy."
+        ),
     ),
     Variant(
         variant_id="C_dfed_w_min",
@@ -142,12 +193,20 @@ def _jsonable(value: Any) -> Any:
             "label": value.label,
             "dsqg_w": value.dsqg_w,
             "hisa_stage2_rep_r": value.hisa_stage2_rep_r,
+            "sites": value.sites,
             "typed_mixer": value.typed_mixer,
             "query_type_bias": value.query_type_bias,
             "typed_hisa_reps": value.typed_hisa_reps,
             "dsr_candidates": value.dsr_candidates,
             "local_offsets": value.local_offsets,
             "long_offsets": value.long_offsets,
+            "sourcewise": value.sourcewise,
+            "triton_sourcewise": value.triton_sourcewise,
+            "detach_recomposer": value.detach_recomposer,
+            "fast_evidence_mean": value.fast_evidence_mean,
+            "k_question": value.k_question,
+            "k_hisa_evidence": value.k_hisa_evidence,
+            "k_l3_skip": value.k_l3_skip,
             "pure_dsqg": value.pure_dsqg,
             "gate_init": value.gate_init,
             "fuse_init_std": value.fuse_init_std,
@@ -202,7 +261,7 @@ def build_variant_config(
         epochs=args.epochs,
         log_interval=args.log_interval,
         passkey_trials=args.passkey_trials,
-        sites=args.sites,
+        sites=variant.sites or args.sites,
         max_candidates=args.max_candidates,
         width_cell=args.width_cell,
         width_bottleneck=args.width_bottleneck,

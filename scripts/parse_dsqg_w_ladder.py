@@ -129,7 +129,18 @@ def parse_trainer_text(text: str, *, stdout_path: str | Path | None = None) -> d
         metrics["planned_steps"] = last["total_steps"]
         metrics["final_ce"] = last["ce"]
         metrics["avg_logged_tok_s"] = sum(float(s["tok_s"]) for s in steps) / len(steps)
-        for key in ("w_gate", "w_dx", "w_hisa", "w_score", "w_smean", "w_mix_gate", "routing_ent"):
+        for key in (
+            "w_gate",
+            "w_dx",
+            "w_hisa",
+            "w_score",
+            "w_smean",
+            "w_mix_gate",
+            "w_fast",
+            "w_det",
+            "w_j",
+            "routing_ent",
+        ):
             if key in last:
                 metrics[key] = last[key]
     else:
@@ -230,6 +241,9 @@ def summarize_lane(results: list[dict[str, Any]]) -> dict[str, Any]:
             "w_hisa": metrics.get("w_hisa"),
             "w_gate": metrics.get("w_gate"),
             "w_mix_gate": metrics.get("w_mix_gate"),
+            "w_fast": metrics.get("w_fast"),
+            "w_det": metrics.get("w_det"),
+            "w_j": metrics.get("w_j"),
             "hisa_stage2_rep_r": metrics.get("hisa_stage2_rep_r"),
         }
         if isinstance(base_ppl, (int, float)) and isinstance(row["val_ppl"], (int, float)):
