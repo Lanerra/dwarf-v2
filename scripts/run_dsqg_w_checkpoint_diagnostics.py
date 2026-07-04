@@ -236,7 +236,18 @@ def run_loss_mode(module, model, batch: torch.Tensor, device: torch.device, mode
     hidden, y, target_mask, telemetry = forward_hidden(module, model, batch, device)
     n_rows = int(target_mask.sum().item())
     losses: dict[str, float] = {}
-    if mode in {"ce", "combined"}:
+    if mode == "combined":
+        # Aux branches off inside the recomposer before final hidden projection.
+        # Backprop it first and retain the graph so the streamed CE backward can
+        # still traverse the shared forward graph.  Doing streamed CE first frees
+        # the graph and makes the subsequent aux backward invalid.
+        aux = module._dsqg_w_width_aux_loss(model, model)
+        aux_value = module._dsqg_w_width_aux_value(model, model)
+        if aux is None:
+            losses["aux_loss"] = None
+        else:
+            losses["aux_loss"] = float(aux.detach().item() if aux_value is None else aux_value)
+            (aux * float(aux_weight)).backward(retain_graph=True)
         total_ce, _ = module._streamed_linear_ce_loss(
             hidden,
             y,
@@ -247,15 +258,27 @@ def run_loss_mode(module, model, batch: torch.Tensor, device: torch.device, mode
         )
         losses["ce_loss_sum"] = float(total_ce.detach().item())
         losses["ce_loss_mean"] = float(total_ce.detach().item() / float(max(n_rows, 1)))
-    if mode in {"aux", "weighted_aux", "combined"}:
-        aux = module._dsqg_w_width_aux_loss(model, model)
-        aux_value = module._dsqg_w_width_aux_value(model, model)
-        if aux is None:
-            losses["aux_loss"] = None
-        else:
-            losses["aux_loss"] = float(aux.detach().item() if aux_value is None else aux_value)
-            scale = aux_weight if mode in {"weighted_aux", "combined"} else 1.0
-            (aux * float(scale)).backward()
+    else:
+        if mode == "ce":
+            total_ce, _ = module._streamed_linear_ce_loss(
+                hidden,
+                y,
+                model.out.weight,
+                chunk_rows=int(getattr(module, "CE_CHUNK", 4096)),
+                grad_denom=float(max(n_rows, 1)),
+                loss_mask=target_mask,
+            )
+            losses["ce_loss_sum"] = float(total_ce.detach().item())
+            losses["ce_loss_mean"] = float(total_ce.detach().item() / float(max(n_rows, 1)))
+        if mode in {"aux", "weighted_aux"}:
+            aux = module._dsqg_w_width_aux_loss(model, model)
+            aux_value = module._dsqg_w_width_aux_value(model, model)
+            if aux is None:
+                losses["aux_loss"] = None
+            else:
+                losses["aux_loss"] = float(aux.detach().item() if aux_value is None else aux_value)
+                scale = aux_weight if mode == "weighted_aux" else 1.0
+                (aux * float(scale)).backward()
     groups = grad_groups(model)
     zero_grad(model)
     return {"mode": mode, "losses": losses, "grad_norms": groups, "forward_telemetry": telemetry}
