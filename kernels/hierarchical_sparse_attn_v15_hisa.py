@@ -457,33 +457,59 @@ def _pack_hisa_selected_tokens_for_dsqg_w(
 
     out_idx = torch.full((B, seq_len, max_candidates), -1, dtype=torch.long, device=device)
     out_scores = torch.full((B, seq_len, max_candidates), float("-inf"), dtype=torch.float32, device=device)
-    positions = torch.arange(seq_len, device=device, dtype=torch.long)
 
+    # Vectorize over rows inside each query chunk.  The original implementation
+    # rebuilt a [B, seq_len] scatter table and ran topk once per token row; at
+    # N=2048/C=32 this produced thousands of topk/scatter kernels per trainer
+    # step.  HISA selections are chunk-scoped, so within a chunk we can dedupe
+    # candidate tokens once, then apply a small causal prefix mask for all rows
+    # in that chunk and topk over [B, chunk_rows, prefix_len].
     for c_q in range(C):
         q_start = c_q * chunk_size
         if q_start >= seq_len:
             break
         q_end = min(q_start + chunk_size, seq_len)
+        row_count = q_end - q_start
+        if row_count <= 0:
+            continue
         flat_idx = token_idx_packed[:, :, c_q].reshape(B, -1).to(torch.long)
         flat_scores = token_scores_packed[:, :, c_q].reshape(B, -1).to(torch.float32)
-        flat_valid = (flat_idx >= 0) & torch.isfinite(flat_scores) & (flat_idx < seq_len)
-        safe_idx = flat_idx.clamp(0, max(seq_len - 1, 0))
-        for t in range(q_start, q_end):
-            causal = flat_valid & (flat_idx <= positions[t])
-            if not bool(causal.any()):
-                continue
-            score_table = torch.full((B, seq_len), float("-inf"), dtype=torch.float32, device=device)
-            score_table.scatter_reduce_(
+        # Tokens at positions >= q_end are future for every row in this query
+        # chunk, so they can be dropped before scatter.  Tokens in [0, q_end)
+        # get max-score deduped once per chunk.
+        flat_valid = (flat_idx >= 0) & torch.isfinite(flat_scores) & (flat_idx < q_end)
+        safe_idx = flat_idx.clamp(0, max(q_end - 1, 0))
+        score_table = torch.full((B, q_end), float("-inf"), dtype=torch.float32, device=device)
+        score_table.scatter_reduce_(
+            dim=-1,
+            index=safe_idx,
+            src=torch.where(flat_valid, flat_scores, torch.full_like(flat_scores, float("-inf"))),
+            reduce="amax",
+            include_self=True,
+        )
+        prefix_positions = torch.arange(q_end, device=device, dtype=torch.long)
+        row_positions = torch.arange(q_start, q_end, device=device, dtype=torch.long)
+        causal = prefix_positions.reshape(1, 1, q_end) <= row_positions.reshape(1, row_count, 1)
+        causal_scores = score_table[:, None, :].expand(B, row_count, q_end).masked_fill(~causal, float("-inf"))
+        k_eff = min(max_candidates, q_end)
+        top_scores, top_idx = causal_scores.topk(k_eff, dim=-1)
+        if k_eff < max_candidates:
+            pad_shape = (B, row_count, max_candidates - k_eff)
+            top_scores = torch.cat(
+                [top_scores, torch.full(pad_shape, float("-inf"), dtype=top_scores.dtype, device=device)],
                 dim=-1,
-                index=safe_idx,
-                src=torch.where(causal, flat_scores, torch.full_like(flat_scores, float("-inf"))),
-                reduce="amax",
-                include_self=True,
             )
-            top_scores, top_idx = score_table.topk(max_candidates, dim=-1)
-            valid_top = torch.isfinite(top_scores)
-            out_idx[:, t, :] = torch.where(valid_top, top_idx, torch.full_like(top_idx, -1))
-            out_scores[:, t, :] = torch.where(valid_top, top_scores, torch.full_like(top_scores, float("-inf")))
+            top_idx = torch.cat(
+                [top_idx, torch.full(pad_shape, -1, dtype=top_idx.dtype, device=device)],
+                dim=-1,
+            )
+        valid_top = torch.isfinite(top_scores)
+        out_idx[:, q_start:q_end, :] = torch.where(valid_top, top_idx, torch.full_like(top_idx, -1))
+        out_scores[:, q_start:q_end, :] = torch.where(
+            valid_top,
+            top_scores,
+            torch.full_like(top_scores, float("-inf")),
+        )
     return out_idx, out_scores
 
 

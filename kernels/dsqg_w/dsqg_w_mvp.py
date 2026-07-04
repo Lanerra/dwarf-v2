@@ -1214,7 +1214,11 @@ class DSQGWWidthCell(nn.Module):
         question_mask = cand_types == int(CandidateType.QUESTION)
         hisa_family_mask = _hisa_evidence_type_mask(cand_types)
 
-        delta_norm = delta.masked_select(cand_mask[..., None]).reshape(-1, d).norm(dim=-1).mean()
+        # Avoid masked_select(cand_mask[..., None]) here: at trainer shape (BS=16,
+        # N=2048, J=11, D=512) it materializes a multi-GB boolean-expanded copy
+        # purely for telemetry and can OOM before the width-cell gate is measured.
+        valid_delta_count = cand_mask.to(delta.dtype).sum().clamp_min(1.0)
+        delta_norm = (delta.norm(dim=-1) * cand_mask.to(delta.dtype)).sum() / valid_delta_count
         transfer_aux_loss = width_pair_transfer_loss(p_mean, cand_types, cand_mask)
         entropy_penalty = torch.relu(entropy.new_tensor(self.entropy_floor) - entropy)
         aux_loss = transfer_aux_loss + self.entropy_weight * entropy_penalty
@@ -1309,7 +1313,8 @@ class DSQGWTypedCandidateMixer(nn.Module):
         valid_targets = cand_mask.bool()
         p_safe = probs.clamp_min(1e-8)
         entropy = (-(p_safe * p_safe.log()).sum(dim=-1)).masked_select(valid_targets).mean()
-        delta_norm = delta.masked_select(cand_mask[..., None]).reshape(-1, d).norm(dim=-1).mean()
+        valid_delta_count = cand_mask.to(delta.dtype).sum().clamp_min(1.0)
+        delta_norm = (delta.norm(dim=-1) * cand_mask.to(delta.dtype)).sum() / valid_delta_count
         telemetry = {
             "dsqg_w_typed_mixer_entropy": entropy.detach(),
             "dsqg_w_typed_mixer_gate_mean": gate.mean().detach(),
