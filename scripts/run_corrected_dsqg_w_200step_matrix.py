@@ -242,6 +242,10 @@ def build_config(args: argparse.Namespace, variant: MatrixVariant, out_root: Pat
     )
     env = config["env"]
     env["DWARF_DSQG_W_ALLOW_FAST_EVIDENCE_MEAN_BYPASS"] = "1" if variant.allow_fast_evidence_mean_bypass else "0"
+    # Width transfer aux is meaningful only when DSQG-W's width cell is active.
+    # Keep no-W and non-width ablations from failing the trainer's aux-telemetry guard.
+    if not (variant.dsqg_w and variant.width_cell):
+        env["DWARF_DSQG_W_WIDTH_AUX_WEIGHT"] = "0.0"
     config["matrix"] = {
         "variant": _jsonable(variant),
         "expected_steps": int(args.max_acc_steps),
