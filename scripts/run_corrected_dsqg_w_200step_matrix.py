@@ -325,6 +325,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             "w_smean": m.get("w_smean"),
             "w_mix_gate": m.get("w_mix_gate"),
             "w_width_gate": m.get("w_width_gate"),
+            "w_width_delta": m.get("w_width_delta"),
             "w_width_ent": m.get("w_width_ent"),
             "w_width_self": m.get("w_width_self"),
             "w_width_qh": m.get("w_width_qh"),

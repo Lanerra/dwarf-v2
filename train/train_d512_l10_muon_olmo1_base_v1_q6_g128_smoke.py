@@ -4693,6 +4693,7 @@ def train():
                         ('dsqg_w_candidate_score_mean', 'w_smean'),
                         ('dsqg_w_typed_mixer_gate_mean', 'w_mix_gate'),
                         ('dsqg_w_width_gate_mean', 'w_width_gate'),
+                        ('dsqg_w_width_delta_norm', 'w_width_delta'),
                         ('dsqg_w_width_entropy', 'w_width_ent'),
                         ('dsqg_w_width_self_mass', 'w_width_self'),
                         ('dsqg_w_width_question_to_hisa_evidence_mass', 'w_width_qh'),
