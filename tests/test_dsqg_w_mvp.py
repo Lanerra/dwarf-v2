@@ -354,7 +354,28 @@ def test_dsqg_w_width_cell_pair_bias_can_directionally_route_question_to_evidenc
     )
 
     assert telemetry["dsqg_w_width_question_to_hisa_evidence_mass"].item() > 0.70
+    assert telemetry["dsqg_w_width_hisa_evidence_to_question_mass"].item() > 0.0
     assert telemetry["dsqg_w_width_self_mass"].item() < 0.60
+
+
+def test_dsqg_w_width_transfer_loss_treats_typed_hisa_reps_as_evidence_family() -> None:
+    cand_types = torch.tensor([[[
+        int(CandidateType.QUESTION),
+        int(CandidateType.HISA_EVIDENCE_REP0),
+        int(CandidateType.HISA_EVIDENCE_REP1),
+    ]]])
+    cand_mask = torch.ones_like(cand_types, dtype=torch.bool)
+    probs = torch.zeros(1, 1, 3, 3)
+    probs[0, 0, 0, 1] = 0.90  # QUESTION reads HISA rep.
+    probs[0, 0, 0, 0] = 0.10
+    probs[0, 0, 1, 0] = 0.80  # HISA rep reads QUESTION.
+    probs[0, 0, 1, 1] = 0.20
+    probs[0, 0, 2, 0] = 0.70  # Another HISA rep reads QUESTION.
+    probs[0, 0, 2, 2] = 0.30
+
+    loss = width_pair_transfer_loss(probs, cand_types, cand_mask)
+
+    assert loss.item() < 0.25
 
 
 def test_dsqg_w_width_cell_relation_features_can_affect_lateral_routing() -> None:
@@ -392,13 +413,33 @@ def test_dsqg_w_width_cell_relation_features_can_affect_lateral_routing() -> Non
         block.width_cell.rel_diff_proj.weight.zero_()
         block.width_cell.rel_prod_proj.weight.zero_()
         block.width_cell.rel_prod_proj.weight[0, 0] = 1.0
-        block.width_cell.rel_score.zero_()
-        block.width_cell.rel_score[0] = 8.0
+        block.width_cell.rel_diff_score.zero_()
+        block.width_cell.rel_prod_score.zero_()
+        block.width_cell.rel_prod_score[0] = 8.0
 
     _, telemetry = block.width_cell(cand_states, cand_types, cand_sources, cand_mask)
 
     assert telemetry["dsqg_w_width_question_to_hisa_evidence_mass"].item() > 0.80
     assert telemetry["dsqg_w_width_self_mass"].item() < 0.20
+
+
+def test_dsqg_w_width_cell_relation_scores_are_split_and_nonzero_at_init() -> None:
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=3,
+        use_width_cell=True,
+        width_bottleneck=8,
+    )
+    block = DSQGWBlock.from_config(cfg)
+    assert block.width_cell is not None
+
+    assert hasattr(block.width_cell, "rel_diff_score")
+    assert hasattr(block.width_cell, "rel_prod_score")
+    assert block.width_cell.rel_diff_score.shape == (8,)
+    assert block.width_cell.rel_prod_score.shape == (8,)
+    assert block.width_cell.rel_diff_score.detach().abs().sum().item() > 0.0
+    assert block.width_cell.rel_prod_score.detach().abs().sum().item() > 0.0
 
 
 def test_candidate_provider_can_label_hisa_evidence_slots_as_query_representatives() -> None:

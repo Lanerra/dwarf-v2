@@ -23,6 +23,8 @@ def load_trainer(
     triton_sourcewise: bool = False,
     detach_recomposer: bool = False,
     fast_evidence_mean: bool = False,
+    width_cell: bool = False,
+    typed_mixer: bool = False,
 ):
     monkeypatch.setenv("DWARF_DISABLE_BNB", "1")
     monkeypatch.setenv("DWARF_LIGER", "0")
@@ -47,6 +49,16 @@ def load_trainer(
             monkeypatch.setenv("DWARF_DSQG_W_FAST_EVIDENCE_MEAN", "1")
         else:
             monkeypatch.delenv("DWARF_DSQG_W_FAST_EVIDENCE_MEAN", raising=False)
+        if width_cell:
+            monkeypatch.setenv("DWARF_DSQG_W_WIDTH_CELL", "1")
+            monkeypatch.setenv("DWARF_DSQG_W_WIDTH_BOTTLENECK", "64")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_WIDTH_CELL", raising=False)
+        if typed_mixer:
+            monkeypatch.setenv("DWARF_DSQG_W_TYPED_MIXER", "1")
+            monkeypatch.setenv("DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK", "64")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_TYPED_MIXER", raising=False)
         if sites is not None:
             monkeypatch.setenv("DWARF_DSQG_W_SITES", sites)
         else:
@@ -69,6 +81,8 @@ def load_trainer(
         monkeypatch.delenv("DWARF_DSQG_W_SITES", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_QUESTION", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_HISA_L3", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_WIDTH_CELL", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_TYPED_MIXER", raising=False)
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "kernels"))
     try:
@@ -533,3 +547,33 @@ def test_dsqg_w_triton_sourcewise_env_is_training_smoke_accepted_on_cuda(monkeyp
     assert model.dsqg_w_last_telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 0.0
     assert model.dsqg_w_last_telemetry["dsqg_w_triton_compact_read_backward"].item() == 1.0
     assert model.dsqg_w.read_mix.weight.grad is not None
+
+
+def test_dsqg_w_gate_lr_multiplier_puts_all_w_gates_in_dedicated_adamw_group(monkeypatch) -> None:
+    monkeypatch.setenv("DWARF_DSQG_W_GATE_LR_MULT", "1.25")
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        width_cell=True,
+        typed_mixer=True,
+    )
+    model = make_model(mod)
+
+    grouped = mod._make_hybrid_muon_param_groups(model)
+    gate_group = next(group for group in grouped["adamw"] if group["name"] == "adamw_dsqg_w_gate")
+    gate_param_ids = {
+        id(param)
+        for name, param in model.named_parameters()
+        if "dsqg_w" in name and name.endswith(".gate")
+    }
+
+    assert len(gate_param_ids) >= 3
+    assert {id(param) for param in gate_group["params"]} == gate_param_ids
+    assert gate_group["lr"] == pytest.approx(mod.LR * 1.25)
+    assert gate_group["weight_decay"] == 0.0
+    for group in grouped["adamw"]:
+        if group is gate_group:
+            continue
+        assert not (gate_param_ids & {id(param) for param in group["params"]})

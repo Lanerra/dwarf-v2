@@ -65,6 +65,7 @@ class MatrixVariant:
     k_l3_skip: int = 2
     hisa_stage2_rep_r: int = 4
     gate_init: float = -2.0
+    gate_lr_mult: float = 1.25
     width_gate_init: float = -2.5
     typed_mixer_gate_init: float = -2.5
     notes: str = ""
@@ -86,6 +87,7 @@ class MatrixVariant:
             "k_l3_skip": self.k_l3_skip,
             "hisa_stage2_rep_r": self.hisa_stage2_rep_r,
             "gate_init": self.gate_init,
+            "gate_lr_mult": self.gate_lr_mult,
             "width_gate_init": self.width_gate_init,
             "typed_mixer_gate_init": self.typed_mixer_gate_init,
             "local_offsets": "none",
@@ -323,6 +325,10 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             "w_width_self": m.get("w_width_self"),
             "w_width_qh": m.get("w_width_qh"),
             "w_width_hq": m.get("w_width_hq"),
+            "w_width_xfer": m.get("w_width_xfer"),
+            "w_width_ep": m.get("w_width_ep"),
+            "w_rel_diff": m.get("w_rel_diff"),
+            "w_rel_prod": m.get("w_rel_prod"),
             "w_fast": m.get("w_fast"),
             "w_fast_bypass": m.get("w_fast_bypass"),
             "w_trainable": m.get("w_trainable"),
@@ -360,7 +366,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-candidates", type=int, default=16)
     parser.add_argument("--bottleneck", type=int, default=128)
     parser.add_argument("--width-bottleneck", type=int, default=64)
-    parser.add_argument("--width-aux-weight", type=float, default=0.0)
+    parser.add_argument("--width-aux-weight", type=float, default=0.01)
     parser.add_argument("--width-entropy-floor", type=float, default=1.5)
     parser.add_argument("--width-entropy-weight", type=float, default=0.25)
     parser.add_argument("--typed-mixer-bottleneck", type=int, default=64)

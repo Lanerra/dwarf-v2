@@ -1038,6 +1038,23 @@ class CandidateProvider:
         return out
 
 
+def _hisa_evidence_type_mask(cand_types: torch.Tensor) -> torch.Tensor:
+    """Return mask for all concrete HISA evidence candidate type IDs.
+
+    Typed HISA representatives are semantically still HISA evidence for width
+    transfer objectives/telemetry.  Keeping this predicate centralized prevents
+    aux losses from silently going inactive when typed_hisa_reps=True.
+    """
+
+    return (
+        (cand_types == int(CandidateType.HISA_EVIDENCE))
+        | (cand_types == int(CandidateType.HISA_EVIDENCE_REP0))
+        | (cand_types == int(CandidateType.HISA_EVIDENCE_REP1))
+        | (cand_types == int(CandidateType.HISA_EVIDENCE_REP2))
+        | (cand_types == int(CandidateType.HISA_EVIDENCE_REP3))
+    )
+
+
 def width_pair_transfer_loss(
     probs: torch.Tensor,
     cand_types: torch.Tensor,
@@ -1058,9 +1075,9 @@ def width_pair_transfer_loss(
         raise ValueError("candidate tensors must align with probs [B,T,J,J]")
     valid_targets = cand_mask.bool()
 
-    def direction_mass(target_type: CandidateType, source_type: CandidateType) -> torch.Tensor:
-        target_mask = (cand_types == int(target_type)) & valid_targets
-        source_mask = (cand_types == int(source_type)) & cand_mask.bool()
+    def direction_mass(target_mask: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
+        target_mask = target_mask & valid_targets
+        source_mask = source_mask & cand_mask.bool()
         if not target_mask.any():
             return p.sum() * 0.0
         mass = p.masked_fill(~source_mask[:, :, None, :], 0.0).sum(dim=-1)
@@ -1069,8 +1086,10 @@ def width_pair_transfer_loss(
             return p.sum() * 0.0
         return selected.mean()
 
-    q_to_hisa = direction_mass(CandidateType.QUESTION, CandidateType.HISA_EVIDENCE)
-    hisa_to_q = direction_mass(CandidateType.HISA_EVIDENCE, CandidateType.QUESTION)
+    question_mask = cand_types == int(CandidateType.QUESTION)
+    hisa_family_mask = _hisa_evidence_type_mask(cand_types)
+    q_to_hisa = direction_mass(question_mask, hisa_family_mask)
+    hisa_to_q = direction_mass(hisa_family_mask, question_mask)
     transfer_loss = -0.5 * (
         torch.log(q_to_hisa.clamp_min(float(eps)))
         + torch.log(hisa_to_q.clamp_min(float(eps)))
@@ -1118,12 +1137,15 @@ class DSQGWWidthCell(nn.Module):
         self.v_proj = nn.Linear(d, self.width_dim, bias=False)
         self.rel_diff_proj = nn.Linear(d, self.width_dim, bias=False)
         self.rel_prod_proj = nn.Linear(d, self.width_dim, bias=False)
-        self.rel_score = nn.Parameter(torch.zeros(self.width_dim))
+        self.rel_diff_score = nn.Parameter(torch.empty(self.width_dim))
+        self.rel_prod_score = nn.Parameter(torch.empty(self.width_dim))
         self.lateral_up = nn.Linear(self.width_dim, d, bias=False)
         self.type_pair_bias = nn.Parameter(torch.zeros(n_types, n_types))
         self.source_pair_bias = nn.Parameter(torch.zeros(n_sources, n_sources))
         self.self_bias = nn.Parameter(torch.tensor(float(self_bias_init)))
         self.gate = nn.Parameter(torch.full((d,), float(gate_init)))
+        nn.init.normal_(self.rel_diff_score, mean=0.0, std=0.02)
+        nn.init.normal_(self.rel_prod_score, mean=0.0, std=0.02)
 
     def forward(
         self,
@@ -1150,11 +1172,14 @@ class DSQGWWidthCell(nn.Module):
         scores = (q[:, :, :, None, :] * k[:, :, None, :, :]).sum(dim=-1) / math.sqrt(float(self.width_dim))
         rel_diff = self.rel_diff_proj(c_n)
         rel_prod = self.rel_prod_proj(c_n)
-        rel_hidden = torch.tanh(
-            (rel_diff[:, :, :, None, :] - rel_diff[:, :, None, :, :])
-            + (rel_prod[:, :, :, None, :] * rel_prod[:, :, None, :, :])
-        )
-        scores = scores + (rel_hidden * self.rel_score.reshape(1, 1, 1, 1, self.width_dim)).sum(dim=-1) / math.sqrt(float(self.width_dim))
+        rel_diff_hidden = torch.tanh(rel_diff[:, :, :, None, :] - rel_diff[:, :, None, :, :])
+        rel_prod_hidden = torch.tanh(rel_prod[:, :, :, None, :] * rel_prod[:, :, None, :, :])
+        scores = scores + (
+            rel_diff_hidden * self.rel_diff_score.reshape(1, 1, 1, 1, self.width_dim)
+        ).sum(dim=-1) / math.sqrt(float(self.width_dim))
+        scores = scores + (
+            rel_prod_hidden * self.rel_prod_score.reshape(1, 1, 1, 1, self.width_dim)
+        ).sum(dim=-1) / math.sqrt(float(self.width_dim))
         scores = scores + self.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
         scores = scores + self.source_pair_bias[cand_sources[:, :, :, None], cand_sources[:, :, None, :]]
         eye = torch.eye(j_count, device=cand_states.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
@@ -1178,13 +1203,16 @@ class DSQGWWidthCell(nn.Module):
         diag = torch.eye(j_count, device=cand_states.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
         self_mass = p_mean.masked_fill(~diag, 0.0).sum(dim=-1).masked_select(valid_targets).mean()
 
-        def pair_mass(target_type: CandidateType, source_type: CandidateType) -> torch.Tensor:
-            target_mask = (cand_types == int(target_type)) & valid_targets
-            source_mask = (cand_types == int(source_type)) & cand_mask
+        def pair_mass(target_mask: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
+            target_mask = target_mask & valid_targets
+            source_mask = source_mask & cand_mask
             if not target_mask.any():
                 return cand_states.new_tensor(0.0)
             mass = p_mean.masked_fill(~source_mask[:, :, None, :], 0.0).sum(dim=-1)
             return mass.masked_select(target_mask).mean()
+
+        question_mask = cand_types == int(CandidateType.QUESTION)
+        hisa_family_mask = _hisa_evidence_type_mask(cand_types)
 
         delta_norm = delta.masked_select(cand_mask[..., None]).reshape(-1, d).norm(dim=-1).mean()
         transfer_aux_loss = width_pair_transfer_loss(p_mean, cand_types, cand_mask)
@@ -1203,12 +1231,10 @@ class DSQGWWidthCell(nn.Module):
             "dsqg_w_width_entropy_penalty": entropy_penalty.detach(),
             "dsqg_w_width_entropy_floor": entropy.new_tensor(self.entropy_floor).detach(),
             "dsqg_w_width_entropy_weight": entropy.new_tensor(self.entropy_weight).detach(),
-            "dsqg_w_width_question_to_hisa_evidence_mass": pair_mass(
-                CandidateType.QUESTION, CandidateType.HISA_EVIDENCE
-            ).detach(),
-            "dsqg_w_width_hisa_evidence_to_question_mass": pair_mass(
-                CandidateType.HISA_EVIDENCE, CandidateType.QUESTION
-            ).detach(),
+            "dsqg_w_width_question_to_hisa_evidence_mass": pair_mass(question_mask, hisa_family_mask).detach(),
+            "dsqg_w_width_hisa_evidence_to_question_mass": pair_mass(hisa_family_mask, question_mask).detach(),
+            "dsqg_w_width_rel_diff_score_norm": self.rel_diff_score.detach().norm(),
+            "dsqg_w_width_rel_prod_score_norm": self.rel_prod_score.detach().norm(),
         }
         return out, telemetry
 

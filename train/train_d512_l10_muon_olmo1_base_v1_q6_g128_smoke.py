@@ -360,6 +360,7 @@ DSQG_W_FAST_EVIDENCE_MEAN = os.getenv('DWARF_DSQG_W_FAST_EVIDENCE_MEAN', '0') ==
 DSQG_W_MAX_CANDIDATES = int(os.environ.get('DWARF_DSQG_W_MAX_CANDIDATES', '32'))
 DSQG_W_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_BOTTLENECK', '256'))
 DSQG_W_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_GATE_INIT', '-5.0'))
+DSQG_W_GATE_LR_MULT = float(os.environ.get('DWARF_DSQG_W_GATE_LR_MULT', '1.25'))
 DSQG_W_FUSE_INIT_STD = float(os.environ.get('DWARF_DSQG_W_FUSE_INIT_STD', '0.0001'))
 DSQG_W_WIDTH_CELL = os.getenv('DWARF_DSQG_W_WIDTH_CELL', '0') == '1'
 DSQG_W_WIDTH_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_WIDTH_BOTTLENECK', '64'))
@@ -3766,6 +3767,10 @@ def _adamw_cls():
     return torch.optim.AdamW
 
 
+def _is_dsqg_w_gate_param(name, p):
+    return DSQG_W_ENABLED and p.ndim == 1 and 'dsqg_w' in name and name.endswith('.gate')
+
+
 def _make_optimizer_param_groups(model_ref):
     scale_embed_params = list(model_ref.scale_embed_parameters())
     phase_params = list(model_ref.phase_parameters())
@@ -3774,12 +3779,14 @@ def _make_optimizer_param_groups(model_ref):
     special_ids.update(id(p) for p in phase_params)
     special_ids.update(id(p) for p in npci_theta_params)
 
-    decay_params, no_decay_params = [], []
+    decay_params, no_decay_params, dsqg_w_gate_params = [], [], []
     for name, p in model_ref.named_parameters():
         if not p.requires_grad or id(p) in special_ids:
             continue
         lname = name.lower()
-        if p.ndim < 2 or name.endswith('.bias') or 'norm' in lname or name in ('embedding.weight', 'out.weight'):
+        if _is_dsqg_w_gate_param(name, p):
+            dsqg_w_gate_params.append(p)
+        elif p.ndim < 2 or name.endswith('.bias') or 'norm' in lname or name in ('embedding.weight', 'out.weight'):
             no_decay_params.append(p)
         else:
             decay_params.append(p)
@@ -3787,6 +3794,7 @@ def _make_optimizer_param_groups(model_ref):
     return [
         {'params': decay_params, 'lr': LR, 'weight_decay': WEIGHT_DECAY, 'name': 'decay'},
         {'params': no_decay_params, 'lr': LR, 'weight_decay': 0.0, 'name': 'no_decay'},
+        {'params': dsqg_w_gate_params, 'lr': LR * DSQG_W_GATE_LR_MULT, 'weight_decay': 0.0, 'name': 'dsqg_w_gate'},
         {'params': scale_embed_params, 'lr': LR * SCALE_EMBED_LR_MULT, 'weight_decay': 0.0, 'name': 'scale_embed'},
         {'params': phase_params, 'lr': LR * PHASE_LR_MULT, 'weight_decay': 0.0, 'name': 'phase'},
         {'params': npci_theta_params, 'lr': LR * NPCI_THETA_LR_MULT, 'weight_decay': 0.0, 'name': 'npci_theta'},
@@ -3812,12 +3820,14 @@ def _make_hybrid_muon_param_groups(model_ref):
     special_ids.update(id(p) for p in phase_params)
     special_ids.update(id(p) for p in npci_theta_params)
 
-    muon_hidden, adamw_decay, adamw_no_decay = [], [], []
+    muon_hidden, adamw_decay, adamw_no_decay, adamw_dsqg_w_gate = [], [], [], []
     for name, p in model_ref.named_parameters():
         if not p.requires_grad or id(p) in special_ids:
             continue
         lname = name.lower()
-        if _is_muon_hidden_param(name, p, special_ids):
+        if _is_dsqg_w_gate_param(name, p):
+            adamw_dsqg_w_gate.append(p)
+        elif _is_muon_hidden_param(name, p, special_ids):
             muon_hidden.append(p)
         elif p.ndim >= 2 and not name.endswith('.bias') and 'norm' not in lname and name not in ('embedding.weight', 'out.weight'):
             adamw_decay.append(p)
@@ -3834,6 +3844,7 @@ def _make_hybrid_muon_param_groups(model_ref):
         'adamw': [
             {'params': adamw_decay, 'lr': LR, 'weight_decay': WEIGHT_DECAY, 'name': 'adamw_decay'},
             {'params': adamw_no_decay, 'lr': LR, 'weight_decay': 0.0, 'name': 'adamw_no_decay'},
+            {'params': adamw_dsqg_w_gate, 'lr': LR * DSQG_W_GATE_LR_MULT, 'weight_decay': 0.0, 'name': 'adamw_dsqg_w_gate'},
             {'params': scale_embed_params, 'lr': LR * SCALE_EMBED_LR_MULT, 'weight_decay': 0.0, 'name': 'adamw_scale_embed'},
             {'params': phase_params, 'lr': LR * PHASE_LR_MULT, 'weight_decay': 0.0, 'name': 'adamw_phase'},
             {'params': npci_theta_params, 'lr': LR * NPCI_THETA_LR_MULT, 'weight_decay': 0.0, 'name': 'adamw_npci_theta'},
@@ -4686,6 +4697,10 @@ def train():
                         ('dsqg_w_width_self_mass', 'w_width_self'),
                         ('dsqg_w_width_question_to_hisa_evidence_mass', 'w_width_qh'),
                         ('dsqg_w_width_hisa_evidence_to_question_mass', 'w_width_hq'),
+                        ('dsqg_w_width_transfer_aux_loss', 'w_width_xfer'),
+                        ('dsqg_w_width_entropy_penalty', 'w_width_ep'),
+                        ('dsqg_w_width_rel_diff_score_norm', 'w_rel_diff'),
+                        ('dsqg_w_width_rel_prod_score_norm', 'w_rel_prod'),
                         ('dsqg_w_metadata_cache_hit', 'w_cache'),
                         ('dsqg_w_static_source_count', 'w_srcs'),
                         ('dsqg_w_candidate_slot_count', 'w_j'),

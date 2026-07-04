@@ -38,6 +38,7 @@ def build_run_config(
     max_candidates: int = 16,
     bottleneck: int = 64,
     gate_init: float = -2.5,
+    gate_lr_mult: float = 1.25,
     fuse_init_std: float = 0.02,
     sourcewise: bool = False,
     triton_sourcewise: bool = False,
@@ -93,6 +94,7 @@ def build_run_config(
         "DWARF_DSQG_W_MAX_CANDIDATES": str(int(max_candidates)),
         "DWARF_DSQG_W_BOTTLENECK": str(int(bottleneck)),
         "DWARF_DSQG_W_GATE_INIT": str(float(gate_init)),
+        "DWARF_DSQG_W_GATE_LR_MULT": str(float(gate_lr_mult)),
         "DWARF_DSQG_W_FUSE_INIT_STD": str(float(fuse_init_std)),
         "DWARF_DSQG_W_SOURCEWISE": "1" if sourcewise else "0",
         "DWARF_DSQG_W_TRITON_SOURCEWISE": "1" if triton_sourcewise else "0",
@@ -198,6 +200,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-candidates", type=int, default=16)
     parser.add_argument("--bottleneck", type=int, default=64)
     parser.add_argument("--gate-init", type=float, default=-2.5)
+    parser.add_argument("--gate-lr-mult", type=float, default=1.25)
     parser.add_argument("--fuse-init-std", type=float, default=0.02)
     parser.add_argument("--sourcewise", action="store_true", help="Enable opt-in source-wise DSQG-W score/read accumulation.")
     parser.add_argument(
@@ -254,6 +257,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         max_candidates=args.max_candidates,
         bottleneck=args.bottleneck,
         gate_init=args.gate_init,
+        gate_lr_mult=args.gate_lr_mult,
         fuse_init_std=args.fuse_init_std,
         sourcewise=args.sourcewise,
         triton_sourcewise=args.triton_sourcewise,

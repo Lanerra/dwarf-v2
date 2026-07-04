@@ -38,6 +38,7 @@ def test_full_run_launcher_builds_winning_layout_env(tmp_path: Path) -> None:
     assert env["DWARF_DSQG_W_MAX_CANDIDATES"] == "16"
     assert env["DWARF_DSQG_W_BOTTLENECK"] == "64"
     assert env["DWARF_DSQG_W_GATE_INIT"] == "-2.5"
+    assert env["DWARF_DSQG_W_GATE_LR_MULT"] == "1.25"
     assert env["DWARF_DSQG_W_FUSE_INIT_STD"] == "0.02"
     assert env["DWARF_DSQG_W_DSR_CANDIDATES"] == "1"
     assert env["DWARF_DSQG_W_LOCAL_OFFSETS"] == "none"
