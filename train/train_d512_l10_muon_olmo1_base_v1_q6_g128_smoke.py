@@ -4235,6 +4235,55 @@ def passkey_accuracy(model, tokenizer, device):
 # TRAINING
 # =============================================================================
 
+def _grad_norm_for_named_params(named_params, predicate):
+    total_sq = 0.0
+    seen = 0
+    for name, p in named_params:
+        if not predicate(name) or p.grad is None:
+            continue
+        grad = p.grad.detach()
+        if grad.numel() == 0:
+            continue
+        norm = grad.float().norm().item()
+        if math.isfinite(norm):
+            total_sq += norm * norm
+            seen += 1
+    if seen == 0:
+        return None
+    return math.sqrt(total_sq)
+
+
+def _dsqg_w_grad_diagnostics(model_ref):
+    """Compact DSQG-W gradient norms before clipping/optimizer step.
+
+    Width transfer aux only reaches the width-cell scoring path. The value/up/gate
+    groups below are therefore the cheap diagnostic for whether CE is sending any
+    signal through the indirect content path.
+    """
+    named_params = list(model_ref.named_parameters())
+    score_terms = (
+        '.width_cell.q_proj', '.width_cell.k_proj', '.width_cell.rel_diff_proj',
+        '.width_cell.rel_prod_proj', '.width_cell.rel_diff_score', '.width_cell.rel_prod_score',
+        '.width_cell.type_pair_bias', '.width_cell.source_pair_bias', '.width_cell.self_bias',
+    )
+    groups = {
+        'w_width_score_gn': lambda n: any(term in n for term in score_terms),
+        'w_width_v_gn': lambda n: '.width_cell.v_proj' in n,
+        'w_width_up_gn': lambda n: '.width_cell.lateral_up' in n,
+        'w_width_gate_gn': lambda n: '.width_cell.gate' in n,
+        'w_mix_gate_gn': lambda n: '.typed_mixer.gate' in n,
+        'w_all_gate_gn': lambda n: n.endswith('.gate') and (
+            'dsqg_w' in n or '.width_cell.' in n or '.typed_mixer.' in n
+        ),
+    }
+    out = {}
+    for label, predicate in groups.items():
+        val = _grad_norm_for_named_params(named_params, predicate)
+        if val is not None:
+            out[label] = val
+    return out
+
+
 def train():
     if not torch.cuda.is_available():
         raise RuntimeError('DWARF DSQG/HISA kernels require CUDA + Triton; CPU execution is not supported.')
@@ -4617,6 +4666,8 @@ def train():
 
             loss_val = loss_accum / float(total_rows_this_accum)
 
+            should_log = ((acc_step + 1) % TRAIN_LOG_INTERVAL == 0) or ((acc_step + 1) == steps_per_epoch)
+            dsqg_w_grad_diag = _dsqg_w_grad_diagnostics(model_ref) if (DSQG_W_ENABLED and should_log) else {}
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             total_norm_for_guard = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
             if (not math.isfinite(loss_val)) or (not math.isfinite(total_norm_for_guard)):
@@ -4648,7 +4699,6 @@ def train():
                 first_step_ms = step_ms
             step_times.append(step_ms)
 
-            should_log = ((acc_step + 1) % TRAIN_LOG_INTERVAL == 0) or ((acc_step + 1) == steps_per_epoch)
             if should_log:
                 avg_ms = sum(step_times) / len(step_times)
                 tok_s = tokens_per_step / (avg_ms / 1000.0)
@@ -4717,6 +4767,17 @@ def train():
                         _val = _tel_float(_name)
                         if _val is not None and math.isfinite(_val):
                             entropy_str += f' {_label}={_val:.3f}'
+                    for _name, _label in [
+                        ('dsqg_w_gate_logit_mean', 'w_gate_logit'),
+                        ('dsqg_w_typed_mixer_gate_logit_mean', 'w_mix_gate_logit'),
+                        ('dsqg_w_width_gate_logit_mean', 'w_width_gate_logit'),
+                    ]:
+                        _val = _tel_float(_name)
+                        if _val is not None and math.isfinite(_val):
+                            entropy_str += f' {_label}={_val:.6f}'
+                for _label, _val in dsqg_w_grad_diag.items():
+                    if isinstance(_val, (int, float)) and math.isfinite(float(_val)):
+                        entropy_str += f' {_label}={float(_val):.3e}'
                 print(f'  [ep{epoch} step {acc_step+1}/{steps_per_epoch}] '
                       f'ce={loss_val:.4f} se_max={se_max:.3f} '
                       f'grad_norm={total_norm:.4f} lr={lr_now:.2e} '
