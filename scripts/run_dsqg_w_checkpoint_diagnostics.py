@@ -197,7 +197,7 @@ def gate_logits(model: torch.nn.Module) -> dict[str, float]:
                 out["w_width_gate_logit_mean"] = float(param.detach().float().mean().item())
             elif ".typed_mixer.gate" in name:
                 out["w_mix_gate_logit_mean"] = float(param.detach().float().mean().item())
-            elif ".dsqg_w_blocks." in name:
+            elif "dsqg_w_blocks." in name:
                 out["w_gate_logit_mean"] = float(param.detach().float().mean().item())
     if vals:
         cat = torch.cat(vals)
