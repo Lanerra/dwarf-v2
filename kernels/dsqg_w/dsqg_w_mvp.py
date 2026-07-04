@@ -1294,27 +1294,39 @@ class DSQGWTypedCandidateMixer(nn.Module):
         if not cand_mask.any(dim=-1).all():
             raise ValueError("typed candidate mixer received an all-invalid candidate row")
 
-        c = self.norm_c(cand_states + self.type_embed(cand_types))
+        if os.getenv("DWARF_DSQG_W_TYPED_MIXER_TYPE_EMBED", "1") == "1":
+            c = self.norm_c(cand_states + self.type_embed(cand_types))
+            type_embed_active = True
+        else:
+            c = self.norm_c(cand_states)
+            type_embed_active = False
         q = self.q_proj(c)
         k = self.k_proj(c)
         v = self.v_proj(c)
-        scores = (q[:, :, :, None, :] * k[:, :, None, :, :]).sum(dim=-1) / math.sqrt(float(self.mix_dim))
-        scores = scores + self.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
+        scores = torch.einsum("btjd,btkd->btjk", q, k) / math.sqrt(float(self.mix_dim))
+        if os.getenv("DWARF_DSQG_W_TYPED_MIXER_PAIR_BIAS", "1") == "1":
+            type_one_hot = F.one_hot(cand_types, num_classes=self.n_types).to(dtype=scores.dtype)
+            scores = scores + torch.einsum("btjr,rs,btks->btjk", type_one_hot, self.type_pair_bias, type_one_hot)
         valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
         scores = scores.masked_fill(~valid_pair, torch.finfo(scores.dtype).min)
         probs = F.softmax(scores, dim=-1)
         probs = probs.masked_fill(~valid_pair, 0.0)
 
-        mixed = (probs[..., None] * v[:, :, None, :, :]).sum(dim=3)
+        mixed = torch.einsum("btjk,btkd->btjd", probs, v)
         delta = self.out_proj(mixed)
         gate = torch.sigmoid(self.gate).reshape(1, 1, 1, d)
         out = cand_states + gate * delta * cand_mask[..., None].to(delta.dtype)
 
-        valid_targets = cand_mask.bool()
-        p_safe = probs.clamp_min(1e-8)
-        entropy = (-(p_safe * p_safe.log()).sum(dim=-1)).masked_select(valid_targets).mean()
-        valid_delta_count = cand_mask.to(delta.dtype).sum().clamp_min(1.0)
-        delta_norm = (delta.norm(dim=-1) * cand_mask.to(delta.dtype)).sum() / valid_delta_count
+        fast_telemetry = os.getenv("DWARF_DSQG_W_FAST_TELEMETRY", "0") == "1"
+        if fast_telemetry:
+            entropy = cand_states.new_tensor(0.0)
+            delta_norm = cand_states.new_tensor(0.0)
+        else:
+            valid_targets = cand_mask.bool()
+            p_safe = probs.clamp_min(1e-8)
+            entropy = (-(p_safe * p_safe.log()).sum(dim=-1)).masked_select(valid_targets).mean()
+            valid_delta_count = cand_mask.to(delta.dtype).sum().clamp_min(1.0)
+            delta_norm = (delta.norm(dim=-1) * cand_mask.to(delta.dtype)).sum() / valid_delta_count
         telemetry = {
             "dsqg_w_typed_mixer_entropy": entropy.detach(),
             "dsqg_w_typed_mixer_gate_mean": gate.mean().detach(),
@@ -1322,6 +1334,7 @@ class DSQGWTypedCandidateMixer(nn.Module):
             "dsqg_w_typed_mixer_gate_max": gate.max().detach(),
             "dsqg_w_typed_mixer_gate_logit_mean": self.gate.detach().mean(),
             "dsqg_w_typed_mixer_delta_norm": delta_norm.detach(),
+            "dsqg_w_typed_mixer_type_embed_active": cand_states.new_tensor(1.0 if type_embed_active else 0.0).detach(),
         }
         return out, telemetry
 
@@ -2664,18 +2677,32 @@ class DSQGWBlock(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         bsz, seq_len, _ = r_all.shape
         weight = self.read_mix.weight
-        read = F.linear(r_all, weight[:, : self.d])
+        read_slots = [r_all]
         typed_read_norms = [r_all.new_tensor(0.0) for _ in range(self.n_types)]
+        active_type_ids: list[int] = []
         for type_id in self.read_type_ids:
             if type_id < 0 or type_id >= self.n_types:
                 continue
-            type_mask = ((cand_types == type_id) & cand_mask)[:, :, :, None, None]
-            p_type = probs[..., None].masked_fill(~type_mask, 0.0)
-            r_type_h = (p_type * v).sum(dim=2)
+            type_mask = ((cand_types == type_id) & cand_mask).to(probs.dtype)
+            r_type_h = torch.einsum("btjh,btjhd,btj->bthd", probs, v, type_mask)
             r_type = r_type_h.reshape(bsz, seq_len, self.d)
+            read_slots.append(r_type)
+            active_type_ids.append(int(type_id))
+            if os.getenv("DWARF_DSQG_W_FAST_TELEMETRY", "0") != "1":
+                typed_read_norms[type_id] = r_type.norm(dim=-1).mean()
+        if os.getenv("DWARF_DSQG_W_DENSE_BATCHED_READ_MIX", "0") == "1" and len(read_slots) > 1:
+            slices = [weight[:, : self.d]]
+            for type_id in active_type_ids:
+                start = (type_id + 1) * self.d
+                slices.append(weight[:, start : start + self.d])
+            weight_by_slot = torch.stack(slices, dim=0)
+            slots_by_slot = torch.stack(read_slots, dim=2).reshape(-1, len(read_slots), self.d).transpose(0, 1)
+            read = torch.bmm(slots_by_slot, weight_by_slot.transpose(1, 2)).sum(dim=0)
+            return read.reshape(bsz, seq_len, self.d), typed_read_norms
+        read = F.linear(r_all, weight[:, : self.d])
+        for type_id, r_type in zip(active_type_ids, read_slots[1:]):
             start = (type_id + 1) * self.d
             read = read + F.linear(r_type, weight[:, start : start + self.d])
-            typed_read_norms[type_id] = r_type.norm(dim=-1).mean()
         return read, typed_read_norms
 
     def _mix_compact_read_slots(self, read_slots: torch.Tensor, *, batched: bool | None = None) -> torch.Tensor:
@@ -2748,18 +2775,43 @@ class DSQGWBlock(nn.Module):
         final_states = x
         l3_base = l3_states if l3_states is not None else final_states
         summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
-        zero_base = torch.zeros_like(final_states)
         bases: dict[int, torch.Tensor] = {
             int(CandidateSource.FINAL): final_states,
             int(CandidateSource.QUESTION_CACHE): final_states,
             int(CandidateSource.L3): l3_base,
             int(CandidateSource.HISA): l3_base,
             int(CandidateSource.SUMMARY): summary_base,
-            int(CandidateSource.NULL): zero_base,
         }
         cand_states = x.new_zeros((*cand_token_indices.shape, x.shape[-1]))
+        grouped_bases: dict[int, tuple[torch.Tensor, list[int]]] = {}
         for source_id, states in bases.items():
-            source_mask = (cand_sources == int(source_id)) & cand_mask
+            if source_id == int(CandidateSource.NULL):
+                continue
+            cache_key = id(states)
+            if cache_key not in grouped_bases:
+                grouped_bases[cache_key] = (states, [])
+            grouped_bases[cache_key][1].append(int(source_id))
+        if os.getenv("DWARF_DSQG_W_SLOT_MATERIALIZE", "0") == "1":
+            slot_states: list[torch.Tensor] = []
+            for j in range(cand_token_indices.shape[-1]):
+                token_j = cand_token_indices[:, :, j]
+                mask_j_all = cand_mask[:, :, j]
+                out_j = x.new_zeros((*token_j.shape, x.shape[-1]))
+                for states, source_ids in grouped_bases.values():
+                    source_mask_j = torch.zeros_like(mask_j_all, dtype=torch.bool)
+                    for source_id in source_ids:
+                        source_mask_j = source_mask_j | (cand_sources[:, :, j] == int(source_id))
+                    source_mask_j = source_mask_j & mask_j_all
+                    if bool(source_mask_j.any()):
+                        gathered_j = self._gather_source_rows(states, token_j.clamp(0, max(x.shape[1] - 1, 0)))
+                        out_j = out_j + gathered_j * source_mask_j[..., None].to(gathered_j.dtype)
+                slot_states.append(out_j)
+            return torch.stack(slot_states, dim=2)
+        for states, source_ids in grouped_bases.values():
+            source_mask = torch.zeros_like(cand_mask, dtype=torch.bool)
+            for source_id in source_ids:
+                source_mask = source_mask | (cand_sources == int(source_id))
+            source_mask = source_mask & cand_mask
             if bool(source_mask.any()):
                 gathered = self._gather_source_candidate_states(states, cand_token_indices)
                 cand_states = cand_states + gathered * source_mask[..., None].to(gathered.dtype)
@@ -3359,11 +3411,21 @@ class DSQGWBlock(nn.Module):
         q = self.q_proj(x_n).reshape(bsz, seq_len, h, dh)
         k = self.k_proj(c_n).reshape(bsz, seq_len, j_count, h, dh)
         v = self.v_proj(c_n).reshape(bsz, seq_len, j_count, h, dh)
-        role = self.role_key(cand_types).reshape(bsz, seq_len, j_count, h, dh)
-        source = self.source_key(cand_sources).reshape(bsz, seq_len, j_count, h, dh)
-        k_eff = k + role + source
 
-        scores = (q[:, :, None, :, :] * k_eff).sum(dim=-1) / math.sqrt(float(dh))
+        # Avoid materializing role/source embeddings as [B,T,J,H,DH].  They are
+        # candidate-type/source constants, so score them against q once for the
+        # tiny type/source vocabularies and gather the resulting [B,T,J,H]
+        # logits.  This removes two large embedding tensors and their expensive
+        # scatter-style backward from the typed/width materialized path.
+        inv_sqrt_dh = 1.0 / math.sqrt(float(dh))
+        scores = torch.einsum("bthd,btjhd->btjh", q, k)
+        role_table = self.role_key.weight.reshape(self.n_types, h, dh)
+        source_table = self.source_key.weight.reshape(self.n_sources, h, dh)
+        role_scores = torch.einsum("bthd,rhd->btrh", q, role_table)
+        source_scores = torch.einsum("bthd,rhd->btrh", q, source_table)
+        scores = scores + role_scores.gather(2, cand_types[:, :, :, None].expand(-1, -1, -1, h))
+        scores = scores + source_scores.gather(2, cand_sources[:, :, :, None].expand(-1, -1, -1, h))
+        scores = scores * inv_sqrt_dh
         scores = scores + self.type_bias[cand_types]
         candidate_score_bias_norm = x.new_tensor(0.0)
         if cand_scores is not None:
@@ -3388,7 +3450,7 @@ class DSQGWBlock(nn.Module):
         scores = scores.masked_fill(~cand_mask[:, :, :, None], torch.finfo(scores.dtype).min)
         probs = F.softmax(scores, dim=2)
 
-        r_all_h = (probs[..., None] * v).sum(dim=2)
+        r_all_h = torch.einsum("btjh,btjhd->bthd", probs, v)
         r_all = r_all_h.reshape(bsz, seq_len, d)
 
         read, typed_read_norms = self._mix_typed_reads(r_all, probs, v, cand_types, cand_mask)
@@ -3397,13 +3459,18 @@ class DSQGWBlock(nn.Module):
         gate = torch.sigmoid(self.gate).reshape(1, 1, d)
         x_out = x + gate * delta
 
-        p_mean = probs.mean(dim=-1)
-        p_safe = p_mean.clamp_min(1e-8)
-        entropy = -(p_safe * p_safe.log()).sum(dim=-1).mean()
+        fast_telemetry = os.getenv("DWARF_DSQG_W_FAST_TELEMETRY", "0") == "1"
+        if fast_telemetry:
+            p_mean = None
+            entropy = x.new_tensor(0.0)
+        else:
+            p_mean = probs.mean(dim=-1)
+            p_safe = p_mean.clamp_min(1e-8)
+            entropy = -(p_safe * p_safe.log()).sum(dim=-1).mean()
         valid_counts = cand_mask.sum(dim=-1).float()
-        delta_norm = delta.norm(dim=-1).mean()
+        delta_norm = x.new_tensor(0.0) if fast_telemetry else delta.norm(dim=-1).mean()
         x_norm = x.norm(dim=-1).mean()
-        read_norm = read.norm(dim=-1).mean()
+        read_norm = x.new_tensor(0.0) if fast_telemetry else read.norm(dim=-1).mean()
 
         telemetry: dict[str, torch.Tensor] = {
             "dsqg_w_entropy": entropy.detach(),
@@ -3421,20 +3488,31 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_query_type_bias_norm": query_type_bias_norm.detach(),
             "dsqg_w_candidate_score_bias_norm": candidate_score_bias_norm.detach(),
         }
-        for ctype in CandidateType:
-            mask = (cand_types == int(ctype)) & cand_mask
-            mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
-            telemetry[f"dsqg_w_{ctype.name.lower()}_mass"] = mass.detach()
+        zero_mass = x.new_tensor(0.0)
+        if fast_telemetry:
+            for ctype in CandidateType:
+                telemetry[f"dsqg_w_{ctype.name.lower()}_mass"] = zero_mass.detach()
+        else:
+            assert p_mean is not None
+            for ctype in CandidateType:
+                mask = (cand_types == int(ctype)) & cand_mask
+                mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
+                telemetry[f"dsqg_w_{ctype.name.lower()}_mass"] = mass.detach()
         telemetry["dsqg_w_local_mass"] = telemetry[f"dsqg_w_{CandidateType.LOCAL.name.lower()}_mass"]
         telemetry["dsqg_w_question_mass"] = telemetry[f"dsqg_w_{CandidateType.QUESTION.name.lower()}_mass"]
         telemetry["dsqg_w_hisa_evidence_mass"] = telemetry[f"dsqg_w_{CandidateType.HISA_EVIDENCE.name.lower()}_mass"]
         telemetry["dsqg_w_long_offset_mass"] = telemetry[f"dsqg_w_{CandidateType.LONG_OFFSET.name.lower()}_mass"]
         telemetry["dsqg_w_chunk_rep_mass"] = telemetry[f"dsqg_w_{CandidateType.CHUNK_REP.name.lower()}_mass"]
         telemetry["dsqg_w_null_mass"] = telemetry[f"dsqg_w_{CandidateType.NULL.name.lower()}_mass"]
-        for source in CandidateSource:
-            mask = (cand_sources == int(source)) & cand_mask
-            mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
-            telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
+        if fast_telemetry:
+            for source in CandidateSource:
+                telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = zero_mass.detach()
+        else:
+            assert p_mean is not None
+            for source in CandidateSource:
+                mask = (cand_sources == int(source)) & cand_mask
+                mass = p_mean.masked_fill(~mask, 0.0).sum(dim=-1).mean()
+                telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
         telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
         telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
         telemetry.update(width_telemetry)

@@ -84,19 +84,38 @@ So the pack optimization moved final-site full-candidate W from below floor to a
 
 ## Current state / next gate
 
-The base full-candidate W final-site acceptance gate is now met.
+The base full-candidate W final-site acceptance gate is met.
 
-Typed mixer is not yet promotable at BS16:
+A follow-up typed-mixer pass removed the worst dense fallback overheads:
 
-- Without checkpointing it OOMs after step 1 around the dense fallback path (`k_eff = k + role + source`) because typed mixer currently forces sourcewise W to materialize candidate states and then use the dense DSQG-W forward.
-- With `DWARF_CKPT=all`, typed mixer fits but only reaches about `38.7K tok/s`:
+- typed mixer and width-cell dense scoring/read paths avoid broadcast multiply/sum materialization in favor of einsum contractions;
+- source materialization groups identical source surfaces so `FINAL`/`QUESTION_CACHE` and `L3`/`HISA` are gathered once per surface instead of once per source id;
+- `DWARF_DSQG_W_FAST_TELEMETRY=1` disables routing/diagnostic mass reductions during throughput/quality training, because routing telemetry is explicitly not a promotion signal;
+- `DWARF_DSQG_W_TYPED_MIXER_PAIR_BIAS=0` disables the tiny typed-pair bias term in the typed mixer. That term is not the target semantic mechanism and costs enough at BS16 to put the gate on the edge.
+
+Latest acceptance evidence:
 
 ```text
-results/dsqg_w_typed_ckpt_probe_20260704_093317/trainer.stdout.log
-[ep1 step 40/40] ... 38,721 tok/s ... w_mat=1.000
-[BENCH] peak_vram=11064MB
+results/dsqg_w_reset_throughput_20260704_104749_typed_gate_nopair/summary.md
+DWARF_DSQG_W_FAST_TELEMETRY=1 DWARF_DSQG_W_TYPED_MIXER_PAIR_BIAS=0
 ```
 
-Therefore the next systems target is the typed-mixer sourcewise path: avoid falling back to dense `[B,T,J,D] -> k/v -> k_eff` materialization, or otherwise fuse/recompute it so typed-mixer BS16 can be measured against the same `>=50K tok/s` floor.
+| variant | rc | steady tok/s | trailing ms | peak MB | last CE | gate |
+|---|---:|---:|---:|---:|---:|---|
+| no_w | 0 | 71,344 | 459.1 | 13,122 | 8.2176 | control |
+| w_base_final | 0 | 54,282 | 603.4 | 14,227 | 8.3259 | **PASS** |
+| w_typed_final | 0 | 51,852 | 631.6 | 19,230 | 8.3755 | **PASS** |
 
-Width cell remains behind typed/base gates. The telemetry-only OOM was fixed, but the semantic width cell still materializes candidate states and JxJ tensors; do not promote it until the typed/sourcewise materialization problem is solved.
+Width cell remains blocked as the suspected killer:
+
+```text
+results/dsqg_w_width_gate_20260704_104405/summary.md
+DWARF_DSQG_W_FAST_TELEMETRY=1 DWARF_DSQG_W_TYPED_MIXER_PAIR_BIAS=0
+```
+
+| variant | rc | steady tok/s | result |
+|---|---:|---:|---|
+| w_width_final | 2 | 0 | OOM during backward after step 1 |
+| w_typed_width_final | 2 | 0 | OOM during forward materialized read |
+
+Conclusion: the reset's first two throughput gates are satisfied for final-site full-candidate W and +typed_mixer. Width-cell alone collapses at BS16 and should stay out of the default path. The next track is the 20K/50K CE + semantic-transfer sanity ladder with aux off by default; do not use aux/routing telemetry to claim W is alive.
