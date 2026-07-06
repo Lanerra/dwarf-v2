@@ -2023,6 +2023,31 @@ class DSQGWEvidenceBindingHub(nn.Module):
         device = x.device
         dtype = x.dtype
         j_count = cand_mask.shape[-1]
+        use_triton_lane_accum = (
+            os.getenv("DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM", "0") == "1"
+            and _TRITON_SOURCEWISE_AVAILABLE
+            and triton is not None
+            and x.is_cuda
+            and cand_token_indices.is_cuda
+            and cand_sources.is_cuda
+            and cand_mask.is_cuda
+            and chunk_rep_states is None
+        )
+        if use_triton_lane_accum:
+            fast_result = self._forward_sourcewise_packet_triton_accum(
+                x,
+                cand_token_indices,
+                cand_types,
+                cand_sources,
+                cand_mask,
+                l3_states=l3_states,
+                candidate_distances=candidate_distances,
+                cand_scores=cand_scores,
+                return_aux=return_aux,
+            )
+            if fast_result is not None:
+                return fast_result
+
         valid = cand_mask.to(device=device, dtype=torch.bool)
         safe_types = cand_types.to(device=device, dtype=torch.long).clamp(0, self.n_types - 1)
         safe_sources = cand_sources.to(device=device, dtype=torch.long).clamp(0, self.n_sources - 1)
@@ -2133,6 +2158,114 @@ class DSQGWEvidenceBindingHub(nn.Module):
         )
         telemetry["dsqg_w_ebh_packet_sourcewise"] = x.new_tensor(1.0).detach()
         telemetry["dsqg_w_ebh_packet_triton"] = x.new_tensor(0.0).detach()
+        if return_aux:
+            aux = {
+                "bound_packet": bound_packet,
+                "all_read": all_read,
+                "type_reads": type_reads,
+                "source_reads": source_reads,
+                "candidate_weight_mass": mass.squeeze(-1).detach(),
+                "type_weight_mass": type_mass.detach(),
+                "source_weight_mass": source_mass.detach(),
+                "bind_gate": gate,
+                "delta": delta,
+            }
+            return out, telemetry, aux
+        return out, telemetry
+
+    def _forward_sourcewise_packet_triton_accum(
+        self,
+        x: torch.Tensor,
+        cand_token_indices: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        candidate_distances: torch.Tensor | None = None,
+        cand_scores: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ):
+        """Fast EBH packet path using the existing Triton sourcewise gather seam.
+
+        The slow sourcewise packet path avoids persistent candidate materialization
+        but still performs Python slot/source loops and scatter-add lane
+        accumulation.  This path gathers already-projected source surfaces once
+        into candidate order, then reuses the vectorized EBH lane reducer from the
+        materialized path.  It is exact for raw sourcewise packets without real
+        chunk/summary states; callers fall back before entering this helper when
+        `chunk_rep_states` is present.
+        """
+        if not (_TRITON_SOURCEWISE_AVAILABLE and triton is not None and x.is_cuda):
+            return None
+        bsz, seq_len, d = x.shape
+        j_count = cand_mask.shape[-1]
+        device = x.device
+        dtype = x.dtype
+
+        valid = cand_mask.to(device=device, dtype=torch.bool)
+        safe_types = cand_types.to(device=device, dtype=torch.long).clamp(0, self.n_types - 1)
+        safe_sources = cand_sources.to(device=device, dtype=torch.long).clamp(0, self.n_sources - 1)
+        weights = valid.to(dtype=dtype)
+        mass = weights.sum(dim=-1, keepdim=True)
+        norm_weights = torch.where(mass > 0, weights / mass.clamp_min(self.eps), torch.zeros_like(weights))
+
+        x_n = self.norm_x(x)
+        query_context = self.query_proj(x_n)
+        final_base = self.value_proj(self.norm_c(x))
+        l3_source = l3_states if l3_states is not None else x
+        l3_base = final_base if l3_source is x else self.value_proj(self.norm_c(l3_source))
+        values = _DSQGWSourcewiseCandidateStateGather.apply(
+            final_base,
+            l3_base,
+            cand_token_indices,
+            safe_sources,
+            valid,
+            l3_source is not x,
+        )
+
+        aligned = values
+        aligned = aligned + self.type_value(safe_types).to(dtype=dtype)
+        aligned = aligned + self.source_value(safe_sources).to(dtype=dtype)
+        aligned = aligned + self.phase_proj(self._phase_features(candidate_distances, bsz, seq_len, j_count, device, dtype))
+        if self.use_score_features:
+            aligned = aligned + self.score_proj(
+                self._score_features(cand_scores, valid, bsz, seq_len, j_count, device, dtype)[..., None]
+            )
+        aligned = aligned + query_context[:, :, None, :]
+        aligned = aligned.masked_fill(~valid[..., None], 0.0)
+
+        all_read = (aligned * norm_weights[..., None]).sum(dim=2)
+        type_reads, type_mass = self._lane_reads(aligned, weights, safe_types, self.n_types)
+        source_reads, source_mass = self._lane_reads(aligned, weights, safe_sources, self.n_sources)
+        lane_cat = torch.cat(
+            [
+                all_read,
+                type_reads.reshape(bsz, seq_len, self.n_types * d),
+                source_reads.reshape(bsz, seq_len, self.n_sources * d),
+            ],
+            dim=-1,
+        )
+        bound_packet = self.packet_norm(self.read_mix(lane_cat))
+        gate_input = torch.cat([x_n, bound_packet], dim=-1)
+        gate = torch.sigmoid(self.bind_gate(gate_input))
+        delta_input = torch.cat([x, bound_packet, x * bound_packet, bound_packet - x], dim=-1)
+        delta = self.delta_proj(delta_input)
+        has_evidence = (mass.squeeze(-1) > 0).to(dtype=dtype)[..., None]
+        out = x + has_evidence * gate * delta
+
+        telemetry = self._telemetry(
+            x,
+            bound_packet,
+            delta,
+            gate,
+            weights,
+            type_mass,
+            source_mass,
+            has_evidence,
+        )
+        telemetry["dsqg_w_ebh_packet_sourcewise"] = x.new_tensor(1.0).detach()
+        telemetry["dsqg_w_ebh_packet_triton"] = x.new_tensor(1.0).detach()
         if return_aux:
             aux = {
                 "bound_packet": bound_packet,
@@ -5220,7 +5353,9 @@ class DSQGWBlock(nn.Module):
             telemetry.update(ebh_telemetry)
             telemetry["dsqg_w_sourcewise_ebh_materialized"] = x.new_tensor(0.0).detach()
             telemetry["dsqg_w_ebh_packet_sourcewise"] = x.new_tensor(1.0).detach()
-            telemetry["dsqg_w_ebh_packet_triton"] = x.new_tensor(0.0).detach()
+            telemetry["dsqg_w_ebh_packet_triton"] = ebh_telemetry.get(
+                "dsqg_w_ebh_packet_triton", x.new_tensor(0.0).detach()
+            )
             telemetry["dsqg_w_ebh_packet_semantic_approx"] = x.new_tensor(1.0 if semantic_approx else 0.0).detach()
             return x_out, telemetry
         if self.width_cell is not None or self.typed_mixer is not None or self.evidence_binding_hub is not None:

@@ -59,6 +59,7 @@ def build_run_config(
     ebh_phase_bands: int = 4,
     ebh_score_features: bool = True,
     ebh_sourcewise_packet: bool = False,
+    ebh_triton_lane_accum: bool = False,
     evidence_prior: bool = False,
     evidence_prior_clip: float = 2.0,
     evidence_prior_init_scale: float = 0.0,
@@ -133,6 +134,7 @@ def build_run_config(
         "DWARF_DSQG_W_EBH_PHASE_BANDS": str(int(ebh_phase_bands)),
         "DWARF_DSQG_W_EBH_SCORE_FEATURES": "1" if ebh_score_features else "0",
         "DWARF_DSQG_W_EBH_SOURCEWISE_PACKET": "1" if ebh_sourcewise_packet else "0",
+        "DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM": "1" if ebh_triton_lane_accum else "0",
         "DWARF_DSQG_W_EVIDENCE_PRIOR": "1" if evidence_prior else "0",
         "DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP": str(float(evidence_prior_clip)),
         "DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE": str(float(evidence_prior_init_scale)),
@@ -268,6 +270,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ebh-phase-bands", type=int, default=4)
     parser.add_argument("--no-ebh-score-features", action="store_true", help="Disable scalar score features in the EBH alignment path.")
     parser.add_argument("--ebh-sourcewise-packet", action="store_true", help="Use sourcewise EBH packet accumulation instead of materializing [B,T,J,D] candidate states.")
+    parser.add_argument("--ebh-triton-lane-accum", action="store_true", help="Use the Triton-backed EBH sourcewise packet lane-accumulation fast path.")
     parser.add_argument("--evidence-prior", action="store_true", help="Enable the DSQG-W scalar evidence/source/type prior composer.")
     parser.add_argument("--evidence-prior-clip", type=float, default=2.0)
     parser.add_argument("--evidence-prior-init-scale", type=float, default=0.0)
@@ -339,6 +342,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         ebh_phase_bands=args.ebh_phase_bands,
         ebh_score_features=not args.no_ebh_score_features,
         ebh_sourcewise_packet=args.ebh_sourcewise_packet,
+        ebh_triton_lane_accum=args.ebh_triton_lane_accum,
         evidence_prior=args.evidence_prior,
         evidence_prior_clip=args.evidence_prior_clip,
         evidence_prior_init_scale=args.evidence_prior_init_scale,

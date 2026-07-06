@@ -365,6 +365,89 @@ def test_evidence_binding_hub_sourcewise_packet_matches_materialized_raw_layout(
     assert telemetry["dsqg_w_ebh_packet_triton"].item() == pytest.approx(0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Triton EBH packet path")
+def test_evidence_binding_hub_sourcewise_packet_triton_matches_python_and_backprops(monkeypatch) -> None:
+    torch.manual_seed(7051)
+    device = torch.device("cuda")
+    x_ref = torch.randn(1, 8, 16, device=device, requires_grad=True)
+    l3_ref = torch.randn(1, 8, 16, device=device, requires_grad=True)
+    x_fast = x_ref.detach().clone().requires_grad_(True)
+    l3_fast = l3_ref.detach().clone().requires_grad_(True)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=6,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=2,
+        k_hisa_evidence=2,
+        k_l3_skip=1,
+        k_chunk=0,
+        bottleneck=32,
+        use_evidence_binding_hub=True,
+        ebh_bottleneck=32,
+        ebh_gate_init=-2.0,
+    )
+    positions = torch.arange(8, device=device)
+    batch = CandidateProvider(cfg).build_metadata(
+        x_ref.detach(),
+        l3_states=l3_ref.detach(),
+        question_indices=torch.tensor([[0, 5]], device=device),
+        hisa_evidence_indices=torch.stack([(positions - i).clamp_min(0) for i in [1, 4]], dim=-1).unsqueeze(0),
+        hisa_evidence_scores=torch.linspace(-1.0, 1.0, steps=16, device=device).reshape(1, 8, 2),
+        l3_skip_indices=(positions - 6).clamp_min(0).reshape(1, 8, 1),
+    )
+    block_ref = DSQGWBlock.from_config(cfg).to(device=device)
+    block_fast = DSQGWBlock.from_config(cfg).to(device=device)
+    block_fast.load_state_dict(block_ref.state_dict())
+    assert block_ref.evidence_binding_hub is not None
+    assert block_fast.evidence_binding_hub is not None
+
+    monkeypatch.setenv("DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM", "0")
+    y_ref, _, aux_ref = block_ref.evidence_binding_hub.forward_sourcewise_packet(
+        x_ref,
+        batch.cand_token_indices,
+        batch.cand_types,
+        batch.cand_sources,
+        batch.cand_mask,
+        l3_states=l3_ref,
+        candidate_distances=batch.candidate_distances,
+        cand_scores=batch.cand_scores,
+        return_aux=True,
+    )
+    ref_loss = y_ref.square().mean() + aux_ref["bound_packet"].square().mean()
+    ref_loss.backward()
+
+    monkeypatch.setenv("DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM", "1")
+    y_fast, telemetry, aux_fast = block_fast.evidence_binding_hub.forward_sourcewise_packet(
+        x_fast,
+        batch.cand_token_indices,
+        batch.cand_types,
+        batch.cand_sources,
+        batch.cand_mask,
+        l3_states=l3_fast,
+        candidate_distances=batch.candidate_distances,
+        cand_scores=batch.cand_scores,
+        return_aux=True,
+    )
+    fast_loss = y_fast.square().mean() + aux_fast["bound_packet"].square().mean()
+    fast_loss.backward()
+
+    assert telemetry["dsqg_w_ebh_packet_triton"].item() == pytest.approx(1.0)
+    assert torch.allclose(y_fast, y_ref, atol=2e-5, rtol=2e-5)
+    assert torch.allclose(aux_fast["bound_packet"], aux_ref["bound_packet"], atol=2e-5, rtol=2e-5)
+    assert torch.allclose(x_fast.grad, x_ref.grad, atol=3e-5, rtol=3e-5)
+    assert torch.allclose(l3_fast.grad, l3_ref.grad, atol=3e-5, rtol=3e-5)
+    ref_params = dict(block_ref.evidence_binding_hub.named_parameters())
+    fast_params = dict(block_fast.evidence_binding_hub.named_parameters())
+    for name in ("value_proj.weight", "read_mix.weight", "bind_gate.weight", "delta_proj.3.weight"):
+        grad_ref = ref_params[name].grad
+        grad_fast = fast_params[name].grad
+        assert grad_ref is not None and grad_ref.norm().item() > 0.0
+        assert grad_fast is not None and grad_fast.norm().item() > 0.0
+        assert torch.allclose(grad_fast, grad_ref, atol=5e-5, rtol=5e-5)
+
+
 def test_sourcewise_ebh_packet_flag_avoids_ebh_materialization_and_backprops(monkeypatch) -> None:
     monkeypatch.setenv("DWARF_DSQG_W_EBH_SOURCEWISE_PACKET", "1")
     monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "0")

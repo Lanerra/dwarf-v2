@@ -202,6 +202,7 @@ def test_full_run_launcher_can_enable_evidence_binding_hub_env(tmp_path: Path) -
         ebh_phase_bands=3,
         ebh_score_features=False,
         ebh_sourcewise_packet=True,
+        ebh_triton_lane_accum=True,
     )
 
     env = cfg["env"]
@@ -211,6 +212,7 @@ def test_full_run_launcher_can_enable_evidence_binding_hub_env(tmp_path: Path) -
     assert env["DWARF_DSQG_W_EBH_PHASE_BANDS"] == "3"
     assert env["DWARF_DSQG_W_EBH_SCORE_FEATURES"] == "0"
     assert env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] == "1"
+    assert env["DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM"] == "1"
 
 
 def test_full_run_launcher_can_configure_cpt_resume_env(tmp_path: Path) -> None:
