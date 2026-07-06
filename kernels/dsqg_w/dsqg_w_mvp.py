@@ -8,6 +8,7 @@ from enum import IntEnum
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:
     import triton
@@ -41,6 +42,16 @@ class CandidateSource(IntEnum):
     HISA = 3
     SUMMARY = 4
     QUESTION_CACHE = 5
+
+
+class CandidateEvidenceBit(IntEnum):
+    HISA = 1 << 0
+    QUESTION = 1 << 1
+    L3_SKIP = 1 << 2
+    LOCAL = 1 << 3
+    LONG_OFFSET = 1 << 4
+    CHUNK_REP = 1 << 5
+    NULL = 1 << 6
 
 
 # Lower is better.  This matches the DWARF v2 proposal: semantic evidence/cues
@@ -116,6 +127,137 @@ def _dsqg_w_profile_range(name: str):
     if _dsqg_w_profile_enabled():
         return torch.profiler.record_function(f"dsqg_w/{name}")
     return nullcontext()
+
+
+if _TRITON_SOURCEWISE_AVAILABLE:
+    @triton.jit
+    def _dsqg_w_candidate_state_gather_kernel(
+        x_ptr,
+        l3_ptr,
+        token_ptr,
+        source_ptr,
+        mask_ptr,
+        out_ptr,
+        total: tl.constexpr,
+        n: tl.constexpr,
+        j_count: tl.constexpr,
+        d: tl.constexpr,
+        has_l3: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        active = offsets < total
+        dim = offsets % d
+        slot = (offsets // d) % j_count
+        pos = (offsets // (d * j_count)) % n
+        batch = offsets // (d * j_count * n)
+        meta_offset = (batch * n + pos) * j_count + slot
+        valid = active & (tl.load(mask_ptr + meta_offset, mask=active, other=0) != 0)
+        source = tl.load(source_ptr + meta_offset, mask=active, other=0)
+        token = tl.load(token_ptr + meta_offset, mask=active, other=0)
+        token = tl.minimum(tl.maximum(token, 0), n - 1)
+        source_l3 = (source == 2) | (source == 3)
+        source_null = source == 0
+        use_l3 = source_l3 & has_l3
+        use_x = (~use_l3) & (~source_null)
+        base_offset = (batch * n + token) * d + dim
+        x_val = tl.load(x_ptr + base_offset, mask=valid & use_x, other=0.0)
+        l3_val = tl.load(l3_ptr + base_offset, mask=valid & use_l3, other=0.0)
+        # SUMMARY uses x on this fast path; callers with real chunk_rep_states
+        # fall back before launching this kernel.
+        val = x_val + l3_val
+        tl.store(out_ptr + offsets, val, mask=active)
+
+
+    @triton.jit
+    def _dsqg_w_candidate_state_gather_backward_kernel(
+        grad_out_ptr,
+        token_ptr,
+        source_ptr,
+        mask_ptr,
+        grad_x_ptr,
+        grad_l3_ptr,
+        total: tl.constexpr,
+        n: tl.constexpr,
+        j_count: tl.constexpr,
+        d: tl.constexpr,
+        has_l3: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+        active = offsets < total
+        dim = offsets % d
+        slot = (offsets // d) % j_count
+        pos = (offsets // (d * j_count)) % n
+        batch = offsets // (d * j_count * n)
+        meta_offset = (batch * n + pos) * j_count + slot
+        valid = active & (tl.load(mask_ptr + meta_offset, mask=active, other=0) != 0)
+        source = tl.load(source_ptr + meta_offset, mask=active, other=0)
+        token = tl.load(token_ptr + meta_offset, mask=active, other=0)
+        token = tl.minimum(tl.maximum(token, 0), n - 1)
+        source_l3 = (source == 2) | (source == 3)
+        source_null = source == 0
+        use_l3 = source_l3 & has_l3
+        use_x = (~use_l3) & (~source_null)
+        base_offset = (batch * n + token) * d + dim
+        grad = tl.load(grad_out_ptr + offsets, mask=valid, other=0.0)
+        tl.atomic_add(grad_x_ptr + base_offset, grad, sem="relaxed", mask=valid & use_x)
+        tl.atomic_add(grad_l3_ptr + base_offset, grad, sem="relaxed", mask=valid & use_l3)
+
+
+class _DSQGWSourcewiseCandidateStateGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, l3_states, cand_token_indices, cand_sources, cand_mask, has_l3: bool):
+        bsz, seq_len, d = x.shape
+        j_count = cand_token_indices.shape[-1]
+        out = torch.empty((bsz, seq_len, j_count, d), device=x.device, dtype=x.dtype)
+        block = 256
+        total = int(out.numel())
+        l3_arg = l3_states if bool(has_l3) else x
+        _dsqg_w_candidate_state_gather_kernel[(triton.cdiv(total, block),)](
+            x.contiguous(),
+            l3_arg.contiguous(),
+            cand_token_indices.contiguous(),
+            cand_sources.contiguous(),
+            cand_mask.contiguous(),
+            out,
+            total=total,
+            n=seq_len,
+            j_count=j_count,
+            d=d,
+            has_l3=bool(has_l3),
+            block=block,
+        )
+        ctx.save_for_backward(cand_token_indices, cand_sources, cand_mask)
+        ctx.x_shape = tuple(x.shape)
+        ctx.has_l3 = bool(has_l3)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        cand_token_indices, cand_sources, cand_mask = ctx.saved_tensors
+        bsz, seq_len, d = ctx.x_shape
+        j_count = cand_token_indices.shape[-1]
+        grad_x = torch.zeros((bsz, seq_len, d), device=grad_out.device, dtype=grad_out.dtype)
+        grad_l3 = torch.zeros_like(grad_x) if ctx.has_l3 else None
+        block = 256
+        total = int(grad_out.numel())
+        grad_l3_arg = grad_l3 if grad_l3 is not None else grad_x
+        _dsqg_w_candidate_state_gather_backward_kernel[(triton.cdiv(total, block),)](
+            grad_out.contiguous(),
+            cand_token_indices.contiguous(),
+            cand_sources.contiguous(),
+            cand_mask.contiguous(),
+            grad_x,
+            grad_l3_arg,
+            total=total,
+            n=seq_len,
+            j_count=j_count,
+            d=d,
+            has_l3=ctx.has_l3,
+            block=block,
+        )
+        return grad_x, grad_l3, None, None, None, None
 
 
 def _dsqg_w_geometry_telemetry(
@@ -207,6 +349,16 @@ class DSQGWConfig:
     typed_mixer_gate_init: float = -5.0
     use_query_type_bias: bool = False
     typed_hisa_reps: bool = False
+    use_evidence_prior: bool = False
+    evidence_prior_clip: float = 2.0
+    evidence_prior_init_scale: float = 0.0
+    use_evidence_binding_hub: bool = False
+    ebh_bottleneck: int = 256
+    ebh_gate_init: float = -5.0
+    ebh_phase_bands: int = 4
+    ebh_score_features: bool = True
+    use_candidate_quotas: bool = False
+    quota_hisa_max: int = 0
 
     def __post_init__(self) -> None:
         if self.d <= 0:
@@ -229,6 +381,14 @@ class DSQGWConfig:
             raise ValueError("width_entropy_weight must be non-negative")
         if self.typed_mixer_bottleneck <= 0:
             raise ValueError("typed_mixer_bottleneck must be positive")
+        if self.evidence_prior_clip <= 0.0:
+            raise ValueError("evidence_prior_clip must be positive")
+        if self.ebh_bottleneck <= 0:
+            raise ValueError("ebh_bottleneck must be positive")
+        if self.ebh_phase_bands <= 0:
+            raise ValueError("ebh_phase_bands must be positive")
+        if self.quota_hisa_max < 0:
+            raise ValueError("quota_hisa_max must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -249,6 +409,9 @@ class CandidateBatch:
     cand_token_indices: torch.Tensor
     valid_candidate_count: torch.Tensor
     cand_scores: torch.Tensor | None = None
+    evidence_bits: torch.Tensor | None = None
+    evidence_count: torch.Tensor | None = None
+    candidate_distances: torch.Tensor | None = None
     telemetry: dict[str, torch.Tensor] = field(default_factory=dict)
     active_source_ids: tuple[int, ...] = field(default_factory=tuple)
 
@@ -401,6 +564,120 @@ class CandidateProvider:
         duplicate_count = (valid & earlier_same_key.any(dim=-1)).sum()
         return keep, duplicate_count
 
+    @staticmethod
+    def _is_hisa_type(types: torch.Tensor) -> torch.Tensor:
+        return (
+            (types == int(CandidateType.HISA_EVIDENCE))
+            | (types == int(CandidateType.HISA_EVIDENCE_REP0))
+            | (types == int(CandidateType.HISA_EVIDENCE_REP1))
+            | (types == int(CandidateType.HISA_EVIDENCE_REP2))
+            | (types == int(CandidateType.HISA_EVIDENCE_REP3))
+        )
+
+    @classmethod
+    def _candidate_type_evidence_bits(cls, types: torch.Tensor) -> torch.Tensor:
+        bits = torch.zeros_like(types, dtype=torch.long)
+        bits = torch.where(cls._is_hisa_type(types), bits | int(CandidateEvidenceBit.HISA), bits)
+        for ctype, bit in (
+            (CandidateType.QUESTION, CandidateEvidenceBit.QUESTION),
+            (CandidateType.L3_SKIP, CandidateEvidenceBit.L3_SKIP),
+            (CandidateType.LOCAL, CandidateEvidenceBit.LOCAL),
+            (CandidateType.LONG_OFFSET, CandidateEvidenceBit.LONG_OFFSET),
+            (CandidateType.CHUNK_REP, CandidateEvidenceBit.CHUNK_REP),
+            (CandidateType.NULL, CandidateEvidenceBit.NULL),
+        ):
+            bits = torch.where(types == int(ctype), bits | int(bit), bits)
+        return bits
+
+    @staticmethod
+    def _evidence_count_from_bits(bits: torch.Tensor) -> torch.Tensor:
+        count = torch.zeros_like(bits, dtype=torch.long)
+        for bit in CandidateEvidenceBit:
+            count = count + ((bits & int(bit)) != 0).to(torch.long)
+        return count
+
+    @classmethod
+    def _collapse_evidence_by_token_source(
+        cls,
+        tokens: torch.Tensor,
+        sources: torch.Tensor,
+        evidence_bits: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        same_key = (
+            (tokens.unsqueeze(-1) == tokens.unsqueeze(-2))
+            & (sources.unsqueeze(-1) == sources.unsqueeze(-2))
+            & valid.unsqueeze(-1)
+            & valid.unsqueeze(-2)
+        )
+        collapsed = torch.zeros_like(evidence_bits, dtype=torch.long)
+        for bit in CandidateEvidenceBit:
+            bit_present = ((evidence_bits & int(bit)) != 0).unsqueeze(-2)
+            has_bit = (same_key & bit_present).any(dim=-1)
+            collapsed = torch.where(has_bit, collapsed | int(bit), collapsed)
+        collapsed = collapsed.masked_fill(~valid, 0)
+        return collapsed, cls._evidence_count_from_bits(collapsed).masked_fill(~valid, 0)
+
+    def _apply_candidate_quotas(
+        self,
+        sort_key: torch.Tensor,
+        keep: torch.Tensor,
+        types: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        clipped = torch.zeros((), device=sort_key.device, dtype=torch.long)
+        if not self.config.use_candidate_quotas or self.config.quota_hisa_max <= 0:
+            return keep, clipped
+        hisa = self._is_hisa_type(types) & keep
+        if not bool(hisa.any()):
+            return keep, clipped
+        cap = min(int(self.config.quota_hisa_max), int(sort_key.shape[-1]))
+        hisa_order = sort_key.masked_fill(~hisa, float("inf")).argsort(dim=-1)[..., :cap]
+        allowed_hisa = torch.zeros_like(keep, dtype=torch.bool).scatter(-1, hisa_order, True) & hisa
+        capped_keep = keep & (~hisa | allowed_hisa)
+        clipped = (hisa & ~allowed_hisa).sum()
+        return capped_keep, clipped
+
+    @staticmethod
+    def _evidence_telemetry(
+        *,
+        raw_types: torch.Tensor,
+        raw_sources: torch.Tensor,
+        raw_valid: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        evidence_count: torch.Tensor,
+        quota_clipped: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        device = cand_mask.device
+        valid_slots = cand_mask.to(torch.float32).sum().clamp_min(1.0)
+        raw_slots = raw_valid.to(torch.float32).sum().clamp_min(1.0)
+        valid_rows = cand_mask.any(dim=-1)
+        row_denom = valid_rows.to(torch.float32).sum().clamp_min(1.0)
+        multi = (evidence_count > 1) & cand_mask
+        hisa_slots = CandidateProvider._is_hisa_type(cand_types) & cand_mask
+        hisa_frac_by_row = hisa_slots.to(torch.float32).sum(dim=-1) / cand_mask.to(torch.float32).sum(dim=-1).clamp_min(1.0)
+        question_rows = ((cand_types == int(CandidateType.QUESTION)) & cand_mask).any(dim=-1)
+        out: dict[str, torch.Tensor] = {
+            "dsqg_w_candidate_multi_evidence_fraction": (multi.to(torch.float32).sum() / valid_slots).to(device=device, dtype=dtype),
+            "dsqg_w_candidate_evidence_count_mean": (
+                evidence_count.to(torch.float32).masked_select(cand_mask).mean() if cand_mask.any() else torch.zeros((), device=device)
+            ).to(device=device, dtype=dtype),
+            "dsqg_w_candidate_hisa_monopoly_row_fraction": ((hisa_frac_by_row >= 0.75) & valid_rows).to(torch.float32).sum().to(device=device, dtype=dtype) / row_denom.to(device=device, dtype=dtype),
+            "dsqg_w_candidate_missing_question_row_fraction": (valid_rows & ~question_rows).to(torch.float32).sum().to(device=device, dtype=dtype) / row_denom.to(device=device, dtype=dtype),
+            "dsqg_w_candidate_quota_hisa_clipped_fraction": quota_clipped.to(device=device, dtype=dtype) / raw_slots.to(device=device, dtype=dtype),
+        }
+        for source in CandidateSource:
+            raw_mask = (raw_sources == int(source)) & raw_valid
+            post_mask = (cand_sources == int(source)) & cand_mask
+            out[f"dsqg_w_candidate_pre_source_fraction_{source.name.lower()}"] = (raw_mask.to(torch.float32).sum() / raw_slots).to(device=device, dtype=dtype)
+            out[f"dsqg_w_candidate_post_source_fraction_{source.name.lower()}"] = (post_mask.to(torch.float32).sum() / valid_slots).to(device=device, dtype=dtype)
+        for ctype in CandidateType:
+            raw_mask = (raw_types == int(ctype)) & raw_valid
+            out[f"dsqg_w_candidate_pre_fraction_{ctype.name.lower()}"] = (raw_mask.to(torch.float32).sum() / raw_slots).to(device=device, dtype=dtype)
+        return out
+
     def _build_dsr_selected_metadata_fast(
         self,
         final_states: torch.Tensor,
@@ -493,6 +770,17 @@ class CandidateProvider:
         if tokens.shape[-1] == 0 or not valid.any(dim=-1).all():
             raise RuntimeError("CandidateProvider produced an all-invalid DSQG-W candidate row")
 
+        raw_valid = valid
+        raw_types = types
+        raw_sources = sources
+        evidence_bits_all, evidence_count_all = self._collapse_evidence_by_token_source(
+            tokens,
+            sources,
+            self._candidate_type_evidence_bits(types),
+            valid,
+        )
+        candidate_distances_all = (positions - tokens).clamp_min(0).masked_fill(~valid, 0)
+
         priority_table = torch.full((max(self.config.n_types, len(CandidateType)),), 99, device=device, dtype=torch.long)
         for ctype, priority_value in _CANDIDATE_PRIORITY.items():
             priority_table[int(ctype)] = int(priority_value)
@@ -505,7 +793,9 @@ class CandidateProvider:
             + tokens.clamp_min(0).to(torch.float32) * float(sort_stride_source)
             + sources.clamp_min(0).to(torch.float32)
         )
-        sort_key = sort_key.masked_fill(~valid, float("inf"))
+        keep = valid
+        keep, quota_clipped = self._apply_candidate_quotas(sort_key, keep, types)
+        sort_key = sort_key.masked_fill(~keep, float("inf"))
         order_idx = sort_key.argsort(dim=-1)
         order_valid = torch.ones_like(order_idx, dtype=torch.bool)
         j_max = min(int(self.config.max_candidates), int(tokens.shape[-1]))
@@ -516,12 +806,18 @@ class CandidateProvider:
         cand_types = types.gather(-1, order_idx)
         cand_sources = sources.gather(-1, order_idx)
         cand_scores = scores.gather(-1, order_idx)
-        cand_mask = valid.gather(-1, order_idx) & order_valid
+        evidence_bits = evidence_bits_all.gather(-1, order_idx)
+        evidence_count = evidence_count_all.gather(-1, order_idx)
+        candidate_distances = candidate_distances_all.gather(-1, order_idx)
+        cand_mask = keep.gather(-1, order_idx) & order_valid
         valid_count = cand_mask.sum(dim=-1).to(torch.long)
         cand_token_indices = cand_token_indices.masked_fill(~cand_mask, -1)
         cand_types = cand_types.masked_fill(~cand_mask, int(CandidateType.NULL))
         cand_sources = cand_sources.masked_fill(~cand_mask, int(CandidateSource.NULL))
         cand_scores = cand_scores.masked_fill(~cand_mask, 0.0)
+        evidence_bits = evidence_bits.masked_fill(~cand_mask, 0)
+        evidence_count = evidence_count.masked_fill(~cand_mask, 0)
+        candidate_distances = candidate_distances.masked_fill(~cand_mask, 0)
 
         raw_count = max(int(tokens.shape[-1]), 1)
         invalid_count = (~valid).sum()
@@ -540,6 +836,19 @@ class CandidateProvider:
         for ctype in CandidateType:
             mask = (cand_types == int(ctype)) & cand_mask
             telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
+        telemetry.update(
+            self._evidence_telemetry(
+                raw_types=raw_types,
+                raw_sources=raw_sources,
+                raw_valid=raw_valid,
+                cand_types=cand_types,
+                cand_sources=cand_sources,
+                cand_mask=cand_mask,
+                evidence_count=evidence_count,
+                quota_clipped=quota_clipped,
+                dtype=final_states.dtype,
+            )
+        )
         if _dsqg_w_geometry_audit_enabled():
             telemetry.update(_dsqg_w_geometry_telemetry(cand_token_indices, cand_types, cand_sources, cand_mask))
         return CandidateBatch(
@@ -550,6 +859,9 @@ class CandidateProvider:
             cand_token_indices=cand_token_indices,
             valid_candidate_count=valid_count,
             cand_scores=cand_scores,
+            evidence_bits=evidence_bits,
+            evidence_count=evidence_count,
+            candidate_distances=candidate_distances,
             telemetry=telemetry,
             active_source_ids=tuple(sorted(active_source_ids)),
         )
@@ -718,6 +1030,16 @@ class CandidateProvider:
         same_min_priority_higher_or_equal_score = same_min_priority & (score_j >= scores.unsqueeze(-1))
         keep = valid & (priority == min_priority) & (scores >= max_score_same_key) & ~same_min_priority_higher_or_equal_score.any(dim=-1)
         duplicate_count = duplicate_mask.sum()
+        raw_valid = valid
+        raw_types = types
+        raw_sources = sources
+        evidence_bits_all, evidence_count_all = self._collapse_evidence_by_token_source(
+            tokens,
+            sources,
+            self._candidate_type_evidence_bits(types),
+            valid,
+        )
+        candidate_distances_all = (positions - tokens).clamp_min(0).masked_fill(~valid, 0)
 
         sort_stride_source = max(self.config.n_sources, len(CandidateSource)) + 1
         sort_stride_token = (seq_len + 1) * sort_stride_source
@@ -727,6 +1049,7 @@ class CandidateProvider:
             + tokens.clamp_min(0).to(torch.float64) * float(sort_stride_source)
             + sources.clamp_min(0).to(torch.float64)
         )
+        keep, quota_clipped = self._apply_candidate_quotas(sort_key, keep, types)
         sort_key = sort_key.masked_fill(~keep, float("inf"))
         order_idx = sort_key.argsort(dim=-1)
         order_valid = torch.ones_like(order_idx, dtype=torch.bool)
@@ -742,12 +1065,18 @@ class CandidateProvider:
         cand_types = types.gather(-1, order_idx)
         cand_sources = sources.gather(-1, order_idx)
         cand_scores = scores.gather(-1, order_idx)
+        evidence_bits = evidence_bits_all.gather(-1, order_idx)
+        evidence_count = evidence_count_all.gather(-1, order_idx)
+        candidate_distances = candidate_distances_all.gather(-1, order_idx)
         cand_mask = keep.gather(-1, order_idx) & order_valid
         valid_count = cand_mask.sum(dim=-1).to(torch.long)
         cand_token_indices = cand_token_indices.masked_fill(~cand_mask, -1)
         cand_types = cand_types.masked_fill(~cand_mask, int(CandidateType.NULL))
         cand_sources = cand_sources.masked_fill(~cand_mask, int(CandidateSource.NULL))
         cand_scores = cand_scores.masked_fill(~cand_mask, 0.0)
+        evidence_bits = evidence_bits.masked_fill(~cand_mask, 0)
+        evidence_count = evidence_count.masked_fill(~cand_mask, 0)
+        candidate_distances = candidate_distances.masked_fill(~cand_mask, 0)
 
         if materialize_states:
             gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
@@ -789,6 +1118,19 @@ class CandidateProvider:
         for ctype in CandidateType:
             mask = (cand_types == int(ctype)) & cand_mask
             telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
+        telemetry.update(
+            self._evidence_telemetry(
+                raw_types=raw_types,
+                raw_sources=raw_sources,
+                raw_valid=raw_valid,
+                cand_types=cand_types,
+                cand_sources=cand_sources,
+                cand_mask=cand_mask,
+                evidence_count=evidence_count,
+                quota_clipped=quota_clipped,
+                dtype=final_states.dtype,
+            )
+        )
         if _dsqg_w_geometry_audit_enabled():
             telemetry.update(
                 _dsqg_w_geometry_telemetry(
@@ -807,6 +1149,9 @@ class CandidateProvider:
             cand_token_indices=cand_token_indices,
             valid_candidate_count=valid_count,
             cand_scores=cand_scores,
+            evidence_bits=evidence_bits,
+            evidence_count=evidence_count,
+            candidate_distances=candidate_distances,
             telemetry=telemetry,
             active_source_ids=tuple(sorted(active_source_ids)),
         )
@@ -1102,6 +1447,117 @@ def width_pair_transfer_loss(
     return transfer_loss + float(entropy_weight) * entropy_penalty
 
 
+class DSQGWEvidencePriorComposer(nn.Module):
+    """Bounded scalar evidence prior for DSQG-W candidate scoring.
+
+    The module is intentionally scalar and row-centered so it can feed the
+    existing cand_scores path without changing kernel ABI. All learned weights
+    default to zero, making the composer a strict no-op until enabled scales
+    learn away from zero.
+    """
+
+    def __init__(self, *, n_types: int, n_sources: int, clip: float = 2.0, init_scale: float = 0.0) -> None:
+        super().__init__()
+        if clip <= 0.0:
+            raise ValueError("clip must be positive")
+        self.n_types = int(n_types)
+        self.n_sources = int(n_sources)
+        self.clip = float(clip)
+        self.type_bias = nn.Parameter(torch.zeros(n_types))
+        self.source_bias = nn.Parameter(torch.zeros(n_sources))
+        self.feature_scale = nn.Parameter(torch.full((5,), float(init_scale)))
+
+    def forward(
+        self,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        raw_hisa_scores: torch.Tensor | None = None,
+        evidence_bits: torch.Tensor | None = None,
+        evidence_count: torch.Tensor | None = None,
+        candidate_distances: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if cand_types.shape != cand_mask.shape or cand_sources.shape != cand_mask.shape:
+            raise ValueError("candidate type/source/mask tensors must align")
+        dtype = self.type_bias.dtype
+        device = cand_types.device
+        valid = cand_mask.bool()
+        types = cand_types.clamp(0, self.n_types - 1)
+        sources = cand_sources.clamp(0, self.n_sources - 1)
+        prior = self.type_bias[types].to(device=device, dtype=dtype) + self.source_bias[sources].to(device=device, dtype=dtype)
+
+        if raw_hisa_scores is None:
+            score = torch.zeros_like(prior)
+        else:
+            score = torch.nan_to_num(raw_hisa_scores.to(device=device, dtype=dtype), nan=0.0, neginf=0.0, posinf=0.0)
+        valid_f = valid.to(dtype)
+        denom = valid_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        mean = (score.masked_fill(~valid, 0.0).sum(dim=-1, keepdim=True) / denom)
+        var = ((score - mean).masked_fill(~valid, 0.0).square().sum(dim=-1, keepdim=True) / denom).clamp_min(1e-6)
+        score_z = ((score - mean) / var.sqrt()).clamp(-5.0, 5.0).masked_fill(~valid, 0.0)
+
+        masked_score = score.masked_fill(~valid, -float("inf"))
+        order = masked_score.argsort(dim=-1, descending=True)
+        ranks = torch.zeros_like(order)
+        rank_values = torch.arange(order.shape[-1], device=device, dtype=order.dtype).expand_as(order)
+        ranks.scatter_(-1, order, rank_values)
+        rank_feature = torch.rsqrt(ranks.to(dtype) + 1.0).masked_fill(~valid, 0.0)
+
+        if evidence_count is None:
+            count_feature = torch.zeros_like(prior)
+        else:
+            count_feature = torch.log1p(evidence_count.to(device=device, dtype=dtype)).masked_fill(~valid, 0.0)
+
+        if evidence_bits is None:
+            qh_feature = torch.zeros_like(prior)
+            multi_fraction = prior.new_tensor(0.0)
+        else:
+            bits = evidence_bits.to(device=device, dtype=torch.long)
+            qh = ((bits & int(CandidateEvidenceBit.QUESTION)) != 0) & ((bits & int(CandidateEvidenceBit.HISA)) != 0) & valid
+            qh_feature = qh.to(dtype)
+            if evidence_count is not None and valid.any():
+                multi_fraction = ((evidence_count.to(device=device) > 1) & valid).to(dtype).sum() / valid_f.sum().clamp_min(1.0)
+            else:
+                multi_fraction = prior.new_tensor(0.0)
+
+        if candidate_distances is None:
+            distance_feature = torch.zeros_like(prior)
+        else:
+            distance_feature = torch.log1p(candidate_distances.to(device=device, dtype=dtype)).masked_fill(~valid, 0.0)
+
+        features = (score_z, rank_feature, count_feature, qh_feature, -distance_feature)
+        for idx, feature in enumerate(features):
+            prior = prior + self.feature_scale[idx].to(dtype=dtype, device=device) * feature
+
+        centered = prior - (prior.masked_fill(~valid, 0.0).sum(dim=-1, keepdim=True) / denom)
+        centered = centered.masked_fill(~valid, 0.0)
+        clipped = centered.clamp(-self.clip, self.clip).masked_fill(~valid, 0.0)
+        valid_values = clipped.masked_select(valid)
+        if valid_values.numel() == 0:
+            zero = clipped.sum() * 0.0
+            telemetry = {
+                "dsqg_w_prior_norm": zero.detach(),
+                "dsqg_w_prior_abs_mean": zero.detach(),
+                "dsqg_w_prior_std": zero.detach(),
+                "dsqg_w_prior_clip_fraction": zero.detach(),
+                "dsqg_w_prior_multi_evidence_fraction": zero.detach(),
+            }
+        else:
+            clipped_any = ((centered.abs() > self.clip) & valid).to(dtype).sum() / valid_f.sum().clamp_min(1.0)
+            telemetry = {
+                "dsqg_w_prior_norm": (valid_values.norm() / valid_values.numel()).detach(),
+                "dsqg_w_prior_abs_mean": valid_values.abs().mean().detach(),
+                "dsqg_w_prior_std": valid_values.std(unbiased=False).detach(),
+                "dsqg_w_prior_clip_fraction": clipped_any.detach(),
+                "dsqg_w_prior_multi_evidence_fraction": multi_fraction.detach(),
+                "dsqg_w_prior_feature_scale_norm": self.feature_scale.detach().norm(),
+                "dsqg_w_prior_type_bias_norm": self.type_bias.detach().norm(),
+                "dsqg_w_prior_source_bias_norm": self.source_bias.detach().norm(),
+            }
+        return clipped.to(dtype=raw_hisa_scores.dtype if raw_hisa_scores is not None else torch.float32), telemetry
+
+
 class DSQGWWidthCell(nn.Module):
     """Bounded candidate-to-candidate semantic transfer over the DSQG-W width axis."""
 
@@ -1165,13 +1621,24 @@ class DSQGWWidthCell(nn.Module):
             raise ValueError("DSQG-W width cell received an all-invalid candidate row")
 
         c_n = self.norm_c(cand_states)
-        q = self.q_proj(c_n)
-        k = self.k_proj(c_n)
-        v = self.v_proj(c_n)
+        q, k, v, rel_diff, rel_prod = F.linear(
+            c_n,
+            torch.cat(
+                [
+                    self.q_proj.weight,
+                    self.k_proj.weight,
+                    self.v_proj.weight,
+                    self.rel_diff_proj.weight,
+                    self.rel_prod_proj.weight,
+                ],
+                dim=0,
+            ),
+        ).split(self.width_dim, dim=-1)
 
-        scores = (q[:, :, :, None, :] * k[:, :, None, :, :]).sum(dim=-1) / math.sqrt(float(self.width_dim))
-        rel_diff = self.rel_diff_proj(c_n)
-        rel_prod = self.rel_prod_proj(c_n)
+        scores = torch.bmm(
+            q.reshape(bsz * seq_len, j_count, self.width_dim),
+            k.reshape(bsz * seq_len, j_count, self.width_dim).transpose(1, 2),
+        ).reshape(bsz, seq_len, j_count, j_count) / math.sqrt(float(self.width_dim))
         rel_diff_hidden = torch.tanh(rel_diff[:, :, :, None, :] - rel_diff[:, :, None, :, :])
         rel_prod_hidden = torch.tanh(rel_prod[:, :, :, None, :] * rel_prod[:, :, None, :, :])
         scores = scores + (
@@ -1182,15 +1649,17 @@ class DSQGWWidthCell(nn.Module):
         ).sum(dim=-1) / math.sqrt(float(self.width_dim))
         scores = scores + self.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
         scores = scores + self.source_pair_bias[cand_sources[:, :, :, None], cand_sources[:, :, None, :]]
-        eye = torch.eye(j_count, device=cand_states.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
-        scores = scores + eye.to(scores.dtype) * self.self_bias
+        scores.diagonal(dim1=-2, dim2=-1).add_(self.self_bias)
 
         valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
         scores = scores.masked_fill(~valid_pair, torch.finfo(scores.dtype).min)
         probs = F.softmax(scores, dim=3)
         probs = probs.masked_fill(~valid_pair, 0.0)
 
-        lateral = (probs[..., None] * v[:, :, None, :, :]).sum(dim=3)
+        lateral = torch.bmm(
+            probs.reshape(bsz * seq_len, j_count, j_count),
+            v.reshape(bsz * seq_len, j_count, self.width_dim),
+        ).reshape(bsz, seq_len, j_count, self.width_dim)
         delta = self.lateral_up(lateral)
         gate = torch.sigmoid(self.gate).reshape(1, 1, 1, d)
         out = cand_states + gate * delta * cand_mask[..., None].to(delta.dtype)
@@ -1300,19 +1769,25 @@ class DSQGWTypedCandidateMixer(nn.Module):
         else:
             c = self.norm_c(cand_states)
             type_embed_active = False
-        q = self.q_proj(c)
-        k = self.k_proj(c)
-        v = self.v_proj(c)
-        scores = torch.einsum("btjd,btkd->btjk", q, k) / math.sqrt(float(self.mix_dim))
+        q, k, v = F.linear(
+            c,
+            torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0),
+        ).split(self.mix_dim, dim=-1)
+        scores = torch.bmm(
+            q.reshape(bsz * seq_len, j_count, self.mix_dim),
+            k.reshape(bsz * seq_len, j_count, self.mix_dim).transpose(1, 2),
+        ).reshape(bsz, seq_len, j_count, j_count) / math.sqrt(float(self.mix_dim))
         if os.getenv("DWARF_DSQG_W_TYPED_MIXER_PAIR_BIAS", "1") == "1":
-            type_one_hot = F.one_hot(cand_types, num_classes=self.n_types).to(dtype=scores.dtype)
-            scores = scores + torch.einsum("btjr,rs,btks->btjk", type_one_hot, self.type_pair_bias, type_one_hot)
+            scores = scores + self.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
         valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
         scores = scores.masked_fill(~valid_pair, torch.finfo(scores.dtype).min)
         probs = F.softmax(scores, dim=-1)
         probs = probs.masked_fill(~valid_pair, 0.0)
 
-        mixed = torch.einsum("btjk,btkd->btjd", probs, v)
+        mixed = torch.bmm(
+            probs.reshape(bsz * seq_len, j_count, j_count),
+            v.reshape(bsz * seq_len, j_count, self.mix_dim),
+        ).reshape(bsz, seq_len, j_count, self.mix_dim)
         delta = self.out_proj(mixed)
         gate = torch.sigmoid(self.gate).reshape(1, 1, 1, d)
         out = cand_states + gate * delta * cand_mask[..., None].to(delta.dtype)
@@ -1337,6 +1812,439 @@ class DSQGWTypedCandidateMixer(nn.Module):
             "dsqg_w_typed_mixer_type_embed_active": cand_states.new_tensor(1.0 if type_embed_active else 0.0).detach(),
         }
         return out, telemetry
+
+
+class DSQGWEvidenceBindingHub(nn.Module):
+    """Sparse/linear query-local evidence binder for DSQG-W.
+
+    This is the TPJ-like path for testing whether D/HISA-selected evidence can
+    be aligned into the current query token's semantic frame and injected as an
+    owned residual packet.  It consumes an already-bounded candidate set and only
+    performs candidate-local work plus all/type/source lane reductions; it does
+    not build candidate-candidate K^2 tensors.
+    """
+
+    def __init__(
+        self,
+        *,
+        d: int,
+        n_types: int,
+        n_sources: int,
+        bottleneck: int,
+        gate_init: float = -5.0,
+        phase_bands: int = 4,
+        max_distance: int = 8192,
+        use_score_features: bool = True,
+        dropout: float = 0.0,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        if d <= 0:
+            raise ValueError("d must be positive")
+        if bottleneck <= 0:
+            raise ValueError("evidence binding bottleneck must be positive")
+        if phase_bands <= 0:
+            raise ValueError("evidence binding phase_bands must be positive")
+        if max_distance <= 0:
+            raise ValueError("evidence binding max_distance must be positive")
+        self.d = int(d)
+        self.n_types = int(n_types)
+        self.n_sources = int(n_sources)
+        self.phase_bands = int(phase_bands)
+        self.max_distance = int(max_distance)
+        self.use_score_features = bool(use_score_features)
+        self.eps = float(eps)
+
+        self.norm_x = nn.LayerNorm(d)
+        self.norm_c = nn.LayerNorm(d)
+        self.value_proj = nn.Linear(d, d, bias=False)
+        self.query_proj = nn.Linear(d, d, bias=False)
+        self.type_value = nn.Embedding(n_types, d)
+        self.source_value = nn.Embedding(n_sources, d)
+        self.phase_proj = nn.Linear(2 * self.phase_bands, d, bias=False)
+        self.score_proj = nn.Linear(1, d, bias=False)
+        lane_width = (1 + self.n_types + self.n_sources) * d
+        self.read_mix = nn.Linear(lane_width, d, bias=False)
+        self.packet_norm = nn.LayerNorm(d)
+        self.delta_proj = nn.Sequential(
+            nn.Linear(4 * d, bottleneck),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(bottleneck, d),
+        )
+        self.bind_gate = nn.Linear(2 * d, d)
+
+        nn.init.zeros_(self.bind_gate.weight)
+        nn.init.constant_(self.bind_gate.bias, float(gate_init))
+        nn.init.normal_(self.delta_proj[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.delta_proj[-1].bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cand_states: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        candidate_distances: torch.Tensor | None = None,
+        cand_scores: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ):
+        if x.ndim != 3 or cand_states.ndim != 4:
+            raise ValueError("x must be [B,T,D] and cand_states must be [B,T,J,D]")
+        bsz, seq_len, d = x.shape
+        b2, t2, j_count, d2 = cand_states.shape
+        if (bsz, seq_len, d) != (b2, t2, d2):
+            raise ValueError("x and cand_states shape mismatch")
+        if d != self.d:
+            raise ValueError(f"x last dim {d} does not match evidence binding d {self.d}")
+        if cand_types.shape != (bsz, seq_len, j_count) or cand_sources.shape != cand_types.shape:
+            raise ValueError("candidate type/source tensors must have shape [B,T,J]")
+        if cand_mask.shape != cand_types.shape:
+            raise ValueError("candidate mask must have shape [B,T,J]")
+
+        device = x.device
+        dtype = x.dtype
+        valid = cand_mask.to(device=device, dtype=torch.bool)
+        safe_types = cand_types.to(device=device, dtype=torch.long).clamp(0, self.n_types - 1)
+        safe_sources = cand_sources.to(device=device, dtype=torch.long).clamp(0, self.n_sources - 1)
+        weights = valid.to(dtype=dtype)
+        mass = weights.sum(dim=-1, keepdim=True)
+        norm_weights = torch.where(mass > 0, weights / mass.clamp_min(self.eps), torch.zeros_like(weights))
+
+        x_n = self.norm_x(x)
+        c_n = self.norm_c(cand_states)
+        aligned = self.value_proj(c_n)
+        aligned = aligned + self.type_value(safe_types).to(dtype=dtype)
+        aligned = aligned + self.source_value(safe_sources).to(dtype=dtype)
+        aligned = aligned + self.phase_proj(
+            self._phase_features(candidate_distances, bsz, seq_len, j_count, device, dtype)
+        )
+        if self.use_score_features:
+            aligned = aligned + self.score_proj(
+                self._score_features(cand_scores, valid, bsz, seq_len, j_count, device, dtype)[..., None]
+            )
+        query_context = self.query_proj(x_n)
+        aligned = aligned + query_context[:, :, None, :]
+        aligned = aligned.masked_fill(~valid[..., None], 0.0)
+
+        all_read = (aligned * norm_weights[..., None]).sum(dim=2)
+        type_reads, type_mass = self._lane_reads(aligned, weights, safe_types, self.n_types)
+        source_reads, source_mass = self._lane_reads(aligned, weights, safe_sources, self.n_sources)
+        lane_cat = torch.cat(
+            [
+                all_read,
+                type_reads.reshape(bsz, seq_len, self.n_types * d),
+                source_reads.reshape(bsz, seq_len, self.n_sources * d),
+            ],
+            dim=-1,
+        )
+        bound_packet = self.packet_norm(self.read_mix(lane_cat))
+        gate_input = torch.cat([x_n, bound_packet], dim=-1)
+        gate = torch.sigmoid(self.bind_gate(gate_input))
+        delta_input = torch.cat([x, bound_packet, x * bound_packet, bound_packet - x], dim=-1)
+        delta = self.delta_proj(delta_input)
+        has_evidence = (mass.squeeze(-1) > 0).to(dtype=dtype)[..., None]
+        out = x + has_evidence * gate * delta
+
+        telemetry = self._telemetry(
+            x,
+            bound_packet,
+            delta,
+            gate,
+            weights,
+            type_mass,
+            source_mass,
+            has_evidence,
+        )
+        if return_aux:
+            aux = {
+                "bound_packet": bound_packet,
+                "aligned_candidates": aligned,
+                "all_read": all_read,
+                "type_reads": type_reads,
+                "source_reads": source_reads,
+                "candidate_weight_mass": mass.squeeze(-1).detach(),
+                "normalized_candidate_weights": norm_weights.detach(),
+                "type_weight_mass": type_mass.detach(),
+                "source_weight_mass": source_mass.detach(),
+                "bind_gate": gate,
+                "delta": delta,
+            }
+            return out, telemetry, aux
+        return out, telemetry
+
+    @staticmethod
+    def _gather_source_rows(states: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
+        bsz, seq_len, d = states.shape
+        safe = token_indices.to(device=states.device, dtype=torch.long).clamp(0, max(seq_len - 1, 0))
+        return torch.gather(states, 1, safe[:, :, None].expand(bsz, seq_len, d))
+
+    def forward_sourcewise_packet(
+        self,
+        x: torch.Tensor,
+        cand_token_indices: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+        candidate_distances: torch.Tensor | None = None,
+        cand_scores: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ):
+        """Build the EBH lane packet directly from sourcewise metadata.
+
+        This preserves the materialized EBH lane math for raw source candidate
+        states, but accumulates one slot at a time into all/type/source lanes
+        instead of constructing a persistent [B,T,J,D] candidate-state tensor.
+        When upstream semantic transforms (width cell / typed mixer) are active,
+        callers must label the path as an approximation because those transforms
+        are not included in this packet.
+        """
+        if x.ndim != 3:
+            raise ValueError("x must be [B,T,D]")
+        bsz, seq_len, d = x.shape
+        if d != self.d:
+            raise ValueError(f"x last dim {d} does not match evidence binding d {self.d}")
+        if cand_mask.shape[:2] != (bsz, seq_len):
+            raise ValueError("candidate metadata shape mismatch")
+        if cand_token_indices.shape != cand_mask.shape or cand_types.shape != cand_mask.shape:
+            raise ValueError("candidate token/type tensors must have shape [B,T,J]")
+        if cand_sources.shape != cand_mask.shape:
+            raise ValueError("candidate source tensor must have shape [B,T,J]")
+        if l3_states is not None and l3_states.shape != x.shape:
+            raise ValueError("l3_states must match x shape")
+        if chunk_rep_states is not None and chunk_rep_states.shape != x.shape:
+            raise ValueError("chunk_rep_states must match x shape")
+
+        device = x.device
+        dtype = x.dtype
+        j_count = cand_mask.shape[-1]
+        valid = cand_mask.to(device=device, dtype=torch.bool)
+        safe_types = cand_types.to(device=device, dtype=torch.long).clamp(0, self.n_types - 1)
+        safe_sources = cand_sources.to(device=device, dtype=torch.long).clamp(0, self.n_sources - 1)
+        weights = valid.to(dtype=dtype)
+        mass = weights.sum(dim=-1, keepdim=True)
+        type_mass = x.new_zeros((bsz, seq_len, self.n_types))
+        source_mass = x.new_zeros((bsz, seq_len, self.n_sources))
+        for slot_idx in range(j_count):
+            w_j = weights[:, :, slot_idx]
+            type_mass.scatter_add_(2, safe_types[:, :, slot_idx, None], w_j[:, :, None])
+            source_mass.scatter_add_(2, safe_sources[:, :, slot_idx, None], w_j[:, :, None])
+
+        x_n = self.norm_x(x)
+        query_context = self.query_proj(x_n)
+        final_base = self.value_proj(self.norm_c(x))
+        l3_source = l3_states if l3_states is not None else x
+        l3_base = final_base if l3_source is x else self.value_proj(self.norm_c(l3_source))
+        summary_source = chunk_rep_states if chunk_rep_states is not None else x
+        summary_base = final_base if summary_source is x else self.value_proj(self.norm_c(summary_source))
+        null_base = self.value_proj(self.norm_c(torch.zeros_like(x)))
+        projected_bases: dict[int, torch.Tensor] = {
+            int(CandidateSource.FINAL): final_base,
+            int(CandidateSource.QUESTION_CACHE): final_base,
+            int(CandidateSource.L3): l3_base,
+            int(CandidateSource.HISA): l3_base,
+            int(CandidateSource.SUMMARY): summary_base,
+            int(CandidateSource.NULL): null_base,
+        }
+
+        score_features = None
+        if self.use_score_features:
+            score_features = self._score_features(cand_scores, valid, bsz, seq_len, j_count, device, dtype)
+
+        all_sum = x.new_zeros((bsz, seq_len, d))
+        type_sums = x.new_zeros((bsz, seq_len, self.n_types, d))
+        source_sums = x.new_zeros((bsz, seq_len, self.n_sources, d))
+        gather_tokens = cand_token_indices.to(device=device, dtype=torch.long).clamp(0, max(seq_len - 1, 0))
+        for slot_idx in range(j_count):
+            valid_j = valid[:, :, slot_idx]
+            if not bool(valid_j.any()):
+                continue
+            source_j = safe_sources[:, :, slot_idx]
+            token_j = gather_tokens[:, :, slot_idx]
+            value_j = x.new_zeros((bsz, seq_len, d))
+            for source_id, base in projected_bases.items():
+                source_mask = (source_j == int(source_id)) & valid_j
+                if bool(source_mask.any()):
+                    gathered = self._gather_source_rows(base, token_j)
+                    value_j = value_j + gathered * source_mask[:, :, None].to(dtype)
+            type_j = safe_types[:, :, slot_idx]
+            aligned_j = value_j
+            aligned_j = aligned_j + self.type_value(type_j).to(dtype=dtype)
+            aligned_j = aligned_j + self.source_value(source_j).to(dtype=dtype)
+            aligned_j = aligned_j + self.phase_proj(
+                self._phase_features(
+                    None if candidate_distances is None else candidate_distances[:, :, slot_idx : slot_idx + 1],
+                    bsz,
+                    seq_len,
+                    1,
+                    device,
+                    dtype,
+                ).squeeze(2)
+            )
+            if score_features is not None:
+                aligned_j = aligned_j + self.score_proj(score_features[:, :, slot_idx, None])
+            aligned_j = aligned_j + query_context
+            aligned_j = aligned_j * valid_j[:, :, None].to(dtype)
+            all_sum = all_sum + aligned_j
+            type_sums.scatter_add_(2, type_j[:, :, None, None].expand(-1, -1, 1, d), aligned_j[:, :, None, :])
+            source_sums.scatter_add_(2, source_j[:, :, None, None].expand(-1, -1, 1, d), aligned_j[:, :, None, :])
+
+        all_read = torch.where(mass > 0, all_sum / mass.clamp_min(self.eps), torch.zeros_like(all_sum))
+        type_reads = torch.where(
+            type_mass[:, :, :, None] > 0,
+            type_sums / type_mass[:, :, :, None].clamp_min(self.eps),
+            torch.zeros_like(type_sums),
+        )
+        source_reads = torch.where(
+            source_mass[:, :, :, None] > 0,
+            source_sums / source_mass[:, :, :, None].clamp_min(self.eps),
+            torch.zeros_like(source_sums),
+        )
+        lane_cat = torch.cat(
+            [
+                all_read,
+                type_reads.reshape(bsz, seq_len, self.n_types * d),
+                source_reads.reshape(bsz, seq_len, self.n_sources * d),
+            ],
+            dim=-1,
+        )
+        bound_packet = self.packet_norm(self.read_mix(lane_cat))
+        gate_input = torch.cat([x_n, bound_packet], dim=-1)
+        gate = torch.sigmoid(self.bind_gate(gate_input))
+        delta_input = torch.cat([x, bound_packet, x * bound_packet, bound_packet - x], dim=-1)
+        delta = self.delta_proj(delta_input)
+        has_evidence = (mass.squeeze(-1) > 0).to(dtype=dtype)[..., None]
+        out = x + has_evidence * gate * delta
+
+        telemetry = self._telemetry(
+            x,
+            bound_packet,
+            delta,
+            gate,
+            weights,
+            type_mass,
+            source_mass,
+            has_evidence,
+        )
+        telemetry["dsqg_w_ebh_packet_sourcewise"] = x.new_tensor(1.0).detach()
+        telemetry["dsqg_w_ebh_packet_triton"] = x.new_tensor(0.0).detach()
+        if return_aux:
+            aux = {
+                "bound_packet": bound_packet,
+                "all_read": all_read,
+                "type_reads": type_reads,
+                "source_reads": source_reads,
+                "candidate_weight_mass": mass.squeeze(-1).detach(),
+                "type_weight_mass": type_mass.detach(),
+                "source_weight_mass": source_mass.detach(),
+                "bind_gate": gate,
+                "delta": delta,
+            }
+            return out, telemetry, aux
+        return out, telemetry
+
+    def _phase_features(
+        self,
+        candidate_distances: torch.Tensor | None,
+        bsz: int,
+        seq_len: int,
+        j_count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if candidate_distances is None:
+            distances = torch.zeros((bsz, seq_len, j_count), device=device, dtype=dtype)
+        else:
+            if candidate_distances.shape != (bsz, seq_len, j_count):
+                raise ValueError("candidate_distances must have shape [B,T,J]")
+            distances = candidate_distances.to(device=device, dtype=dtype).clamp_min(0.0)
+        phase = torch.log1p(distances) / math.log1p(float(self.max_distance))
+        bands = torch.arange(1, self.phase_bands + 1, device=device, dtype=dtype)
+        angles = phase[..., None] * bands * math.pi
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+
+    def _score_features(
+        self,
+        cand_scores: torch.Tensor | None,
+        valid: torch.Tensor,
+        bsz: int,
+        seq_len: int,
+        j_count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if cand_scores is None:
+            return torch.zeros((bsz, seq_len, j_count), device=device, dtype=dtype)
+        if cand_scores.shape != (bsz, seq_len, j_count):
+            raise ValueError("cand_scores must have shape [B,T,J]")
+        scores = torch.nan_to_num(cand_scores.to(device=device, dtype=dtype), nan=0.0, neginf=0.0, posinf=0.0)
+        scores = scores.masked_fill(~valid, 0.0)
+        denom = valid.to(dtype).sum(dim=-1, keepdim=True).clamp_min(1.0)
+        mean = scores.sum(dim=-1, keepdim=True) / denom
+        var = ((scores - mean).masked_fill(~valid, 0.0).square().sum(dim=-1, keepdim=True) / denom).clamp_min(1e-6)
+        return ((scores - mean) / var.sqrt()).clamp(-5.0, 5.0).masked_fill(~valid, 0.0)
+
+    def _lane_reads(
+        self,
+        values: torch.Tensor,
+        weights: torch.Tensor,
+        lane_ids: torch.Tensor,
+        n_lanes: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        lane_mask = F.one_hot(lane_ids, num_classes=n_lanes).to(dtype=values.dtype)
+        lane_weights = weights[..., None] * lane_mask
+        lane_mass = lane_weights.sum(dim=2)
+        lane_norm = torch.where(
+            lane_mass[:, :, None, :] > 0,
+            lane_weights / lane_mass[:, :, None, :].clamp_min(self.eps),
+            torch.zeros_like(lane_weights),
+        )
+        reads = torch.einsum("btjd,btjl->btld", values, lane_norm)
+        return reads, lane_mass
+
+    def _telemetry(
+        self,
+        x: torch.Tensor,
+        bound_packet: torch.Tensor,
+        delta: torch.Tensor,
+        gate: torch.Tensor,
+        weights: torch.Tensor,
+        type_mass: torch.Tensor,
+        source_mass: torch.Tensor,
+        has_evidence: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        with torch.no_grad():
+            valid_count = weights.sum(dim=-1)
+            fast_telemetry = os.getenv("DWARF_DSQG_W_FAST_TELEMETRY", "0") == "1"
+            delta_norm = x.new_tensor(0.0) if fast_telemetry else delta.norm(dim=-1).mean()
+            x_norm = x.norm(dim=-1).mean()
+            packet_norm = x.new_tensor(0.0) if fast_telemetry else bound_packet.norm(dim=-1).mean()
+            telemetry = {
+                "dsqg_w_ebh_enabled": x.new_tensor(1.0).detach(),
+                "dsqg_w_ebh_valid_candidate_count": valid_count.mean().detach(),
+                "dsqg_w_ebh_candidate_weight_mass": weights.sum(dim=-1).mean().detach(),
+                "dsqg_w_ebh_active_row_fraction": has_evidence.squeeze(-1).float().mean().detach(),
+                "dsqg_w_ebh_bind_gate_mean": gate.mean().detach(),
+                "dsqg_w_ebh_bind_gate_min": gate.min().detach(),
+                "dsqg_w_ebh_bind_gate_max": gate.max().detach(),
+                "dsqg_w_ebh_bind_gate_logit_mean": self.bind_gate.bias.detach().mean(),
+                "dsqg_w_ebh_delta_norm": delta_norm.detach(),
+                "dsqg_w_ebh_x_norm": x_norm.detach(),
+                "dsqg_w_ebh_delta_to_x_ratio": (delta_norm / x_norm.clamp_min(1e-8)).detach(),
+                "dsqg_w_ebh_bound_packet_norm": packet_norm.detach(),
+            }
+            for ctype in CandidateType:
+                if int(ctype) < type_mass.shape[-1]:
+                    telemetry[f"dsqg_w_ebh_{ctype.name.lower()}_mass"] = type_mass[..., int(ctype)].mean().detach()
+            for source in CandidateSource:
+                if int(source) < source_mass.shape[-1]:
+                    telemetry[f"dsqg_w_ebh_{source.name.lower()}_source_mass"] = source_mass[..., int(source)].mean().detach()
+            return telemetry
 
 
 def _read_type_ids_from_config(config: DSQGWConfig) -> tuple[int, ...]:
@@ -1670,6 +2578,250 @@ if _TRITON_SOURCEWISE_AVAILABLE:
 
 
     @triton.jit
+    def _dsqg_w_materialized_read_slots_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        role_key_ptr,
+        source_key_ptr,
+        type_bias_ptr,
+        source_bias_ptr,
+        qtb_ptr,
+        score_bias_ptr,
+        cand_type_ptr,
+        cand_source_ptr,
+        cand_mask_ptr,
+        type_slot_map_ptr,
+        read_slots_ptr,
+        lse_ptr,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        D: tl.constexpr,
+        J: tl.constexpr,
+        N_TYPES: tl.constexpr,
+        READ_SLOTS: tl.constexpr,
+        MAX_READ_SLOTS: tl.constexpr,
+        BLOCK_HD: tl.constexpr,
+        USE_QTB: tl.constexpr,
+        USE_SCORE_BIAS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        h = pid % H
+        row = pid // H
+        n = row % N
+        b = row // N
+        offs = tl.arange(0, BLOCK_HD)
+        hd_mask = offs < HD
+        q_base = ((b * N + n) * H + h) * HD + offs
+        q = tl.load(q_ptr + q_base, mask=hd_mask, other=0.0).to(tl.float32)
+        inv_sqrt = 1.0 / tl.sqrt(HD + 0.0)
+        row_j_base = (b * N + n) * J
+
+        max_score = -float("inf")
+        for j in tl.static_range(0, J):
+            meta = row_j_base + j
+            valid = tl.load(cand_mask_ptr + meta).to(tl.int1)
+            ctype = tl.load(cand_type_ptr + meta)
+            source_id = tl.load(cand_source_ptr + meta)
+            kv_base = (((b * N + n) * J + j) * H + h) * HD + offs
+            k = tl.load(k_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+            score += tl.load(type_bias_ptr + ctype * H + h, mask=valid, other=0.0).to(tl.float32)
+            score += tl.load(source_bias_ptr + source_id * H + h, mask=valid, other=0.0).to(tl.float32)
+            if USE_SCORE_BIAS:
+                score += tl.load(score_bias_ptr + meta, mask=valid, other=0.0).to(tl.float32)
+            if USE_QTB:
+                score += tl.load(qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, mask=valid, other=0.0).to(tl.float32)
+            score = tl.where(valid, score, -float("inf"))
+            max_score = tl.maximum(max_score, score)
+
+        denom = 0.0
+        for j in tl.static_range(0, J):
+            meta = row_j_base + j
+            valid = tl.load(cand_mask_ptr + meta).to(tl.int1)
+            ctype = tl.load(cand_type_ptr + meta)
+            source_id = tl.load(cand_source_ptr + meta)
+            kv_base = (((b * N + n) * J + j) * H + h) * HD + offs
+            k = tl.load(k_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+            score += tl.load(type_bias_ptr + ctype * H + h, mask=valid, other=0.0).to(tl.float32)
+            score += tl.load(source_bias_ptr + source_id * H + h, mask=valid, other=0.0).to(tl.float32)
+            if USE_SCORE_BIAS:
+                score += tl.load(score_bias_ptr + meta, mask=valid, other=0.0).to(tl.float32)
+            if USE_QTB:
+                score += tl.load(qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, mask=valid, other=0.0).to(tl.float32)
+            score = tl.where(valid, score, -float("inf"))
+            denom += tl.where(valid, tl.exp(score - max_score), 0.0)
+
+        tl.store(lse_ptr + (b * N + n) * H + h, max_score + tl.log(denom))
+
+        slot_ids = tl.arange(0, MAX_READ_SLOTS)
+        acc = tl.zeros((int(MAX_READ_SLOTS), int(BLOCK_HD)), tl.float32)
+        for j in tl.static_range(0, J):
+            meta = row_j_base + j
+            valid = tl.load(cand_mask_ptr + meta).to(tl.int1)
+            ctype = tl.load(cand_type_ptr + meta)
+            source_id = tl.load(cand_source_ptr + meta)
+            kv_base = (((b * N + n) * J + j) * H + h) * HD + offs
+            k = tl.load(k_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+            score += tl.load(type_bias_ptr + ctype * H + h, mask=valid, other=0.0).to(tl.float32)
+            score += tl.load(source_bias_ptr + source_id * H + h, mask=valid, other=0.0).to(tl.float32)
+            if USE_SCORE_BIAS:
+                score += tl.load(score_bias_ptr + meta, mask=valid, other=0.0).to(tl.float32)
+            if USE_QTB:
+                score += tl.load(qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, mask=valid, other=0.0).to(tl.float32)
+            score = tl.where(valid, score, -float("inf"))
+            p = tl.where(valid, tl.exp(score - max_score) / denom, 0.0)
+            v = tl.load(v_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            contrib = p * v
+            type_slot = tl.load(type_slot_map_ptr + ctype, mask=valid & (ctype >= 0) & (ctype < N_TYPES), other=-1)
+            add_slot = (slot_ids[:, None] == 0) | (slot_ids[:, None] == type_slot)
+            active_slot = slot_ids[:, None] < READ_SLOTS
+            acc += tl.where(add_slot & active_slot, contrib[None, :], 0.0)
+
+        store_base = ((b * N + n) * READ_SLOTS + slot_ids[:, None]) * D + h * HD + offs[None, :]
+        tl.store(read_slots_ptr + store_base, acc, mask=(slot_ids[:, None] < READ_SLOTS) & hd_mask[None, :])
+
+
+    @triton.jit
+    def _dsqg_w_materialized_read_slots_backward_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        role_key_ptr,
+        source_key_ptr,
+        type_bias_ptr,
+        source_bias_ptr,
+        qtb_ptr,
+        score_bias_ptr,
+        cand_type_ptr,
+        cand_source_ptr,
+        cand_mask_ptr,
+        type_slot_map_ptr,
+        lse_ptr,
+        grad_slots_ptr,
+        grad_q_ptr,
+        grad_k_ptr,
+        grad_v_ptr,
+        grad_role_key_ptr,
+        grad_source_key_ptr,
+        grad_type_bias_ptr,
+        grad_source_bias_ptr,
+        grad_qtb_ptr,
+        grad_score_bias_ptr,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        D: tl.constexpr,
+        J: tl.constexpr,
+        N_TYPES: tl.constexpr,
+        READ_SLOTS: tl.constexpr,
+        BLOCK_HD: tl.constexpr,
+        USE_QTB: tl.constexpr,
+        USE_SCORE_BIAS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        h = pid % H
+        row = pid // H
+        n = row % N
+        b = row // N
+        offs = tl.arange(0, BLOCK_HD)
+        hd_mask = offs < HD
+        inv_sqrt = 1.0 / tl.sqrt(HD + 0.0)
+        q_base = ((b * N + n) * H + h) * HD + offs
+        q = tl.load(q_ptr + q_base, mask=hd_mask, other=0.0).to(tl.float32)
+        lse = tl.load(lse_ptr + (b * N + n) * H + h).to(tl.float32)
+        row_j_base = (b * N + n) * J
+
+        sum_p_dp = 0.0
+        for j in tl.static_range(0, J):
+            meta = row_j_base + j
+            valid = tl.load(cand_mask_ptr + meta).to(tl.int1)
+            ctype = tl.load(cand_type_ptr + meta)
+            source_id = tl.load(cand_source_ptr + meta)
+            kv_base = (((b * N + n) * J + j) * H + h) * HD + offs
+            k = tl.load(k_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+            score += tl.load(type_bias_ptr + ctype * H + h, mask=valid, other=0.0).to(tl.float32)
+            score += tl.load(source_bias_ptr + source_id * H + h, mask=valid, other=0.0).to(tl.float32)
+            if USE_SCORE_BIAS:
+                score += tl.load(score_bias_ptr + meta, mask=valid, other=0.0).to(tl.float32)
+            if USE_QTB:
+                score += tl.load(qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, mask=valid, other=0.0).to(tl.float32)
+            p = tl.where(valid, tl.exp(score - lse), 0.0)
+
+            v = tl.load(v_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            grad_slot0 = tl.load(grad_slots_ptr + ((b * N + n) * READ_SLOTS + 0) * D + h * HD + offs, mask=hd_mask, other=0.0).to(tl.float32)
+            type_slot = tl.load(type_slot_map_ptr + ctype, mask=valid & (ctype >= 0) & (ctype < N_TYPES), other=-1)
+            grad_type = tl.load(
+                grad_slots_ptr + ((b * N + n) * READ_SLOTS + type_slot) * D + h * HD + offs,
+                mask=hd_mask & valid & (type_slot > 0) & (type_slot < READ_SLOTS),
+                other=0.0,
+            ).to(tl.float32)
+            dcontrib = grad_slot0 + grad_type
+            dp = tl.sum(dcontrib * v, axis=0)
+            sum_p_dp += p * dp
+
+        grad_q = tl.zeros((int(BLOCK_HD),), tl.float32)
+        for j in tl.static_range(0, J):
+            meta = row_j_base + j
+            valid = tl.load(cand_mask_ptr + meta).to(tl.int1)
+            ctype = tl.load(cand_type_ptr + meta)
+            source_id = tl.load(cand_source_ptr + meta)
+            kv_base = (((b * N + n) * J + j) * H + h) * HD + offs
+            k = tl.load(k_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            v = tl.load(v_ptr + kv_base, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+            score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+            score += tl.load(type_bias_ptr + ctype * H + h, mask=valid, other=0.0).to(tl.float32)
+            score += tl.load(source_bias_ptr + source_id * H + h, mask=valid, other=0.0).to(tl.float32)
+            if USE_SCORE_BIAS:
+                score += tl.load(score_bias_ptr + meta, mask=valid, other=0.0).to(tl.float32)
+            if USE_QTB:
+                score += tl.load(qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, mask=valid, other=0.0).to(tl.float32)
+            p = tl.where(valid, tl.exp(score - lse), 0.0)
+
+            grad_slot0 = tl.load(grad_slots_ptr + ((b * N + n) * READ_SLOTS + 0) * D + h * HD + offs, mask=hd_mask, other=0.0).to(tl.float32)
+            type_slot = tl.load(type_slot_map_ptr + ctype, mask=valid & (ctype >= 0) & (ctype < N_TYPES), other=-1)
+            grad_type = tl.load(
+                grad_slots_ptr + ((b * N + n) * READ_SLOTS + type_slot) * D + h * HD + offs,
+                mask=hd_mask & valid & (type_slot > 0) & (type_slot < READ_SLOTS),
+                other=0.0,
+            ).to(tl.float32)
+            dcontrib = grad_slot0 + grad_type
+            dp = tl.sum(dcontrib * v, axis=0)
+            ds = tl.where(valid, p * (dp - sum_p_dp), 0.0)
+            d_k_eff = ds * q * inv_sqrt
+            d_v = p * dcontrib
+            grad_q += ds * (k + role + src_role) * inv_sqrt
+            tl.store(grad_k_ptr + kv_base, d_k_eff, mask=hd_mask & valid)
+            tl.store(grad_v_ptr + kv_base, d_v, mask=hd_mask & valid)
+            tl.atomic_add(grad_role_key_ptr + ctype * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+            tl.atomic_add(grad_source_key_ptr + source_id * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+            tl.atomic_add(grad_type_bias_ptr + ctype * H + h, ds, sem="relaxed", mask=valid)
+            tl.atomic_add(grad_source_bias_ptr + source_id * H + h, ds, sem="relaxed", mask=valid)
+            if USE_QTB:
+                tl.atomic_add(grad_qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, ds, sem="relaxed", mask=valid)
+            if USE_SCORE_BIAS:
+                tl.atomic_add(grad_score_bias_ptr + meta, ds, sem="relaxed", mask=valid)
+
+        tl.store(grad_q_ptr + q_base, grad_q, mask=hd_mask)
+
+
+    @triton.jit
     def _dsqg_w_sourcewise_read_slots_backward_kernel(
         q_ptr,
         k_final_ptr,
@@ -1703,6 +2855,7 @@ if _TRITON_SOURCEWISE_AVAILABLE:
         grad_type_bias_ptr,
         grad_source_bias_ptr,
         grad_qtb_ptr,
+        grad_score_bias_ptr,
         B: tl.constexpr,
         N: tl.constexpr,
         H: tl.constexpr,
@@ -1829,6 +2982,8 @@ if _TRITON_SOURCEWISE_AVAILABLE:
                 tl.atomic_add(grad_source_bias_ptr + source_id * H + h, ds, sem="relaxed", mask=valid)
                 if USE_QTB:
                     tl.atomic_add(grad_qtb_ptr + ((b * N + n) * N_TYPES + ctype) * H + h, ds, sem="relaxed", mask=valid)
+                if USE_SCORE_BIAS:
+                    tl.atomic_add(grad_score_bias_ptr + meta, ds, sem="relaxed", mask=valid)
 
         if COMPUTE_QUERY:
             tl.store(grad_q_ptr + q_base, grad_q, mask=hd_mask)
@@ -2060,6 +3215,305 @@ def _dsqg_w_sourcewise_read_slots_recompute(
     return slots_h.reshape(bsz, seq_len, read_slots, d)
 
 
+def _dsqg_w_materialized_read_slots_recompute(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    role_key_weight: torch.Tensor,
+    source_key_weight: torch.Tensor,
+    type_bias: torch.Tensor,
+    source_bias: torch.Tensor,
+    qtb: torch.Tensor | None,
+    score_bias: torch.Tensor | None,
+    cand_types: torch.Tensor,
+    cand_sources: torch.Tensor,
+    cand_mask: torch.Tensor,
+    type_slot_map: torch.Tensor,
+    *,
+    d: int,
+    n_heads: int,
+    dh: int,
+    read_slots: int,
+) -> torch.Tensor:
+    """Compact [B,N,S,D] read-slot recompute for transformed/materialized candidates."""
+    bsz, seq_len, j_count = cand_mask.shape
+    inv_sqrt = 1.0 / math.sqrt(float(dh))
+    role = F.embedding(cand_types, role_key_weight).reshape(bsz, seq_len, j_count, n_heads, dh)
+    source = F.embedding(cand_sources, source_key_weight).reshape(bsz, seq_len, j_count, n_heads, dh)
+    scores = (q[:, :, None, :, :] * (k + role + source)).sum(dim=-1) * inv_sqrt
+    scores = scores + type_bias[cand_types] + source_bias[cand_sources]
+    if score_bias is not None:
+        scores = scores + score_bias[:, :, :, None]
+    if qtb is not None:
+        scores = scores + qtb.gather(2, cand_types[:, :, :, None].expand(-1, -1, -1, n_heads))
+    scores = scores.masked_fill(~cand_mask[:, :, :, None], torch.finfo(scores.dtype).min)
+    probs = F.softmax(scores, dim=2)
+    contrib = probs[:, :, :, :, None] * v
+    slots_h = q.new_zeros((bsz, seq_len, read_slots, n_heads, dh))
+    slots_h[:, :, 0] = contrib.sum(dim=2)
+    type_slots = type_slot_map[cand_types].to(torch.long)
+    for slot in range(1, read_slots):
+        slot_mask = ((type_slots == slot) & cand_mask)[:, :, :, None, None]
+        slots_h[:, :, slot] = (contrib * slot_mask.to(contrib.dtype)).sum(dim=2)
+    return slots_h.reshape(bsz, seq_len, read_slots, d)
+
+
+class _DSQGWMaterializedTritonCompactRead(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        role_key_weight,
+        source_key_weight,
+        type_bias,
+        source_bias,
+        qtb,
+        score_bias,
+        cand_types,
+        cand_sources,
+        cand_mask,
+        type_slot_map,
+        use_qtb: bool,
+        use_score_bias: bool,
+        d: int,
+        n_heads: int,
+        dh: int,
+        n_types: int,
+        read_slots: int,
+        block_hd: int,
+    ):
+        ctx.use_qtb = bool(use_qtb)
+        ctx.use_score_bias = bool(use_score_bias)
+        ctx.d = int(d)
+        ctx.n_heads = int(n_heads)
+        ctx.dh = int(dh)
+        ctx.read_slots = int(read_slots)
+        bsz, seq_len = q.shape[:2]
+        schedule = _dsqg_w_triton_schedule(dh, q.device)
+        read_slots_out = torch.empty((bsz, seq_len, int(read_slots), int(d)), device=q.device, dtype=q.dtype)
+        lse_out = torch.empty((bsz, seq_len, int(n_heads)), device=q.device, dtype=torch.float32)
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            role_key_weight,
+            source_key_weight,
+            type_bias,
+            source_bias,
+            qtb,
+            score_bias,
+            cand_types,
+            cand_sources,
+            cand_mask,
+            type_slot_map,
+            lse_out,
+        )
+        empty = torch.empty((0,), device=q.device, dtype=q.dtype)
+        _dsqg_w_materialized_read_slots_kernel[(bsz * seq_len * int(n_heads),)](
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            role_key_weight.contiguous(),
+            source_key_weight.contiguous(),
+            type_bias.contiguous(),
+            source_bias.contiguous(),
+            qtb.contiguous() if bool(use_qtb) else empty,
+            score_bias.contiguous() if bool(use_score_bias) else empty,
+            cand_types.contiguous(),
+            cand_sources.contiguous(),
+            cand_mask.contiguous(),
+            type_slot_map.contiguous(),
+            read_slots_out,
+            lse_out,
+            B=bsz,
+            N=seq_len,
+            H=int(n_heads),
+            HD=int(dh),
+            D=int(d),
+            J=cand_mask.shape[-1],
+            N_TYPES=int(n_types),
+            READ_SLOTS=int(read_slots),
+            MAX_READ_SLOTS=int(triton.next_power_of_2(int(read_slots))),
+            BLOCK_HD=schedule.block_hd,
+            USE_QTB=bool(use_qtb),
+            USE_SCORE_BIAS=bool(use_score_bias),
+            num_warps=schedule.num_warps,
+            num_stages=schedule.num_stages,
+        )
+        return read_slots_out
+
+    @staticmethod
+    def backward(ctx, grad_read_slots):
+        (
+            q,
+            k,
+            v,
+            role_key_weight,
+            source_key_weight,
+            type_bias,
+            source_bias,
+            qtb,
+            score_bias,
+            cand_types,
+            cand_sources,
+            cand_mask,
+            type_slot_map,
+            lse,
+        ) = ctx.saved_tensors
+        materialized_backward_impl = os.getenv(
+            "DWARF_DSQG_W_MATERIALIZED_COMPACT_READ_BACKWARD",
+            "pytorch",
+        ).lower()
+        if materialized_backward_impl in {"1", "true", "triton"}:
+            bsz, seq_len, _ = cand_mask.shape
+            h = ctx.n_heads
+            dh = ctx.dh
+            d = ctx.d
+            grad_q = torch.zeros_like(q)
+            grad_k = torch.zeros_like(k)
+            grad_v = torch.zeros_like(v)
+            grad_role = torch.zeros_like(role_key_weight)
+            grad_source = torch.zeros_like(source_key_weight)
+            grad_type_bias = torch.zeros_like(type_bias)
+            grad_source_bias = torch.zeros_like(source_bias)
+            grad_qtb = torch.zeros_like(qtb) if ctx.use_qtb else None
+            grad_score_bias = torch.zeros_like(score_bias) if ctx.use_score_bias else None
+            empty = torch.empty((0,), device=q.device, dtype=q.dtype)
+            schedule = _dsqg_w_triton_schedule(dh, q.device)
+            _dsqg_w_materialized_read_slots_backward_kernel[(bsz * seq_len * h,)](
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                role_key_weight.contiguous(),
+                source_key_weight.contiguous(),
+                type_bias.contiguous(),
+                source_bias.contiguous(),
+                qtb.contiguous() if ctx.use_qtb else empty,
+                score_bias.contiguous() if ctx.use_score_bias else empty,
+                cand_types.contiguous(),
+                cand_sources.contiguous(),
+                cand_mask.contiguous(),
+                type_slot_map.contiguous(),
+                lse.contiguous(),
+                grad_read_slots.contiguous(),
+                grad_q,
+                grad_k,
+                grad_v,
+                grad_role,
+                grad_source,
+                grad_type_bias,
+                grad_source_bias,
+                grad_qtb if grad_qtb is not None else empty,
+                grad_score_bias if grad_score_bias is not None else empty,
+                B=bsz,
+                N=seq_len,
+                H=h,
+                HD=dh,
+                D=d,
+                J=cand_mask.shape[-1],
+                N_TYPES=type_bias.shape[0],
+                READ_SLOTS=ctx.read_slots,
+                BLOCK_HD=schedule.block_hd,
+                USE_QTB=ctx.use_qtb,
+                USE_SCORE_BIAS=ctx.use_score_bias,
+                num_warps=schedule.num_warps,
+                num_stages=schedule.num_stages,
+            )
+            return (
+                grad_q,
+                grad_k,
+                grad_v,
+                grad_role,
+                grad_source,
+                grad_type_bias,
+                grad_source_bias,
+                grad_qtb,
+                grad_score_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        q_req = q.detach().requires_grad_(True)
+        k_req = k.detach().requires_grad_(True)
+        v_req = v.detach().requires_grad_(True)
+        role_req = role_key_weight.detach().requires_grad_(True)
+        source_req = source_key_weight.detach().requires_grad_(True)
+        type_bias_req = type_bias.detach().requires_grad_(True)
+        source_bias_req = source_bias.detach().requires_grad_(True)
+        qtb_req = qtb.detach().requires_grad_(True) if ctx.use_qtb else None
+        score_bias_req = score_bias.detach().requires_grad_(True) if ctx.use_score_bias else None
+        grad_targets = [q_req, k_req, v_req, role_req, source_req, type_bias_req, source_bias_req]
+        if qtb_req is not None:
+            grad_targets.append(qtb_req)
+        if score_bias_req is not None:
+            grad_targets.append(score_bias_req)
+        with torch.enable_grad():
+            read_slots = _dsqg_w_materialized_read_slots_recompute(
+                q_req,
+                k_req,
+                v_req,
+                role_req,
+                source_req,
+                type_bias_req,
+                source_bias_req,
+                qtb_req,
+                score_bias_req,
+                cand_types,
+                cand_sources,
+                cand_mask,
+                type_slot_map,
+                d=ctx.d,
+                n_heads=ctx.n_heads,
+                dh=ctx.dh,
+                read_slots=ctx.read_slots,
+            )
+            grads = torch.autograd.grad(read_slots, grad_targets, grad_read_slots, allow_unused=True)
+        grad_iter = iter(grads)
+        grad_q = next(grad_iter)
+        grad_k = next(grad_iter)
+        grad_v = next(grad_iter)
+        grad_role = next(grad_iter)
+        grad_source = next(grad_iter)
+        grad_type_bias = next(grad_iter)
+        grad_source_bias = next(grad_iter)
+        grad_qtb = next(grad_iter) if ctx.use_qtb else None
+        grad_score_bias = next(grad_iter) if ctx.use_score_bias else None
+        return (
+            grad_q,
+            grad_k,
+            grad_v,
+            grad_role,
+            grad_source,
+            grad_type_bias,
+            grad_source_bias,
+            grad_qtb,
+            grad_score_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -2205,6 +3659,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
             grad_type_bias = torch.zeros_like(type_bias)
             grad_source_bias = torch.zeros_like(source_bias)
             grad_qtb = torch.zeros_like(qtb) if ctx.use_qtb else None
+            grad_score_bias = torch.zeros_like(score_bias) if ctx.use_score_bias else None
             empty = torch.empty((0,), device=q.device, dtype=q.dtype)
             schedule = _dsqg_w_triton_schedule(dh, q.device)
             grid = (bsz * seq_len * h,)
@@ -2243,6 +3698,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
                     grad_type_bias,
                     grad_source_bias,
                     grad_qtb if grad_qtb is not None else empty,
+                    grad_score_bias if grad_score_bias is not None else empty,
                     B=bsz,
                     N=seq_len,
                     H=h,
@@ -2269,7 +3725,15 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
                 "split",
                 "v20_split",
             }
-            if split_backward:
+            source_grads = os.getenv("DWARF_DSQG_W_TRITON_BACKWARD_SOURCE_GRADS", "1") != "0"
+            source_grad_every = max(1, int(os.getenv("DWARF_DSQG_W_TRITON_BACKWARD_SOURCE_GRAD_EVERY", "1")))
+            if source_grads and source_grad_every > 1:
+                source_grad_counter = int(getattr(_DSQGWSourcewiseTritonCompactRead, "_source_grad_counter", 0))
+                source_grads = (source_grad_counter % source_grad_every) == 0
+                setattr(_DSQGWSourcewiseTritonCompactRead, "_source_grad_counter", source_grad_counter + 1)
+            if not source_grads:
+                launch_split_kernel(compute_query=True, compute_source=False)
+            elif split_backward:
                 launch_split_kernel(compute_query=True, compute_source=False)
                 launch_split_kernel(compute_query=False, compute_source=True)
             else:
@@ -2287,7 +3751,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
                 grad_type_bias,
                 grad_source_bias,
                 grad_qtb,
-                None,
+                grad_score_bias,
                 None,
                 None,
                 None,
@@ -2369,6 +3833,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
         grad_type_bias = torch.zeros_like(type_bias)
         grad_source_bias = torch.zeros_like(source_bias)
         grad_qtb = torch.zeros_like(qtb) if ctx.use_qtb else None
+        grad_score_bias = torch.zeros_like(score_bias) if ctx.use_score_bias else None
         k_grads: dict[int, torch.Tensor] = {
             int(CandidateSource.FINAL): grad_k_final,
             int(CandidateSource.QUESTION_CACHE): grad_k_final,
@@ -2426,6 +3891,8 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
                 grad_source_bias[:, head_idx].index_add_(0, source_flat, ds_flat[:, head_idx].to(grad_source_bias.dtype))
             if grad_qtb is not None:
                 grad_qtb.scatter_add_(2, ctype_j[:, :, None, None].expand(-1, -1, 1, h), ds[:, :, j, None, :].to(grad_qtb.dtype))
+            if grad_score_bias is not None:
+                grad_score_bias[:, :, j] = ds[:, :, j, :].sum(dim=-1).to(grad_score_bias.dtype)
 
         grad_list: list[torch.Tensor | None] = [
             grad_q,
@@ -2443,7 +3910,7 @@ class _DSQGWSourcewiseTritonCompactRead(torch.autograd.Function):
         return (
             *grad_list,
             grad_qtb,
-            None,
+            grad_score_bias,
             None,
             None,
             None,
@@ -2580,6 +4047,14 @@ class DSQGWBlock(nn.Module):
         typed_mixer_bottleneck: int = 64,
         typed_mixer_gate_init: float = -5.0,
         use_query_type_bias: bool = False,
+        use_evidence_prior: bool = False,
+        evidence_prior_clip: float = 2.0,
+        evidence_prior_init_scale: float = 0.0,
+        use_evidence_binding_hub: bool = False,
+        ebh_bottleneck: int = 256,
+        ebh_gate_init: float = -5.0,
+        ebh_phase_bands: int = 4,
+        ebh_score_features: bool = True,
         read_type_ids: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
@@ -2620,6 +4095,29 @@ class DSQGWBlock(nn.Module):
             else None
         )
         self.use_query_type_bias = bool(use_query_type_bias)
+        self.evidence_prior = (
+            DSQGWEvidencePriorComposer(
+                n_types=n_types,
+                n_sources=n_sources,
+                clip=evidence_prior_clip,
+                init_scale=evidence_prior_init_scale,
+            )
+            if use_evidence_prior
+            else None
+        )
+        self.evidence_binding_hub = (
+            DSQGWEvidenceBindingHub(
+                d=d,
+                n_types=n_types,
+                n_sources=n_sources,
+                bottleneck=ebh_bottleneck,
+                gate_init=ebh_gate_init,
+                phase_bands=ebh_phase_bands,
+                use_score_features=ebh_score_features,
+            )
+            if use_evidence_binding_hub
+            else None
+        )
 
         self.norm_x = nn.LayerNorm(d)
         self.norm_c = nn.LayerNorm(d)
@@ -2664,6 +4162,14 @@ class DSQGWBlock(nn.Module):
             typed_mixer_bottleneck=config.typed_mixer_bottleneck,
             typed_mixer_gate_init=config.typed_mixer_gate_init,
             use_query_type_bias=config.use_query_type_bias,
+            use_evidence_prior=config.use_evidence_prior,
+            evidence_prior_clip=config.evidence_prior_clip,
+            evidence_prior_init_scale=config.evidence_prior_init_scale,
+            use_evidence_binding_hub=config.use_evidence_binding_hub,
+            ebh_bottleneck=config.ebh_bottleneck,
+            ebh_gate_init=config.ebh_gate_init,
+            ebh_phase_bands=config.ebh_phase_bands,
+            ebh_score_features=config.ebh_score_features,
             read_type_ids=_read_type_ids_from_config(config),
         )
 
@@ -2741,6 +4247,37 @@ class DSQGWBlock(nn.Module):
             bsz, seq_len, *states.shape[2:]
         )
 
+    def _compose_evidence_prior_scores(
+        self,
+        cand_scores: torch.Tensor | None,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        evidence_bits: torch.Tensor | None = None,
+        evidence_count: torch.Tensor | None = None,
+        candidate_distances: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        if self.evidence_prior is None:
+            return cand_scores, {}
+        if evidence_bits is None:
+            evidence_bits = CandidateProvider._candidate_type_evidence_bits(cand_types).masked_fill(~cand_mask, 0)
+        if evidence_count is None:
+            evidence_count = CandidateProvider._evidence_count_from_bits(evidence_bits).masked_fill(~cand_mask, 0)
+        prior, telemetry = self.evidence_prior(
+            cand_types,
+            cand_sources,
+            cand_mask,
+            raw_hisa_scores=cand_scores,
+            evidence_bits=evidence_bits,
+            evidence_count=evidence_count,
+            candidate_distances=candidate_distances,
+        )
+        prior = prior.to(device=cand_types.device, dtype=cand_scores.dtype if cand_scores is not None else self.type_bias.dtype)
+        combined = prior if cand_scores is None else cand_scores + prior.to(dtype=cand_scores.dtype)
+        telemetry["dsqg_w_evidence_prior_enabled"] = prior.new_tensor(1.0).detach()
+        return combined, telemetry
+
     @staticmethod
     def _gather_source_candidate_states(states: torch.Tensor, token_indices: torch.Tensor) -> torch.Tensor:
         """Gather [B,T,J] causal token indices from a [B,T,D] source surface."""
@@ -2791,6 +4328,73 @@ class DSQGWBlock(nn.Module):
             if cache_key not in grouped_bases:
                 grouped_bases[cache_key] = (states, [])
             grouped_bases[cache_key][1].append(int(source_id))
+        if (
+            os.getenv("DWARF_DSQG_W_TRITON_CAND_STATE_GATHER", "1") != "0"
+            and _TRITON_SOURCEWISE_AVAILABLE
+            and triton is not None
+            and x.is_cuda
+            and chunk_rep_states is None
+            and cand_token_indices.is_cuda
+            and cand_sources.is_cuda
+            and cand_mask.is_cuda
+        ):
+            return _DSQGWSourcewiseCandidateStateGather.apply(
+                x,
+                l3_states if l3_states is not None else x,
+                cand_token_indices,
+                cand_sources,
+                cand_mask,
+                l3_states is not None,
+            )
+        if os.getenv("DWARF_DSQG_W_GROUPED_SLOT_MATERIALIZE", "1") != "0":
+            # The DSR-selected all-open geometry has slot-constant source groups:
+            # question slots gather from final x, HISA/L3 slots gather from l3,
+            # and the null slot is zero.  The older source-group implementation
+            # gathered a full [B,T,J,D] tensor once for x and once for l3, then
+            # masked away most slots.  That doubles candidate-state gather traffic
+            # and its backward scatter for the common 4Q+4HISA+2L3+null packet.
+            # When each slot belongs to a single source group, gather only those
+            # slots for that base in one batched index_select.  If a diagnostic
+            # geometry mixes sources within a slot, fall back to the fully general
+            # path below.
+            null_id = int(CandidateSource.NULL)
+            grouped_slots: dict[int, tuple[torch.Tensor, list[int]]] = {}
+            can_use_grouped_slots = True
+            for slot_idx in range(cand_token_indices.shape[-1]):
+                valid_j = cand_mask[:, :, slot_idx]
+                source_j = cand_sources[:, :, slot_idx]
+                if not bool(valid_j.any()):
+                    continue
+                if bool(((source_j == null_id) | ~valid_j).all()):
+                    continue
+                matched_key: int | None = None
+                matched_states: torch.Tensor | None = None
+                for cache_key, (states, source_ids) in grouped_bases.items():
+                    source_match = torch.zeros_like(valid_j, dtype=torch.bool)
+                    for source_id in source_ids:
+                        source_match = source_match | (source_j == int(source_id))
+                    if bool((source_match | ~valid_j).all()):
+                        matched_key = int(cache_key)
+                        matched_states = states
+                        break
+                if matched_key is None or matched_states is None:
+                    can_use_grouped_slots = False
+                    break
+                if matched_key not in grouped_slots:
+                    grouped_slots[matched_key] = (matched_states, [])
+                grouped_slots[matched_key][1].append(int(slot_idx))
+            if can_use_grouped_slots:
+                cand_states = x.new_zeros((*cand_token_indices.shape, x.shape[-1]))
+                for states, slot_indices in grouped_slots.values():
+                    if not slot_indices:
+                        continue
+                    gathered = self._gather_source_candidate_states(
+                        states,
+                        cand_token_indices[:, :, slot_indices],
+                    )
+                    gathered = gathered * cand_mask[:, :, slot_indices, None].to(gathered.dtype)
+                    cand_states[:, :, slot_indices, :] = gathered
+                return cand_states
         if os.getenv("DWARF_DSQG_W_SLOT_MATERIALIZE", "0") == "1":
             slot_states: list[torch.Tensor] = []
             for j in range(cand_token_indices.shape[-1]):
@@ -2816,6 +4420,360 @@ class DSQGWBlock(nn.Module):
                 gathered = self._gather_source_candidate_states(states, cand_token_indices)
                 cand_states = cand_states + gathered * source_mask[..., None].to(gathered.dtype)
         return cand_states
+
+
+    def _sourcewise_width_cell_fused(
+        self,
+        x: torch.Tensor,
+        cand_token_indices: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Apply width-cell transfer from source metadata without pre-materializing [B,T,J,D].
+
+        This keeps the width-cell semantics identical to materializing candidate
+        states first, but gathers source-normalized width projections from their
+        native source surfaces.  The full-D candidate surface is only assembled at
+        the residual output boundary required by downstream typed mixer/read code.
+        """
+        if self.width_cell is None:
+            raise ValueError("sourcewise width-cell fusion requires width_cell")
+        width_cell = self.width_cell
+        bsz, seq_len, d = x.shape
+        j_count = cand_mask.shape[-1]
+        if d != width_cell.d:
+            raise ValueError("sourcewise width-cell fusion d mismatch")
+        final_states = x
+        l3_base = l3_states if l3_states is not None else final_states
+        summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
+        zero_base = torch.zeros_like(final_states)
+        bases: dict[int, torch.Tensor] = {
+            int(CandidateSource.FINAL): final_states,
+            int(CandidateSource.QUESTION_CACHE): final_states,
+            int(CandidateSource.L3): l3_base,
+            int(CandidateSource.HISA): l3_base,
+            int(CandidateSource.SUMMARY): summary_base,
+            int(CandidateSource.NULL): zero_base,
+        }
+
+        width_dim = width_cell.width_dim
+        use_triton_gather = (
+            os.getenv("DWARF_DSQG_W_SOURCEWISE_WIDTH_TRITON_GATHER", "1") != "0"
+            and _TRITON_SOURCEWISE_AVAILABLE
+            and triton is not None
+            and x.is_cuda
+            and chunk_rep_states is None
+            and cand_token_indices.is_cuda
+            and cand_sources.is_cuda
+            and cand_mask.is_cuda
+        )
+        if use_triton_gather:
+            has_l3 = l3_states is not None
+            weight = torch.cat(
+                [
+                    width_cell.q_proj.weight,
+                    width_cell.k_proj.weight,
+                    width_cell.v_proj.weight,
+                    width_cell.rel_diff_proj.weight,
+                    width_cell.rel_prod_proj.weight,
+                ],
+                dim=0,
+            )
+            final_proj = F.linear(width_cell.norm_c(final_states), weight).split(width_dim, dim=-1)
+            if has_l3 and id(l3_base) != id(final_states):
+                l3_proj = F.linear(width_cell.norm_c(l3_base), weight).split(width_dim, dim=-1)
+            else:
+                l3_proj = final_proj
+            cand_states = _DSQGWSourcewiseCandidateStateGather.apply(
+                final_states,
+                l3_base,
+                cand_token_indices,
+                cand_sources,
+                cand_mask,
+                has_l3,
+            )
+            q, k, v, rel_diff, rel_prod = (
+                _DSQGWSourcewiseCandidateStateGather.apply(
+                    final_part,
+                    l3_part,
+                    cand_token_indices,
+                    cand_sources,
+                    cand_mask,
+                    has_l3,
+                )
+                for final_part, l3_part in zip(final_proj, l3_proj)
+            )
+        else:
+            cand_states = x.new_zeros((bsz, seq_len, j_count, d))
+            q = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            k = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            v = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            rel_diff = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            rel_prod = x.new_zeros((bsz, seq_len, j_count, width_dim))
+
+            projected_by_object: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+            for source_id, states in bases.items():
+                source_mask = (cand_sources == int(source_id)) & cand_mask
+                if not bool(source_mask.any()):
+                    continue
+                cache_key = id(states)
+                projected = projected_by_object.get(cache_key)
+                if projected is None:
+                    states_n = width_cell.norm_c(states)
+                    projected = F.linear(
+                        states_n,
+                        torch.cat(
+                            [
+                                width_cell.q_proj.weight,
+                                width_cell.k_proj.weight,
+                                width_cell.v_proj.weight,
+                                width_cell.rel_diff_proj.weight,
+                                width_cell.rel_prod_proj.weight,
+                            ],
+                            dim=0,
+                        ),
+                    ).split(width_dim, dim=-1)
+                    projected_by_object[cache_key] = projected
+                gathered_states = self._gather_source_candidate_states(states, cand_token_indices)
+                mask_d = source_mask[..., None].to(gathered_states.dtype)
+                cand_states = cand_states + gathered_states * mask_d
+                for out_tensor, source_projection in zip((q, k, v, rel_diff, rel_prod), projected):
+                    gathered_projection = self._gather_source_candidate_states(source_projection, cand_token_indices)
+                    out_tensor.add_(gathered_projection * source_mask[..., None].to(gathered_projection.dtype))
+
+        scores = torch.bmm(
+            q.reshape(bsz * seq_len, j_count, width_dim),
+            k.reshape(bsz * seq_len, j_count, width_dim).transpose(1, 2),
+        ).reshape(bsz, seq_len, j_count, j_count) / math.sqrt(float(width_dim))
+        rel_diff_hidden = torch.tanh(rel_diff[:, :, :, None, :] - rel_diff[:, :, None, :, :])
+        rel_prod_hidden = torch.tanh(rel_prod[:, :, :, None, :] * rel_prod[:, :, None, :, :])
+        scores = scores + (
+            rel_diff_hidden * width_cell.rel_diff_score.reshape(1, 1, 1, 1, width_dim)
+        ).sum(dim=-1) / math.sqrt(float(width_dim))
+        scores = scores + (
+            rel_prod_hidden * width_cell.rel_prod_score.reshape(1, 1, 1, 1, width_dim)
+        ).sum(dim=-1) / math.sqrt(float(width_dim))
+        scores = scores + width_cell.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
+        scores = scores + width_cell.source_pair_bias[cand_sources[:, :, :, None], cand_sources[:, :, None, :]]
+        scores.diagonal(dim1=-2, dim2=-1).add_(width_cell.self_bias)
+
+        valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
+        scores = scores.masked_fill(~valid_pair, torch.finfo(scores.dtype).min)
+        probs = F.softmax(scores, dim=3)
+        probs = probs.masked_fill(~valid_pair, 0.0)
+
+        lateral = torch.bmm(
+            probs.reshape(bsz * seq_len, j_count, j_count),
+            v.reshape(bsz * seq_len, j_count, width_dim),
+        ).reshape(bsz, seq_len, j_count, width_dim)
+        delta = width_cell.lateral_up(lateral)
+        gate = torch.sigmoid(width_cell.gate).reshape(1, 1, 1, d)
+        out = cand_states + gate * delta * cand_mask[..., None].to(delta.dtype)
+
+        p_mean = probs
+        valid_targets = cand_mask.bool()
+        p_safe = p_mean.clamp_min(1e-8)
+        entropy_per_target = -(p_safe * p_safe.log()).sum(dim=-1)
+        entropy = entropy_per_target.masked_select(valid_targets).mean()
+        diag = torch.eye(j_count, device=x.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
+        self_mass = p_mean.masked_fill(~diag, 0.0).sum(dim=-1).masked_select(valid_targets).mean()
+
+        def pair_mass(target_mask: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
+            target_mask = target_mask & valid_targets
+            source_mask = source_mask & cand_mask
+            if not target_mask.any():
+                return x.new_tensor(0.0)
+            mass = p_mean.masked_fill(~source_mask[:, :, None, :], 0.0).sum(dim=-1)
+            return mass.masked_select(target_mask).mean()
+
+        question_mask = cand_types == int(CandidateType.QUESTION)
+        hisa_family_mask = _hisa_evidence_type_mask(cand_types)
+        valid_delta_count = cand_mask.to(delta.dtype).sum().clamp_min(1.0)
+        delta_norm = (delta.norm(dim=-1) * cand_mask.to(delta.dtype)).sum() / valid_delta_count
+        transfer_aux_loss = width_pair_transfer_loss(p_mean, cand_types, cand_mask)
+        entropy_penalty = torch.relu(entropy.new_tensor(width_cell.entropy_floor) - entropy)
+        aux_loss = transfer_aux_loss + width_cell.entropy_weight * entropy_penalty
+        telemetry = {
+            "dsqg_w_width_entropy": entropy.detach(),
+            "dsqg_w_width_self_mass": self_mass.detach(),
+            "dsqg_w_width_gate_mean": gate.mean().detach(),
+            "dsqg_w_width_gate_min": gate.min().detach(),
+            "dsqg_w_width_gate_max": gate.max().detach(),
+            "dsqg_w_width_gate_logit_mean": width_cell.gate.detach().mean(),
+            "dsqg_w_width_delta_norm": delta_norm.detach(),
+            "dsqg_w_width_aux_loss": aux_loss,
+            "dsqg_w_width_aux_loss_value": aux_loss.detach(),
+            "dsqg_w_width_transfer_aux_loss": transfer_aux_loss.detach(),
+            "dsqg_w_width_entropy_penalty": entropy_penalty.detach(),
+            "dsqg_w_width_entropy_floor": entropy.new_tensor(width_cell.entropy_floor).detach(),
+            "dsqg_w_width_entropy_weight": entropy.new_tensor(width_cell.entropy_weight).detach(),
+            "dsqg_w_width_question_to_hisa_evidence_mass": pair_mass(question_mask, hisa_family_mask).detach(),
+            "dsqg_w_width_hisa_evidence_to_question_mass": pair_mass(hisa_family_mask, question_mask).detach(),
+            "dsqg_w_width_rel_diff_score_norm": width_cell.rel_diff_score.detach().norm(),
+            "dsqg_w_width_rel_prod_score_norm": width_cell.rel_prod_score.detach().norm(),
+            "dsqg_w_width_recompute_checkpoint": x.new_tensor(0.0).detach(),
+            "dsqg_w_sourcewise_width_cell_fused": x.new_tensor(1.0).detach(),
+        }
+        return out, telemetry
+
+
+    def _sourcewise_projected_width_score_bias(
+        self,
+        x: torch.Tensor,
+        cand_token_indices: torch.Tensor,
+        cand_types: torch.Tensor,
+        cand_sources: torch.Tensor,
+        cand_mask: torch.Tensor,
+        *,
+        l3_states: torch.Tensor | None = None,
+        chunk_rep_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Projected-space width control: width routing as a read score bias.
+
+        This is intentionally not exact width-cell parity.  It keeps the width
+        routing/scoring parameters trainable through the compact-read score-bias
+        gradient, but avoids building transformed [B,T,J,D] candidates.
+        """
+        if self.width_cell is None:
+            raise ValueError("projected width score bias requires width_cell")
+        width_cell = self.width_cell
+        bsz, seq_len, _ = x.shape
+        j_count = cand_mask.shape[-1]
+        width_dim = width_cell.width_dim
+        final_states = x
+        l3_base = l3_states if l3_states is not None else final_states
+        summary_base = chunk_rep_states if chunk_rep_states is not None else final_states
+        zero_base = torch.zeros_like(final_states)
+        bases: dict[int, torch.Tensor] = {
+            int(CandidateSource.FINAL): final_states,
+            int(CandidateSource.QUESTION_CACHE): final_states,
+            int(CandidateSource.L3): l3_base,
+            int(CandidateSource.HISA): l3_base,
+            int(CandidateSource.SUMMARY): summary_base,
+            int(CandidateSource.NULL): zero_base,
+        }
+        use_triton_gather = (
+            os.getenv("DWARF_DSQG_W_PROJECTED_WIDTH_TRITON_GATHER", "1") != "0"
+            and _TRITON_SOURCEWISE_AVAILABLE
+            and triton is not None
+            and x.is_cuda
+            and chunk_rep_states is None
+            and cand_token_indices.is_cuda
+            and cand_sources.is_cuda
+            and cand_mask.is_cuda
+        )
+        weight = torch.cat(
+            [
+                width_cell.q_proj.weight,
+                width_cell.k_proj.weight,
+                width_cell.rel_diff_proj.weight,
+                width_cell.rel_prod_proj.weight,
+            ],
+            dim=0,
+        )
+        if use_triton_gather:
+            has_l3 = l3_states is not None
+            final_proj = F.linear(width_cell.norm_c(final_states), weight).split(width_dim, dim=-1)
+            if has_l3 and id(l3_base) != id(final_states):
+                l3_proj = F.linear(width_cell.norm_c(l3_base), weight).split(width_dim, dim=-1)
+            else:
+                l3_proj = final_proj
+            q, k, rel_diff, rel_prod = (
+                _DSQGWSourcewiseCandidateStateGather.apply(
+                    final_part,
+                    l3_part,
+                    cand_token_indices,
+                    cand_sources,
+                    cand_mask,
+                    has_l3,
+                )
+                for final_part, l3_part in zip(final_proj, l3_proj)
+            )
+        else:
+            q = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            k = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            rel_diff = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            rel_prod = x.new_zeros((bsz, seq_len, j_count, width_dim))
+            projected_by_object: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+            for source_id, states in bases.items():
+                source_mask = (cand_sources == int(source_id)) & cand_mask
+                if not bool(source_mask.any()):
+                    continue
+                cache_key = id(states)
+                projected = projected_by_object.get(cache_key)
+                if projected is None:
+                    projected = F.linear(width_cell.norm_c(states), weight).split(width_dim, dim=-1)
+                    projected_by_object[cache_key] = projected
+                for out_tensor, source_projection in zip((q, k, rel_diff, rel_prod), projected):
+                    gathered_projection = self._gather_source_candidate_states(source_projection, cand_token_indices)
+                    out_tensor.add_(gathered_projection * source_mask[..., None].to(gathered_projection.dtype))
+
+        scores = torch.bmm(
+            q.reshape(bsz * seq_len, j_count, width_dim),
+            k.reshape(bsz * seq_len, j_count, width_dim).transpose(1, 2),
+        ).reshape(bsz, seq_len, j_count, j_count) / math.sqrt(float(width_dim))
+        rel_diff_hidden = torch.tanh(rel_diff[:, :, :, None, :] - rel_diff[:, :, None, :, :])
+        rel_prod_hidden = torch.tanh(rel_prod[:, :, :, None, :] * rel_prod[:, :, None, :, :])
+        scores = scores + (
+            rel_diff_hidden * width_cell.rel_diff_score.reshape(1, 1, 1, 1, width_dim)
+        ).sum(dim=-1) / math.sqrt(float(width_dim))
+        scores = scores + (
+            rel_prod_hidden * width_cell.rel_prod_score.reshape(1, 1, 1, 1, width_dim)
+        ).sum(dim=-1) / math.sqrt(float(width_dim))
+        scores = scores + width_cell.type_pair_bias[cand_types[:, :, :, None], cand_types[:, :, None, :]]
+        scores = scores + width_cell.source_pair_bias[cand_sources[:, :, :, None], cand_sources[:, :, None, :]]
+        scores.diagonal(dim1=-2, dim2=-1).add_(width_cell.self_bias)
+        valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
+        scores = scores.masked_fill(~valid_pair, torch.finfo(scores.dtype).min)
+        probs = F.softmax(scores, dim=-1).masked_fill(~valid_pair, 0.0)
+
+        mode = os.getenv("DWARF_DSQG_W_PROJECTED_WIDTH_BIAS_MODE", "inbound").lower()
+        if mode in {"outbound", "target"}:
+            raw_bias = probs.mean(dim=-1)
+        elif mode in {"symmetric", "sym"}:
+            raw_bias = 0.5 * (probs.mean(dim=-1) + probs.mean(dim=-2))
+        else:
+            raw_bias = probs.mean(dim=-2)
+        valid_denom = cand_mask.to(raw_bias.dtype).sum(dim=-1, keepdim=True).clamp_min(1.0)
+        centered = raw_bias - (raw_bias.masked_fill(~cand_mask, 0.0).sum(dim=-1, keepdim=True) / valid_denom)
+        scale = float(os.getenv("DWARF_DSQG_W_PROJECTED_WIDTH_BIAS_SCALE", "1.0"))
+        bias = (centered * scale).masked_fill(~cand_mask, 0.0).to(dtype=x.dtype)
+        detach_bias = os.getenv("DWARF_DSQG_W_PROJECTED_WIDTH_DETACH", "0") == "1"
+        if detach_bias:
+            bias = bias.detach()
+
+        p_safe = probs.clamp_min(1e-8)
+        valid_targets = cand_mask.bool()
+        entropy = (-(p_safe * p_safe.log()).sum(dim=-1)).masked_select(valid_targets).mean()
+        diag = torch.eye(j_count, device=x.device, dtype=torch.bool).reshape(1, 1, j_count, j_count)
+        self_mass = probs.masked_fill(~diag, 0.0).sum(dim=-1).masked_select(valid_targets).mean()
+        aux_loss = width_pair_transfer_loss(
+            probs,
+            cand_types,
+            cand_mask,
+            entropy_floor=width_cell.entropy_floor,
+            entropy_weight=width_cell.entropy_weight,
+        )
+        telemetry = {
+            "dsqg_w_projected_width_control": x.new_tensor(1.0).detach(),
+            "dsqg_w_projected_width_bias_detached": x.new_tensor(1.0 if detach_bias else 0.0).detach(),
+            "dsqg_w_projected_width_bias_scale": x.new_tensor(scale).detach(),
+            "dsqg_w_projected_width_bias_norm": bias.masked_select(cand_mask).norm().detach() / cand_mask.float().sum().clamp_min(1.0),
+            "dsqg_w_width_entropy": entropy.detach(),
+            "dsqg_w_width_self_mass": self_mass.detach(),
+            "dsqg_w_width_gate_mean": torch.sigmoid(width_cell.gate).mean().detach(),
+            "dsqg_w_width_gate_logit_mean": width_cell.gate.detach().mean(),
+            "dsqg_w_width_aux_loss": aux_loss,
+            "dsqg_w_width_aux_loss_value": aux_loss.detach(),
+            "dsqg_w_width_transfer_aux_loss": aux_loss.detach(),
+            "dsqg_w_width_rel_diff_score_norm": width_cell.rel_diff_score.detach().norm(),
+            "dsqg_w_width_rel_prod_score_norm": width_cell.rel_prod_score.detach().norm(),
+        }
+        return bias, telemetry
 
     def _source_projection_cache(
         self,
@@ -2865,6 +4823,9 @@ class DSQGWBlock(nn.Module):
         l3_states: torch.Tensor | None = None,
         chunk_rep_states: torch.Tensor | None = None,
         cand_scores: torch.Tensor | None = None,
+        evidence_bits: torch.Tensor | None = None,
+        evidence_count: torch.Tensor | None = None,
+        candidate_distances: torch.Tensor | None = None,
         return_routing: bool = False,
         needed_source_ids: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -2939,6 +4900,15 @@ class DSQGWBlock(nn.Module):
         v_summary = v_summary.contiguous()
 
         empty = torch.empty((0,), device=x.device, dtype=x.dtype)
+        cand_scores, prior_telemetry = self._compose_evidence_prior_scores(
+            cand_scores,
+            cand_types,
+            cand_sources,
+            cand_mask,
+            evidence_bits=evidence_bits,
+            evidence_count=evidence_count,
+            candidate_distances=candidate_distances,
+        )
         score_bias = empty
         candidate_score_bias_norm = x.new_tensor(0.0)
         use_score_bias = cand_scores is not None
@@ -3106,6 +5076,8 @@ class DSQGWBlock(nn.Module):
         split_backward = true_backward and os.getenv(
             "DWARF_DSQG_W_TRITON_BACKWARD_ORGANIZATION", "monolithic"
         ).lower() in {"1", "true", "split", "v20_split"}
+        source_backward_grads = os.getenv("DWARF_DSQG_W_TRITON_BACKWARD_SOURCE_GRADS", "1") != "0"
+        source_backward_grad_every = max(1, int(os.getenv("DWARF_DSQG_W_TRITON_BACKWARD_SOURCE_GRAD_EVERY", "1")))
 
         telemetry: dict[str, torch.Tensor] = {
             "dsqg_w_entropy": entropy.detach(),
@@ -3135,9 +5107,11 @@ class DSQGWBlock(nn.Module):
             "dsqg_w_triton_score_recompute_blocks": x.new_tensor(2.0 if split_backward else 1.0).detach(),
             "dsqg_w_triton_true_backward": x.new_tensor(1.0 if true_backward else 0.0).detach(),
             "dsqg_w_triton_backward_v20_split_kernels": x.new_tensor(1.0 if split_backward else 0.0).detach(),
-            "dsqg_w_triton_backward_monolithic_kernel": x.new_tensor(1.0 if true_backward and not split_backward else 0.0).detach(),
-            "dsqg_w_triton_backward_query_kernel": x.new_tensor(1.0 if split_backward else 0.0).detach(),
-            "dsqg_w_triton_backward_source_kernel": x.new_tensor(1.0 if split_backward else 0.0).detach(),
+            "dsqg_w_triton_backward_monolithic_kernel": x.new_tensor(1.0 if true_backward and not split_backward and source_backward_grads else 0.0).detach(),
+            "dsqg_w_triton_backward_query_kernel": x.new_tensor(1.0 if split_backward or not source_backward_grads else 0.0).detach(),
+            "dsqg_w_triton_backward_source_kernel": x.new_tensor(1.0 if split_backward and source_backward_grads else 0.0).detach(),
+            "dsqg_w_triton_backward_source_grads": x.new_tensor(1.0 if source_backward_grads else 0.0).detach(),
+            "dsqg_w_triton_backward_source_grad_every": x.new_tensor(float(source_backward_grad_every)).detach(),
             "dsqg_w_triton_backward_probs_materialized": x.new_tensor(0.0 if true_backward else (1.0 if needs_backward else 0.0)).detach(),
             "dsqg_w_triton_backward_lse_saved": x.new_tensor(1.0 if needs_backward else 0.0).detach(),
             "dsqg_w_triton_backward_reduction_buffer_bytes": x.new_tensor(0.0).detach(),
@@ -3164,6 +5138,7 @@ class DSQGWBlock(nn.Module):
                 telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
             telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
             telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
+        telemetry.update(prior_telemetry)
         if return_routing:
             telemetry["dsqg_w_probs"] = probs
         return x_out, telemetry
@@ -3179,6 +5154,9 @@ class DSQGWBlock(nn.Module):
         l3_states: torch.Tensor | None = None,
         chunk_rep_states: torch.Tensor | None = None,
         cand_scores: torch.Tensor | None = None,
+        evidence_bits: torch.Tensor | None = None,
+        evidence_count: torch.Tensor | None = None,
+        candidate_distances: torch.Tensor | None = None,
         return_routing: bool = False,
         needed_source_ids: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -3200,15 +5178,210 @@ class DSQGWBlock(nn.Module):
             raise ValueError("l3_states must match x shape")
         if chunk_rep_states is not None and chunk_rep_states.shape != x.shape:
             raise ValueError("chunk_rep_states must match x shape")
-        if self.width_cell is not None or self.typed_mixer is not None:
-            cand_states = self._materialize_sourcewise_candidate_states(
-                x,
-                cand_token_indices,
-                cand_sources,
-                cand_mask,
-                l3_states=l3_states,
-                chunk_rep_states=chunk_rep_states,
+        ebh_sourcewise_packet = (
+            self.evidence_binding_hub is not None
+            and os.getenv("DWARF_DSQG_W_EBH_SOURCEWISE_PACKET", "0") == "1"
+        )
+        if ebh_sourcewise_packet:
+            assert self.evidence_binding_hub is not None
+            semantic_approx = self.width_cell is not None or self.typed_mixer is not None
+            with _dsqg_w_profile_range("ebh_sourcewise_packet"):
+                x_ebh, ebh_telemetry = self.evidence_binding_hub.forward_sourcewise_packet(
+                    x,
+                    cand_token_indices,
+                    cand_types,
+                    cand_sources,
+                    cand_mask,
+                    l3_states=l3_states,
+                    chunk_rep_states=chunk_rep_states,
+                    cand_scores=cand_scores,
+                    candidate_distances=candidate_distances,
+                )
+            saved_ebh = self.evidence_binding_hub
+            self.evidence_binding_hub = None
+            try:
+                x_out, telemetry = self.forward_sourcewise(
+                    x_ebh,
+                    cand_token_indices,
+                    cand_types,
+                    cand_sources,
+                    cand_mask,
+                    l3_states=l3_states,
+                    chunk_rep_states=chunk_rep_states,
+                    cand_scores=cand_scores,
+                    evidence_bits=evidence_bits,
+                    evidence_count=evidence_count,
+                    candidate_distances=candidate_distances,
+                    return_routing=return_routing,
+                    needed_source_ids=needed_source_ids,
+                )
+            finally:
+                self.evidence_binding_hub = saved_ebh
+            telemetry.update(ebh_telemetry)
+            telemetry["dsqg_w_sourcewise_ebh_materialized"] = x.new_tensor(0.0).detach()
+            telemetry["dsqg_w_ebh_packet_sourcewise"] = x.new_tensor(1.0).detach()
+            telemetry["dsqg_w_ebh_packet_triton"] = x.new_tensor(0.0).detach()
+            telemetry["dsqg_w_ebh_packet_semantic_approx"] = x.new_tensor(1.0 if semantic_approx else 0.0).detach()
+            return x_out, telemetry
+        if self.width_cell is not None or self.typed_mixer is not None or self.evidence_binding_hub is not None:
+            semantic_telemetry: dict[str, torch.Tensor] = {}
+            projected_width_control = (
+                self.width_cell is not None
+                and os.getenv("DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL", "0") == "1"
+                and os.getenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "0") == "1"
+                and x.is_cuda
+                and _TRITON_SOURCEWISE_AVAILABLE
+                and triton is not None
             )
+            if projected_width_control:
+                with _dsqg_w_profile_range("projected_width_score_bias"):
+                    if os.getenv("DWARF_DSQG_W_PROJECTED_WIDTH_DETACH", "0") == "1":
+                        with torch.no_grad():
+                            width_bias, semantic_telemetry = self._sourcewise_projected_width_score_bias(
+                                x.detach(),
+                                cand_token_indices,
+                                cand_types,
+                                cand_sources,
+                                cand_mask,
+                                l3_states=l3_states.detach() if l3_states is not None else None,
+                                chunk_rep_states=chunk_rep_states.detach() if chunk_rep_states is not None else None,
+                            )
+                    else:
+                        width_bias, semantic_telemetry = self._sourcewise_projected_width_score_bias(
+                            x,
+                            cand_token_indices,
+                            cand_types,
+                            cand_sources,
+                            cand_mask,
+                            l3_states=l3_states,
+                            chunk_rep_states=chunk_rep_states,
+                        )
+                cand_scores = width_bias if cand_scores is None else cand_scores.to(width_bias.dtype) + width_bias
+                x_out, telemetry = self._forward_sourcewise_triton(
+                    x,
+                    cand_token_indices,
+                    cand_types,
+                    cand_sources,
+                    cand_mask,
+                    l3_states=l3_states,
+                    chunk_rep_states=chunk_rep_states,
+                    cand_scores=cand_scores,
+                    evidence_bits=evidence_bits,
+                    evidence_count=evidence_count,
+                    candidate_distances=candidate_distances,
+                    return_routing=return_routing,
+                    needed_source_ids=needed_source_ids,
+                )
+                telemetry.update(semantic_telemetry)
+                telemetry["dsqg_w_sourcewise_semantic_materialized"] = x.new_tensor(0.0).detach()
+                telemetry["dsqg_w_sourcewise_width_cell_fusion"] = x.new_tensor(0.0).detach()
+                telemetry["dsqg_w_projected_width_semantic_control"] = x.new_tensor(1.0).detach()
+                telemetry["dsqg_w_typed_mixer_projected_bypass"] = x.new_tensor(1.0 if self.typed_mixer is not None else 0.0).detach()
+                telemetry["dsqg_w_triton_sourcewise_semantic_bypass"] = x.new_tensor(1.0).detach()
+                return x_out, telemetry
+            sourcewise_width_fused = (
+                self.width_cell is not None
+                and os.getenv("DWARF_DSQG_W_SOURCEWISE_WIDTH_CELL_FUSION", "0") == "1"
+            )
+            if sourcewise_width_fused:
+                width_recompute = (
+                    os.getenv("DWARF_DSQG_W_SOURCEWISE_WIDTH_RECOMPUTE", "1") != "0"
+                    and torch.is_grad_enabled()
+                    and x.requires_grad
+                    and os.getenv("DWARF_DSQG_W_WIDTH_AUX_WEIGHT", "0") in {"", "0", "0.0"}
+                )
+                if width_recompute:
+                    if l3_states is not None:
+                        def _sourcewise_width_out(x_arg, l3_arg):
+                            with _dsqg_w_profile_range("sourcewise_width_cell_fused"):
+                                out, _ = self._sourcewise_width_cell_fused(
+                                    x_arg,
+                                    cand_token_indices,
+                                    cand_types,
+                                    cand_sources,
+                                    cand_mask,
+                                    l3_states=l3_arg,
+                                    chunk_rep_states=chunk_rep_states,
+                                )
+                            return out
+
+                        cand_states = checkpoint(_sourcewise_width_out, x, l3_states, use_reentrant=False)
+                    else:
+                        def _sourcewise_width_out_no_l3(x_arg):
+                            with _dsqg_w_profile_range("sourcewise_width_cell_fused"):
+                                out, _ = self._sourcewise_width_cell_fused(
+                                    x_arg,
+                                    cand_token_indices,
+                                    cand_types,
+                                    cand_sources,
+                                    cand_mask,
+                                    l3_states=None,
+                                    chunk_rep_states=chunk_rep_states,
+                                )
+                            return out
+
+                        cand_states = checkpoint(_sourcewise_width_out_no_l3, x, use_reentrant=False)
+                    if os.getenv("DWARF_DSQG_W_FAST_TELEMETRY", "0") == "1":
+                        zero = x.new_tensor(0.0)
+                        gate = torch.sigmoid(self.width_cell.gate).reshape(-1)
+                        semantic_telemetry = {
+                            "dsqg_w_width_entropy": zero.detach(),
+                            "dsqg_w_width_self_mass": zero.detach(),
+                            "dsqg_w_width_gate_mean": gate.mean().detach(),
+                            "dsqg_w_width_gate_min": gate.min().detach(),
+                            "dsqg_w_width_gate_max": gate.max().detach(),
+                            "dsqg_w_width_gate_logit_mean": self.width_cell.gate.detach().mean(),
+                            "dsqg_w_width_delta_norm": zero.detach(),
+                            "dsqg_w_width_aux_loss_value": zero.detach(),
+                            "dsqg_w_width_transfer_aux_loss": zero.detach(),
+                            "dsqg_w_width_entropy_penalty": zero.detach(),
+                            "dsqg_w_width_entropy_floor": zero.detach(),
+                            "dsqg_w_width_entropy_weight": zero.detach(),
+                            "dsqg_w_width_question_to_hisa_evidence_mass": zero.detach(),
+                            "dsqg_w_width_hisa_evidence_to_question_mass": zero.detach(),
+                            "dsqg_w_width_rel_diff_score_norm": self.width_cell.rel_diff_score.detach().norm(),
+                            "dsqg_w_width_rel_prod_score_norm": self.width_cell.rel_prod_score.detach().norm(),
+                            "dsqg_w_width_recompute_checkpoint": zero.detach(),
+                            "dsqg_w_sourcewise_width_cell_fused": x.new_tensor(1.0).detach(),
+                            "dsqg_w_sourcewise_width_fast_telemetry": x.new_tensor(1.0).detach(),
+                        }
+                    else:
+                        with torch.no_grad():
+                            with _dsqg_w_profile_range("sourcewise_width_cell_fused_telemetry"):
+                                _, semantic_telemetry = self._sourcewise_width_cell_fused(
+                                    x.detach(),
+                                    cand_token_indices,
+                                    cand_types,
+                                    cand_sources,
+                                    cand_mask,
+                                    l3_states=l3_states.detach() if l3_states is not None else None,
+                                    chunk_rep_states=chunk_rep_states.detach() if chunk_rep_states is not None else None,
+                                )
+                    semantic_telemetry["dsqg_w_sourcewise_width_recompute_checkpoint"] = x.new_tensor(1.0).detach()
+                else:
+                    with _dsqg_w_profile_range("sourcewise_width_cell_fused"):
+                        cand_states, semantic_telemetry = self._sourcewise_width_cell_fused(
+                            x,
+                            cand_token_indices,
+                            cand_types,
+                            cand_sources,
+                            cand_mask,
+                            l3_states=l3_states,
+                            chunk_rep_states=chunk_rep_states,
+                        )
+                    semantic_telemetry["dsqg_w_sourcewise_width_recompute_checkpoint"] = x.new_tensor(0.0).detach()
+                if self.typed_mixer is not None:
+                    cand_states, typed_mixer_telemetry = self.typed_mixer(cand_states, cand_types, cand_mask)
+                    semantic_telemetry.update(typed_mixer_telemetry)
+            else:
+                cand_states = self._materialize_sourcewise_candidate_states(
+                    x,
+                    cand_token_indices,
+                    cand_sources,
+                    cand_mask,
+                    l3_states=l3_states,
+                    chunk_rep_states=chunk_rep_states,
+                )
             x_out, telemetry = self.forward(
                 x,
                 cand_states,
@@ -3216,9 +5389,18 @@ class DSQGWBlock(nn.Module):
                 cand_sources,
                 cand_mask,
                 cand_scores=cand_scores,
+                evidence_bits=evidence_bits,
+                evidence_count=evidence_count,
+                candidate_distances=candidate_distances,
                 return_routing=return_routing,
+                semantic_transforms_applied=sourcewise_width_fused,
+                precomputed_semantic_telemetry=semantic_telemetry if sourcewise_width_fused else None,
             )
-            telemetry["dsqg_w_sourcewise_semantic_materialized"] = x.new_tensor(1.0).detach()
+            telemetry["dsqg_w_sourcewise_semantic_materialized"] = x.new_tensor(0.0 if sourcewise_width_fused else 1.0).detach()
+            telemetry["dsqg_w_sourcewise_width_cell_fusion"] = x.new_tensor(1.0 if sourcewise_width_fused else 0.0).detach()
+            telemetry["dsqg_w_sourcewise_ebh_materialized"] = x.new_tensor(
+                1.0 if self.evidence_binding_hub is not None and not sourcewise_width_fused else 0.0
+            ).detach()
             telemetry["dsqg_w_triton_sourcewise_semantic_bypass"] = x.new_tensor(0.0).detach()
             return x_out, telemetry
         if os.getenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "0") == "1":
@@ -3231,6 +5413,9 @@ class DSQGWBlock(nn.Module):
                 l3_states=l3_states,
                 chunk_rep_states=chunk_rep_states,
                 cand_scores=cand_scores,
+                evidence_bits=evidence_bits,
+                evidence_count=evidence_count,
+                candidate_distances=candidate_distances,
                 return_routing=return_routing,
                 needed_source_ids=needed_source_ids,
             )
@@ -3252,6 +5437,15 @@ class DSQGWBlock(nn.Module):
             needed_source_ids=needed_source_ids,
         )
         gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
+        cand_scores, prior_telemetry = self._compose_evidence_prior_scores(
+            cand_scores,
+            cand_types,
+            cand_sources,
+            cand_mask,
+            evidence_bits=evidence_bits,
+            evidence_count=evidence_count,
+            candidate_distances=candidate_distances,
+        )
 
         score_bias = None
         candidate_score_bias_norm = x.new_tensor(0.0)
@@ -3370,6 +5564,7 @@ class DSQGWBlock(nn.Module):
             telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
         telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
         telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
+        telemetry.update(prior_telemetry)
         if return_routing:
             telemetry["dsqg_w_probs"] = probs
         return x_out, telemetry
@@ -3383,7 +5578,12 @@ class DSQGWBlock(nn.Module):
         cand_mask: torch.Tensor,
         *,
         cand_scores: torch.Tensor | None = None,
+        evidence_bits: torch.Tensor | None = None,
+        evidence_count: torch.Tensor | None = None,
+        candidate_distances: torch.Tensor | None = None,
         return_routing: bool = False,
+        semantic_transforms_applied: bool = False,
+        precomputed_semantic_telemetry: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         bsz, seq_len, d = x.shape
         b2, t2, j_count, d2 = cand_states.shape
@@ -3397,11 +5597,54 @@ class DSQGWBlock(nn.Module):
             raise ValueError("DSQG-W received an all-invalid candidate row")
 
         width_telemetry: dict[str, torch.Tensor] = {}
-        if self.width_cell is not None:
-            cand_states, width_telemetry = self.width_cell(cand_states, cand_types, cand_sources, cand_mask)
         typed_mixer_telemetry: dict[str, torch.Tensor] = {}
-        if self.typed_mixer is not None:
+        ebh_telemetry: dict[str, torch.Tensor] = {}
+        if precomputed_semantic_telemetry is not None:
+            width_telemetry.update(precomputed_semantic_telemetry)
+        if self.width_cell is not None and not semantic_transforms_applied:
+            width_recompute = (
+                os.getenv("DWARF_DSQG_W_WIDTH_CELL_RECOMPUTE", "1") != "0"
+                and torch.is_grad_enabled()
+                and cand_states.requires_grad
+                and os.getenv("DWARF_DSQG_W_WIDTH_AUX_WEIGHT", "0") in {"", "0", "0.0"}
+            )
+            if width_recompute:
+                width_input = cand_states
+
+                def _width_out(states, types, sources, mask):
+                    out, _ = self.width_cell(states, types, sources, mask)
+                    return out
+
+                cand_states = checkpoint(
+                    _width_out,
+                    cand_states,
+                    cand_types,
+                    cand_sources,
+                    cand_mask,
+                    use_reentrant=False,
+                )
+                # Telemetry is not on the training loss path when aux weight is
+                # zero.  Compute it without saving the full width-cell graph; this
+                # keeps the Stage-3 all-open path from carrying both width-cell
+                # activations and the downstream compact-read graph at N=2048.
+                with torch.no_grad():
+                    _, width_telemetry = self.width_cell(width_input.detach(), cand_types, cand_sources, cand_mask)
+                width_telemetry["dsqg_w_width_recompute_checkpoint"] = cand_states.new_tensor(1.0).detach()
+            else:
+                cand_states, width_telemetry = self.width_cell(cand_states, cand_types, cand_sources, cand_mask)
+                width_telemetry["dsqg_w_width_recompute_checkpoint"] = cand_states.new_tensor(0.0).detach()
+        if self.typed_mixer is not None and not semantic_transforms_applied:
             cand_states, typed_mixer_telemetry = self.typed_mixer(cand_states, cand_types, cand_mask)
+        if self.evidence_binding_hub is not None and not semantic_transforms_applied:
+            x, ebh_telemetry = self.evidence_binding_hub(
+                x,
+                cand_states,
+                cand_types,
+                cand_sources,
+                cand_mask,
+                candidate_distances=candidate_distances,
+                cand_scores=cand_scores,
+            )
 
         h = self.n_heads
         dh = self.dh
@@ -3411,6 +5654,126 @@ class DSQGWBlock(nn.Module):
         q = self.q_proj(x_n).reshape(bsz, seq_len, h, dh)
         k = self.k_proj(c_n).reshape(bsz, seq_len, j_count, h, dh)
         v = self.v_proj(c_n).reshape(bsz, seq_len, j_count, h, dh)
+
+        if (
+            os.getenv("DWARF_DSQG_W_TRITON_TRANSFORMED_COMPACT_READ", "0") == "1"
+            and _TRITON_SOURCEWISE_AVAILABLE
+            and triton is not None
+            and x.is_cuda
+            and not return_routing
+        ):
+            schedule = _dsqg_w_triton_schedule(dh, x.device)
+            read_slot_count = 1 + len(self.read_type_ids)
+            type_slot_map = torch.full((self.n_types,), -1, device=x.device, dtype=torch.int32)
+            for slot_idx, type_id in enumerate(self.read_type_ids, start=1):
+                if 0 <= int(type_id) < self.n_types:
+                    type_slot_map[int(type_id)] = int(slot_idx)
+
+            cand_scores, prior_telemetry = self._compose_evidence_prior_scores(
+                cand_scores,
+                cand_types,
+                cand_sources,
+                cand_mask,
+                evidence_bits=evidence_bits,
+                evidence_count=evidence_count,
+                candidate_distances=candidate_distances,
+            )
+            empty = torch.empty((0,), device=x.device, dtype=x.dtype)
+            score_bias = empty
+            candidate_score_bias_norm = x.new_tensor(0.0)
+            use_score_bias = cand_scores is not None
+            if cand_scores is not None:
+                if cand_scores.shape != cand_mask.shape:
+                    raise ValueError("cand_scores must have shape [B,T,J]")
+                score_bias = cand_scores.to(device=x.device, dtype=x.dtype)
+                score_bias = torch.nan_to_num(score_bias, nan=0.0, neginf=0.0, posinf=0.0)
+                valid_denom = cand_mask.to(score_bias.dtype).sum(dim=-1, keepdim=True).clamp_min(1.0)
+                score_bias = score_bias - (score_bias.masked_fill(~cand_mask, 0.0).sum(dim=-1, keepdim=True) / valid_denom)
+                score_bias = score_bias.masked_fill(~cand_mask, 0.0).contiguous()
+                candidate_score_bias_norm = score_bias.masked_select(cand_mask).norm() / cand_mask.float().sum().clamp_min(1.0)
+            qtb = empty
+            query_type_bias_norm = x.new_tensor(0.0)
+            use_qtb = bool(self.use_query_type_bias)
+            if self.use_query_type_bias:
+                qtb = self.query_type_bias(x_n).reshape(bsz, seq_len, self.n_types, h).contiguous()
+                query_type_bias_norm = qtb.norm(dim=-1).mean()
+
+            read_slots = _DSQGWMaterializedTritonCompactRead.apply(
+                q,
+                k,
+                v,
+                self.role_key.weight,
+                self.source_key.weight,
+                self.type_bias,
+                self.source_bias,
+                qtb,
+                score_bias,
+                cand_types,
+                cand_sources,
+                cand_mask,
+                type_slot_map,
+                use_qtb,
+                use_score_bias,
+                d,
+                h,
+                dh,
+                self.n_types,
+                read_slot_count,
+                schedule.block_hd,
+            )
+            read = self._mix_compact_read_slots(read_slots)
+            z = torch.cat([x, read, x * read, read - x], dim=-1)
+            delta = self.fuse(self.norm_z(z))
+            gate = torch.sigmoid(self.gate).reshape(1, 1, d)
+            x_out = x + gate * delta
+
+            fast_telemetry = os.getenv("DWARF_DSQG_W_FAST_TELEMETRY", "0") == "1"
+            valid_counts = cand_mask.sum(dim=-1).float()
+            delta_norm = x.new_tensor(0.0) if fast_telemetry else delta.norm(dim=-1).mean()
+            x_norm = x.norm(dim=-1).mean()
+            read_norm = x.new_tensor(0.0) if fast_telemetry else read.norm(dim=-1).mean()
+            typed_read_norms = [x.new_tensor(0.0) for _ in range(self.n_types)]
+            if not fast_telemetry:
+                for slot_idx, type_id in enumerate(self.read_type_ids, start=1):
+                    if 0 <= int(type_id) < self.n_types:
+                        typed_read_norms[int(type_id)] = read_slots[:, :, slot_idx, :].norm(dim=-1).mean()
+            zero_mass = x.new_tensor(0.0)
+            telemetry: dict[str, torch.Tensor] = {
+                "dsqg_w_entropy": zero_mass.detach(),
+                "dsqg_w_valid_candidate_count": valid_counts.mean().detach(),
+                "dsqg_w_gate_mean": gate.mean().detach(),
+                "dsqg_w_gate_min": gate.min().detach(),
+                "dsqg_w_gate_max": gate.max().detach(),
+                "dsqg_w_gate_logit_mean": self.gate.detach().mean(),
+                "dsqg_w_delta_norm": delta_norm.detach(),
+                "dsqg_w_x_norm": x_norm.detach(),
+                "dsqg_w_delta_to_x_ratio": (delta_norm / x_norm.clamp_min(1e-8)).detach(),
+                "dsqg_w_read_norm": read_norm.detach(),
+                "dsqg_w_typed_read_norms": torch.stack(typed_read_norms).detach(),
+                "read_mix_weight_norm": self.read_mix.weight.norm().detach(),
+                "dsqg_w_query_type_bias_norm": query_type_bias_norm.detach(),
+                "dsqg_w_candidate_score_bias_norm": candidate_score_bias_norm.detach(),
+                "dsqg_w_triton_transformed_compact_read": x.new_tensor(1.0).detach(),
+                "dsqg_w_triton_transformed_compact_read_backward": x.new_tensor(1.0).detach(),
+                "dsqg_w_triton_compact_read_slots_materialized": x.new_tensor(1.0).detach(),
+            }
+            for ctype in CandidateType:
+                telemetry[f"dsqg_w_{ctype.name.lower()}_mass"] = zero_mass.detach()
+            telemetry["dsqg_w_local_mass"] = telemetry[f"dsqg_w_{CandidateType.LOCAL.name.lower()}_mass"]
+            telemetry["dsqg_w_question_mass"] = telemetry[f"dsqg_w_{CandidateType.QUESTION.name.lower()}_mass"]
+            telemetry["dsqg_w_hisa_evidence_mass"] = telemetry[f"dsqg_w_{CandidateType.HISA_EVIDENCE.name.lower()}_mass"]
+            telemetry["dsqg_w_long_offset_mass"] = telemetry[f"dsqg_w_{CandidateType.LONG_OFFSET.name.lower()}_mass"]
+            telemetry["dsqg_w_chunk_rep_mass"] = telemetry[f"dsqg_w_{CandidateType.CHUNK_REP.name.lower()}_mass"]
+            telemetry["dsqg_w_null_mass"] = telemetry[f"dsqg_w_{CandidateType.NULL.name.lower()}_mass"]
+            for source in CandidateSource:
+                telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = zero_mass.detach()
+            telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
+            telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
+            telemetry.update(prior_telemetry)
+            telemetry.update(width_telemetry)
+            telemetry.update(typed_mixer_telemetry)
+            telemetry.update(ebh_telemetry)
+            return x_out, telemetry
 
         # Avoid materializing role/source embeddings as [B,T,J,H,DH].  They are
         # candidate-type/source constants, so score them against q once for the
@@ -3427,6 +5790,15 @@ class DSQGWBlock(nn.Module):
         scores = scores + source_scores.gather(2, cand_sources[:, :, :, None].expand(-1, -1, -1, h))
         scores = scores * inv_sqrt_dh
         scores = scores + self.type_bias[cand_types]
+        cand_scores, prior_telemetry = self._compose_evidence_prior_scores(
+            cand_scores,
+            cand_types,
+            cand_sources,
+            cand_mask,
+            evidence_bits=evidence_bits,
+            evidence_count=evidence_count,
+            candidate_distances=candidate_distances,
+        )
         candidate_score_bias_norm = x.new_tensor(0.0)
         if cand_scores is not None:
             if cand_scores.shape != cand_mask.shape:
@@ -3515,8 +5887,10 @@ class DSQGWBlock(nn.Module):
                 telemetry[f"dsqg_w_{source.name.lower()}_source_mass"] = mass.detach()
         telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
         telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
+        telemetry.update(prior_telemetry)
         telemetry.update(width_telemetry)
         telemetry.update(typed_mixer_telemetry)
+        telemetry.update(ebh_telemetry)
 
         if return_routing:
             telemetry["dsqg_w_probs"] = probs

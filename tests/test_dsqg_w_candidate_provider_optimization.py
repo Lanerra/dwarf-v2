@@ -232,6 +232,78 @@ def test_dsr_selected_metadata_specialization_matches_generic_path(monkeypatch) 
     }
 
 
+def test_grouped_slot_materialization_matches_general_source_group_path(monkeypatch) -> None:
+    torch.manual_seed(20260705)
+    config = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        null_fallback=True,
+        typed_hisa_reps=True,
+    )
+    provider = CandidateProvider(config)
+    block = DSQGWBlock.from_config(config)
+    x = torch.randn(2, 7, 16, requires_grad=True)
+    l3 = torch.randn(2, 7, 16, requires_grad=True)
+    positions = torch.arange(7)
+    question = torch.tensor([[0, 3, 3, 9], [0, 2, 5, 9]], dtype=torch.long)
+    hisa = torch.stack(
+        [
+            (positions - 1).clamp_min(0),
+            (positions - 3).clamp_min(0),
+            (positions - 5).clamp_min(0),
+            torch.full_like(positions, 99),
+        ],
+        dim=-1,
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    hisa_scores = torch.linspace(-0.5, 0.5, steps=2 * 7 * 4).reshape(2, 7, 4)
+    l3_skip = torch.stack(
+        [(positions - 2).clamp_min(0), torch.full_like(positions, 99)], dim=-1
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    metadata = provider.build_metadata(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+
+    monkeypatch.setenv("DWARF_DSQG_W_GROUPED_SLOT_MATERIALIZE", "0")
+    general_x = x.detach().clone().requires_grad_(True)
+    general_l3 = l3.detach().clone().requires_grad_(True)
+    general = block._materialize_sourcewise_candidate_states(
+        general_x,
+        metadata.cand_token_indices,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=general_l3,
+    )
+
+    monkeypatch.setenv("DWARF_DSQG_W_GROUPED_SLOT_MATERIALIZE", "1")
+    grouped_x = x.detach().clone().requires_grad_(True)
+    grouped_l3 = l3.detach().clone().requires_grad_(True)
+    grouped = block._materialize_sourcewise_candidate_states(
+        grouped_x,
+        metadata.cand_token_indices,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=grouped_l3,
+    )
+
+    assert torch.allclose(grouped, general, atol=0.0, rtol=0.0)
+    general.square().mean().backward()
+    grouped.square().mean().backward()
+    assert torch.allclose(grouped_x.grad, general_x.grad, atol=0.0, rtol=0.0)
+    assert torch.allclose(grouped_l3.grad, general_l3.grad, atol=0.0, rtol=0.0)
+
+
 def _require_cuda_triton() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for Triton DSQG-W sourcewise tests")
@@ -269,6 +341,224 @@ def _cuda_sourcewise_metadata(config: DSQGWConfig, *, seq_len: int):
         l3_skip_indices=l3_skip,
     )
     return x, l3, metadata
+
+
+def test_triton_candidate_state_gather_matches_eager_materialization_on_cuda(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607052)
+    config = DSQGWConfig(
+        d=32,
+        n_heads=4,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        null_fallback=True,
+        typed_hisa_reps=True,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=16)
+    block = DSQGWBlock.from_config(config).cuda()
+
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_CAND_STATE_GATHER", "0")
+    eager_x = x.detach().clone().requires_grad_(True)
+    eager_l3 = l3.detach().clone().requires_grad_(True)
+    eager = block._materialize_sourcewise_candidate_states(
+        eager_x,
+        metadata.cand_token_indices,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=eager_l3,
+    )
+
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_CAND_STATE_GATHER", "1")
+    triton_x = x.detach().clone().requires_grad_(True)
+    triton_l3 = l3.detach().clone().requires_grad_(True)
+    triton_out = block._materialize_sourcewise_candidate_states(
+        triton_x,
+        metadata.cand_token_indices,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=triton_l3,
+    )
+
+    torch.cuda.synchronize()
+    assert torch.allclose(triton_out, eager, atol=0.0, rtol=0.0)
+    eager.square().mean().backward()
+    triton_out.square().mean().backward()
+    torch.cuda.synchronize()
+    assert torch.allclose(triton_x.grad, eager_x.grad, atol=0.0, rtol=0.0)
+    assert torch.allclose(triton_l3.grad, eager_l3.grad, atol=0.0, rtol=0.0)
+
+
+def test_triton_transformed_compact_read_matches_materialized_allopen_on_cuda(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607053)
+    config = DSQGWConfig(
+        d=32,
+        n_heads=4,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        null_fallback=True,
+        gate_init=-2.0,
+        fuse_init_std=0.02,
+        use_width_cell=True,
+        width_bottleneck=16,
+        width_gate_init=-1.5,
+        width_entropy_floor=1.5,
+        width_entropy_weight=0.25,
+        use_typed_mixer=True,
+        typed_mixer_bottleneck=16,
+        typed_mixer_gate_init=-1.5,
+        use_query_type_bias=True,
+        typed_hisa_reps=True,
+        use_evidence_prior=True,
+        evidence_prior_init_scale=0.0,
+        use_candidate_quotas=True,
+        quota_hisa_max=4,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=16)
+    base_block = DSQGWBlock.from_config(config).cuda().train()
+    fused_block = DSQGWBlock.from_config(config).cuda().train()
+    fused_block.load_state_dict(base_block.state_dict())
+
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_TRANSFORMED_COMPACT_READ", "0")
+    base_x = x.detach().clone().requires_grad_(True)
+    base_l3 = l3.detach().clone().requires_grad_(True)
+    base_out, base_tel = base_block.forward_sourcewise(
+        base_x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=base_l3,
+        cand_scores=metadata.cand_scores,
+        evidence_bits=metadata.evidence_bits,
+        evidence_count=metadata.evidence_count,
+        candidate_distances=metadata.candidate_distances,
+    )
+    base_loss = base_out.square().mean() + 0.001 * base_tel["dsqg_w_width_aux_loss"]
+    base_loss.backward()
+
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_TRANSFORMED_COMPACT_READ", "1")
+    monkeypatch.setenv("DWARF_DSQG_W_MATERIALIZED_COMPACT_READ_BACKWARD", "triton")
+    monkeypatch.setenv("DWARF_DSQG_W_SOURCEWISE_WIDTH_CELL_FUSION", "1")
+    fused_x = x.detach().clone().requires_grad_(True)
+    fused_l3 = l3.detach().clone().requires_grad_(True)
+    fused_out, fused_tel = fused_block.forward_sourcewise(
+        fused_x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=fused_l3,
+        cand_scores=metadata.cand_scores,
+        evidence_bits=metadata.evidence_bits,
+        evidence_count=metadata.evidence_count,
+        candidate_distances=metadata.candidate_distances,
+    )
+    fused_loss = fused_out.square().mean() + 0.001 * fused_tel["dsqg_w_width_aux_loss"]
+    fused_loss.backward()
+    torch.cuda.synchronize()
+
+    assert fused_tel["dsqg_w_triton_transformed_compact_read"].item() == 1.0
+    assert fused_tel["dsqg_w_sourcewise_width_cell_fusion"].item() == 1.0
+    assert fused_tel["dsqg_w_sourcewise_semantic_materialized"].item() == 0.0
+    assert torch.allclose(fused_out, base_out, atol=2e-4, rtol=2e-4)
+    assert torch.allclose(fused_x.grad, base_x.grad, atol=5e-4, rtol=5e-4)
+    assert torch.allclose(fused_l3.grad, base_l3.grad, atol=5e-4, rtol=5e-4)
+    base_params = dict(base_block.named_parameters())
+    fused_params = dict(fused_block.named_parameters())
+    for name in (
+        "q_proj.weight",
+        "k_proj.weight",
+        "v_proj.weight",
+        "role_key.weight",
+        "source_key.weight",
+        "width_cell.q_proj.weight",
+        "typed_mixer.q_proj.weight",
+    ):
+        base_grad = base_params[name].grad
+        fused_grad = fused_params[name].grad
+        assert base_grad is not None and fused_grad is not None
+        assert torch.allclose(fused_grad, base_grad, atol=8e-4, rtol=8e-4), name
+
+
+
+def test_projected_width_control_uses_triton_sourcewise_without_semantic_materialization(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607052)
+    config = DSQGWConfig(
+        d=128,
+        n_heads=4,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        gate_init=-2.0,
+        fuse_init_std=0.02,
+        use_width_cell=True,
+        width_bottleneck=16,
+        width_gate_init=-1.5,
+        width_entropy_floor=1.5,
+        width_entropy_weight=0.25,
+        use_typed_mixer=True,
+        typed_mixer_bottleneck=16,
+        typed_mixer_gate_init=-1.5,
+        use_query_type_bias=True,
+        typed_hisa_reps=True,
+        use_evidence_prior=True,
+        evidence_prior_init_scale=0.0,
+        use_candidate_quotas=True,
+        quota_hisa_max=4,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=16)
+    block = DSQGWBlock.from_config(config).cuda().train()
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
+    monkeypatch.setenv("DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL", "1")
+    monkeypatch.setenv("DWARF_DSQG_W_PROJECTED_WIDTH_BIAS_SCALE", "3.0")
+
+    x_req = x.detach().clone().requires_grad_(True)
+    l3_req = l3.detach().clone().requires_grad_(True)
+    out, telemetry = block.forward_sourcewise(
+        x_req,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=l3_req,
+        cand_scores=metadata.cand_scores,
+        evidence_bits=metadata.evidence_bits,
+        evidence_count=metadata.evidence_count,
+        candidate_distances=metadata.candidate_distances,
+    )
+    loss = out.square().mean() + 0.001 * telemetry["dsqg_w_width_aux_loss"]
+    loss.backward()
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert telemetry["dsqg_w_triton_sourcewise"].item() == 1.0
+    assert telemetry["dsqg_w_projected_width_control"].item() == 1.0
+    assert telemetry["dsqg_w_projected_width_semantic_control"].item() == 1.0
+    assert telemetry["dsqg_w_sourcewise_semantic_materialized"].item() == 0.0
+    assert telemetry["dsqg_w_typed_mixer_projected_bypass"].item() == 1.0
+    assert x_req.grad is not None and torch.isfinite(x_req.grad).all()
+    assert l3_req.grad is not None and torch.isfinite(l3_req.grad).all()
+    width_grad = block.width_cell.q_proj.weight.grad
+    assert width_grad is not None
+    assert torch.isfinite(width_grad).all()
+    assert width_grad.abs().sum() > 0
 
 
 def test_triton_sourcewise_matches_eager_sourcewise_on_cuda(monkeypatch) -> None:
@@ -570,6 +860,58 @@ def test_triton_sourcewise_default_backward_uses_true_kernel_and_no_backward_pro
         assert triton_param.grad is not None, name
         assert eager_param.grad is not None, name
         assert torch.allclose(triton_param.grad, eager_param.grad, atol=8e-4, rtol=8e-4), name
+
+
+
+def test_triton_sourcewise_query_only_backward_can_skip_source_kv_grads_on_cuda(monkeypatch) -> None:
+    _require_cuda_triton()
+    torch.manual_seed(202607053)
+    config = DSQGWConfig(
+        d=32,
+        n_heads=4,
+        max_candidates=8,
+        local_offsets=(1,),
+        long_offsets=(),
+        k_question=2,
+        k_hisa_evidence=2,
+        k_l3_skip=1,
+        k_chunk=0,
+        gate_init=-2.0,
+        fuse_init_std=0.02,
+        use_query_type_bias=True,
+    )
+    x, l3, metadata = _cuda_sourcewise_metadata(config, seq_len=8)
+    block = DSQGWBlock.from_config(config).cuda()
+    x_req = x.detach().clone().requires_grad_(True)
+    l3_req = l3.detach().clone().requires_grad_(True)
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "1")
+    monkeypatch.setenv("DWARF_DSQG_W_TRITON_BACKWARD_SOURCE_GRADS", "0")
+
+    out, telemetry = block.forward_sourcewise(
+        x_req,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=l3_req,
+        cand_scores=metadata.cand_scores,
+    )
+    out.float().square().mean().backward()
+    torch.cuda.synchronize()
+
+    assert telemetry["dsqg_w_triton_true_backward"].item() == 1.0
+    assert telemetry["dsqg_w_triton_backward_source_grads"].item() == 0.0
+    assert telemetry["dsqg_w_triton_backward_monolithic_kernel"].item() == 0.0
+    assert telemetry["dsqg_w_triton_backward_query_kernel"].item() == 1.0
+    assert telemetry["dsqg_w_triton_backward_source_kernel"].item() == 0.0
+    assert block.q_proj.weight.grad is not None
+    assert block.role_key.weight.grad is not None
+    assert block.source_key.weight.grad is not None
+    # Source K/V projection gradients are intentionally severed by this speed-control mode.
+    assert block.k_proj.weight.grad is None or block.k_proj.weight.grad.abs().sum().item() == 0.0
+    assert block.v_proj.weight.grad is None or block.v_proj.weight.grad.abs().sum().item() == 0.0
+    assert x_req.grad is not None and torch.isfinite(x_req.grad).all()
+    assert l3_req.grad is None or torch.isfinite(l3_req.grad).all()
 
 
 def test_triton_sourcewise_v20_split_backward_is_opt_in_and_matches_eager_on_cuda(monkeypatch) -> None:

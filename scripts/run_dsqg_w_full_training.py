@@ -53,17 +53,35 @@ def build_run_config(
     typed_mixer: bool = False,
     typed_mixer_bottleneck: int = 64,
     typed_mixer_gate_init: float = -2.5,
+    evidence_binding_hub: bool = False,
+    ebh_bottleneck: int = 256,
+    ebh_gate_init: float = -5.0,
+    ebh_phase_bands: int = 4,
+    ebh_score_features: bool = True,
+    ebh_sourcewise_packet: bool = False,
+    evidence_prior: bool = False,
+    evidence_prior_clip: float = 2.0,
+    evidence_prior_init_scale: float = 0.0,
+    candidate_quotas: bool = False,
+    quota_hisa_max: int = 0,
     query_type_bias: bool = False,
     typed_hisa_reps: bool = False,
     dsr_candidates: bool = True,
     local_offsets: str = "none",
     long_offsets: str = "none",
     hisa_stage2_rep_r: int = 4,
+    hisa_top_m: int | None = None,
     k_question: int = 4,
     k_hisa_evidence: int = 4,
     k_l3_skip: int = 2,
     pure_dsqg: bool = False,
     lr: float | None = None,
+    min_lr_ratio: float | None = None,
+    lr_warmup_steps: int | None = None,
+    seq_len: int | None = None,
+    resume: Path | str | None = None,
+    skip_opt: bool = False,
+    skip_sched: bool = False,
     dataset: Path | str = DEFAULT_DATASET,
     tokenizer: Path | str = DEFAULT_TOKENIZER,
     python: Path | str | None = None,
@@ -109,6 +127,17 @@ def build_run_config(
         "DWARF_DSQG_W_TYPED_MIXER": "1" if typed_mixer else "0",
         "DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK": str(int(typed_mixer_bottleneck)),
         "DWARF_DSQG_W_TYPED_MIXER_GATE_INIT": str(float(typed_mixer_gate_init)),
+        "DWARF_DSQG_W_EVIDENCE_BINDING_HUB": "1" if evidence_binding_hub else "0",
+        "DWARF_DSQG_W_EBH_BOTTLENECK": str(int(ebh_bottleneck)),
+        "DWARF_DSQG_W_EBH_GATE_INIT": str(float(ebh_gate_init)),
+        "DWARF_DSQG_W_EBH_PHASE_BANDS": str(int(ebh_phase_bands)),
+        "DWARF_DSQG_W_EBH_SCORE_FEATURES": "1" if ebh_score_features else "0",
+        "DWARF_DSQG_W_EBH_SOURCEWISE_PACKET": "1" if ebh_sourcewise_packet else "0",
+        "DWARF_DSQG_W_EVIDENCE_PRIOR": "1" if evidence_prior else "0",
+        "DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP": str(float(evidence_prior_clip)),
+        "DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE": str(float(evidence_prior_init_scale)),
+        "DWARF_DSQG_W_CANDIDATE_QUOTAS": "1" if candidate_quotas else "0",
+        "DWARF_DSQG_W_QUOTA_HISA_MAX": str(int(quota_hisa_max)),
         "DWARF_DSQG_W_QUERY_TYPE_BIAS": "1" if query_type_bias else "0",
         "DWARF_DSQG_W_TYPED_HISA_REPS": "1" if typed_hisa_reps else "0",
         "DWARF_DSQG_W_DSR_CANDIDATES": "1" if dsr_candidates else "0",
@@ -128,6 +157,20 @@ def build_run_config(
     }
     if lr is not None:
         env["DWARF_LR"] = str(float(lr))
+    if min_lr_ratio is not None:
+        env["DWARF_MIN_LR_RATIO"] = str(float(min_lr_ratio))
+    if lr_warmup_steps is not None:
+        env["DWARF_LR_WARMUP_STEPS"] = str(int(lr_warmup_steps))
+    if hisa_top_m is not None:
+        env["DWARF_HISA_TOP_M"] = str(int(hisa_top_m))
+    if seq_len is not None:
+        env["DWARF_SEQ_LEN"] = str(int(seq_len))
+    if resume is not None:
+        env["DWARF_RESUME"] = str(resume)
+    if skip_opt:
+        env["DWARF_SKIP_OPT"] = "1"
+    if skip_sched:
+        env["DWARF_SKIP_SCHED"] = "1"
     return {
         "objective": "dsqg_w_full_training_launcher",
         "run_name": run_name,
@@ -219,17 +262,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--typed-mixer", action="store_true", help="Enable the typed candidate-set mixer before DSQG-W scoring.")
     parser.add_argument("--typed-mixer-bottleneck", type=int, default=64)
     parser.add_argument("--typed-mixer-gate-init", type=float, default=-2.5)
+    parser.add_argument("--evidence-binding-hub", action="store_true", help="Enable the TPJ-like DSQG-W evidence binding hub before W scoring/readout.")
+    parser.add_argument("--ebh-bottleneck", type=int, default=256)
+    parser.add_argument("--ebh-gate-init", type=float, default=-5.0)
+    parser.add_argument("--ebh-phase-bands", type=int, default=4)
+    parser.add_argument("--no-ebh-score-features", action="store_true", help="Disable scalar score features in the EBH alignment path.")
+    parser.add_argument("--ebh-sourcewise-packet", action="store_true", help="Use sourcewise EBH packet accumulation instead of materializing [B,T,J,D] candidate states.")
+    parser.add_argument("--evidence-prior", action="store_true", help="Enable the DSQG-W scalar evidence/source/type prior composer.")
+    parser.add_argument("--evidence-prior-clip", type=float, default=2.0)
+    parser.add_argument("--evidence-prior-init-scale", type=float, default=0.0)
+    parser.add_argument("--candidate-quotas", action="store_true", help="Enable DSQG-W candidate quotas for HISA evidence slots.")
+    parser.add_argument("--quota-hisa-max", type=int, default=0)
     parser.add_argument("--query-type-bias", action="store_true", help="Enable query-conditioned candidate-type score bias.")
     parser.add_argument("--typed-hisa-reps", action="store_true", help="Label first four HISA evidence candidates as representative evidence slots.")
     parser.add_argument("--no-dsr-candidates", action="store_true", help="Disable direct HISA/DSR selected-token candidates and use fallback offset candidates only.")
     parser.add_argument("--local-offsets", default="none", help="Comma-separated DSQG-W local offset candidates; default none for D-fed W runs.")
     parser.add_argument("--long-offsets", default="none", help="Comma-separated DSQG-W long offset candidates; default none for D-fed W runs.")
     parser.add_argument("--hisa-stage2-rep-r", type=int, default=4, help="Query-representative HISA Stage-2 selector representatives; use 0 for legacy row-max diagnostic fallback.")
+    parser.add_argument("--hisa-top-m", type=int, default=None, help="HISA token-refinement top-m; 8192 CPT uses 16 to stay under Triton shared-memory limits when resuming 2048 checkpoints.")
     parser.add_argument("--k-question", type=int, default=4, help="Number of DSQG-W question candidates; use 0 to disable.")
     parser.add_argument("--k-hisa-evidence", type=int, default=4, help="Number of DSQG-W HISA evidence candidates; use 0 to disable.")
     parser.add_argument("--k-l3-skip", type=int, default=2, help="Number of DSQG-W L3 skip candidates; use 0 to disable.")
     parser.add_argument("--pure-dsqg", action="store_true", help="Disable HISA/DSR and run the pure DSQG-D v1 control layout.")
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--min-lr-ratio", type=float, default=None)
+    parser.add_argument("--lr-warmup-steps", type=int, default=None)
+    parser.add_argument("--seq-len", type=int, default=None)
+    parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--skip-opt", action="store_true", help="Skip optimizer state when resuming from a checkpoint.")
+    parser.add_argument("--skip-sched", action="store_true", help="Skip scheduler state when resuming from a checkpoint.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
@@ -272,17 +333,35 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         typed_mixer=args.typed_mixer,
         typed_mixer_bottleneck=args.typed_mixer_bottleneck,
         typed_mixer_gate_init=args.typed_mixer_gate_init,
+        evidence_binding_hub=args.evidence_binding_hub,
+        ebh_bottleneck=args.ebh_bottleneck,
+        ebh_gate_init=args.ebh_gate_init,
+        ebh_phase_bands=args.ebh_phase_bands,
+        ebh_score_features=not args.no_ebh_score_features,
+        ebh_sourcewise_packet=args.ebh_sourcewise_packet,
+        evidence_prior=args.evidence_prior,
+        evidence_prior_clip=args.evidence_prior_clip,
+        evidence_prior_init_scale=args.evidence_prior_init_scale,
+        candidate_quotas=args.candidate_quotas,
+        quota_hisa_max=args.quota_hisa_max,
         query_type_bias=args.query_type_bias,
         typed_hisa_reps=args.typed_hisa_reps,
         dsr_candidates=not args.no_dsr_candidates,
         local_offsets=args.local_offsets,
         long_offsets=args.long_offsets,
         hisa_stage2_rep_r=args.hisa_stage2_rep_r,
+        hisa_top_m=args.hisa_top_m,
         k_question=args.k_question,
         k_hisa_evidence=args.k_hisa_evidence,
         k_l3_skip=args.k_l3_skip,
         pure_dsqg=args.pure_dsqg,
         lr=args.lr,
+        min_lr_ratio=args.min_lr_ratio,
+        lr_warmup_steps=args.lr_warmup_steps,
+        seq_len=args.seq_len,
+        resume=args.resume,
+        skip_opt=args.skip_opt,
+        skip_sched=args.skip_sched,
         dataset=args.dataset,
         tokenizer=args.tokenizer,
         python=args.python,

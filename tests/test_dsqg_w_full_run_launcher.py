@@ -190,6 +190,63 @@ def test_full_run_launcher_can_enable_typed_mixer_and_query_rep_hisa_env(tmp_pat
     assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
 
 
+def test_full_run_launcher_can_enable_evidence_binding_hub_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "ebh_run",
+        run_name="ebh_unit",
+        evidence_binding_hub=True,
+        ebh_bottleneck=48,
+        ebh_gate_init=-2.0,
+        ebh_phase_bands=3,
+        ebh_score_features=False,
+        ebh_sourcewise_packet=True,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W_EVIDENCE_BINDING_HUB"] == "1"
+    assert env["DWARF_DSQG_W_EBH_BOTTLENECK"] == "48"
+    assert env["DWARF_DSQG_W_EBH_GATE_INIT"] == "-2.0"
+    assert env["DWARF_DSQG_W_EBH_PHASE_BANDS"] == "3"
+    assert env["DWARF_DSQG_W_EBH_SCORE_FEATURES"] == "0"
+    assert env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] == "1"
+
+
+def test_full_run_launcher_can_configure_cpt_resume_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+    resume = tmp_path / "seed.pt"
+    dataset = tmp_path / "cpt_8192.pt"
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "cpt_run",
+        run_name="cpt_unit",
+        dataset=dataset,
+        seq_len=8192,
+        resume=resume,
+        skip_opt=True,
+        skip_sched=True,
+        lr=2e-5,
+        min_lr_ratio=0.5,
+        lr_warmup_steps=0,
+        hisa_top_m=16,
+        batch_size=1,
+        grad_accum=16,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DATASET"] == str(dataset)
+    assert env["DWARF_SEQ_LEN"] == "8192"
+    assert env["DWARF_RESUME"] == str(resume)
+    assert env["DWARF_SKIP_OPT"] == "1"
+    assert env["DWARF_SKIP_SCHED"] == "1"
+    assert env["DWARF_LR"] == "2e-05"
+    assert env["DWARF_MIN_LR_RATIO"] == "0.5"
+    assert env["DWARF_LR_WARMUP_STEPS"] == "0"
+    assert env["DWARF_HISA_TOP_M"] == "16"
+
+
+
 def test_full_run_launcher_dry_run_writes_config_without_executing(tmp_path: Path) -> None:
     mod = load_launcher_module()
 

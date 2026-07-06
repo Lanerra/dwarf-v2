@@ -7,11 +7,13 @@ import torch
 import torch.nn as nn
 
 from kernels.dsqg_w.dsqg_w_mvp import (
+    CandidateEvidenceBit,
     CandidateProvider,
     CandidateSource,
     CandidateType,
     DSQGWBlock,
     DSQGWConfig,
+    DSQGWEvidencePriorComposer,
     DSQGWTypedCandidateMixer,
     answer_masked_loss,
     conditional_copy_unlikelihood_loss,
@@ -79,7 +81,61 @@ def test_candidate_provider_deduplicates_by_token_and_source_with_semantic_prior
     final_token3 = (t4_tokens == 3) & (t4_sources == int(CandidateSource.FINAL))
     assert final_token3.sum().item() == 1
     assert t4_types[final_token3].item() == int(CandidateType.QUESTION)
+    t4_bits = batch.evidence_bits[0, 4][batch.cand_mask[0, 4]]
+    collapsed_bits = int(t4_bits[final_token3].item())
+    assert collapsed_bits & int(CandidateEvidenceBit.QUESTION)
+    assert collapsed_bits & int(CandidateEvidenceBit.LOCAL)
+    assert collapsed_bits & int(CandidateEvidenceBit.LONG_OFFSET)
+    assert batch.evidence_count[0, 4][batch.cand_mask[0, 4]][final_token3].item() == 3
+    assert batch.telemetry["dsqg_w_candidate_multi_evidence_fraction"].item() > 0.0
     assert batch.telemetry["dsqg_w_candidate_duplicate_rate"].item() > 0.0
+
+
+def test_candidate_provider_quota_cap_preserves_non_hisa_candidates_when_enabled() -> None:
+    x = make_hidden(batch=1, seq=5)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=4,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=1,
+        k_hisa_evidence=4,
+        k_l3_skip=1,
+        k_chunk=0,
+        use_candidate_quotas=True,
+        quota_hisa_max=2,
+    )
+    provider = CandidateProvider(cfg)
+    positions = torch.arange(5)
+    hisa_indices = torch.stack(
+        [positions, (positions - 1).clamp_min(0), (positions - 2).clamp_min(0), (positions - 3).clamp_min(0)],
+        dim=-1,
+    ).unsqueeze(0)
+    hisa_scores = torch.tensor([0.4, 0.3, 0.2, 0.1], dtype=x.dtype).reshape(1, 1, 4).expand(1, 5, 4)
+    batch = provider.build(
+        x,
+        question_indices=torch.tensor([[0]]),
+        hisa_evidence_indices=hisa_indices,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=(positions - 1).clamp_min(0).view(1, 5, 1),
+    )
+
+    valid_types = batch.cand_types[0, 4][batch.cand_mask[0, 4]]
+    hisa_family_ids = torch.tensor(
+        [
+            int(CandidateType.HISA_EVIDENCE),
+            int(CandidateType.HISA_EVIDENCE_REP0),
+            int(CandidateType.HISA_EVIDENCE_REP1),
+            int(CandidateType.HISA_EVIDENCE_REP2),
+            int(CandidateType.HISA_EVIDENCE_REP3),
+        ],
+        dtype=valid_types.dtype,
+    )
+    hisa_family = torch.isin(valid_types, hisa_family_ids)
+    assert hisa_family.sum().item() <= 2
+    assert (valid_types == int(CandidateType.QUESTION)).any()
+    assert batch.telemetry["dsqg_w_candidate_quota_hisa_clipped_fraction"].item() > 0.0
 
 
 def test_candidate_provider_preserves_and_prioritizes_dsr_scores_without_offsets() -> None:
@@ -149,6 +205,36 @@ def test_dsqg_w_block_uses_candidate_scores_as_measurable_routing_bias() -> None
     probs = telemetry["dsqg_w_probs"].mean(dim=-1)
     assert cands.cand_scores[0, 3, 0].item() > cands.cand_scores[0, 3, 1].item()
     assert probs[0, 3, 0].item() > probs[0, 3, 1].item()
+
+
+def test_evidence_prior_composer_zero_init_is_centered_noop_with_telemetry() -> None:
+    composer = DSQGWEvidencePriorComposer(n_types=len(CandidateType), n_sources=len(CandidateSource), clip=2.0)
+    cand_types = torch.tensor([[[int(CandidateType.HISA_EVIDENCE), int(CandidateType.QUESTION), int(CandidateType.LOCAL)]]])
+    cand_sources = torch.tensor([[[int(CandidateSource.HISA), int(CandidateSource.FINAL), int(CandidateSource.FINAL)]]])
+    cand_mask = torch.ones_like(cand_types, dtype=torch.bool)
+    cand_scores = torch.tensor([[[5.0, 0.0, -1.0]]])
+    evidence_bits = torch.tensor([[[
+        int(CandidateEvidenceBit.HISA) | int(CandidateEvidenceBit.QUESTION),
+        int(CandidateEvidenceBit.QUESTION),
+        int(CandidateEvidenceBit.LOCAL),
+    ]]])
+    evidence_count = torch.tensor([[[2, 1, 1]]])
+    distances = torch.tensor([[[4, 2, 1]]])
+
+    prior, telemetry = composer(
+        cand_types,
+        cand_sources,
+        cand_mask,
+        raw_hisa_scores=cand_scores,
+        evidence_bits=evidence_bits,
+        evidence_count=evidence_count,
+        candidate_distances=distances,
+    )
+
+    assert torch.equal(prior, torch.zeros_like(prior))
+    assert telemetry["dsqg_w_prior_norm"].item() == 0.0
+    assert telemetry["dsqg_w_prior_clip_fraction"].item() == 0.0
+    assert telemetry["dsqg_w_prior_multi_evidence_fraction"].item() > 0.0
 
 
 def test_candidate_provider_fast_path_matches_reference_candidate_layout() -> None:
