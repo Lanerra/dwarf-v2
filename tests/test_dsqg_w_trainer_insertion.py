@@ -25,6 +25,8 @@ def load_trainer(
     fast_evidence_mean: bool = False,
     width_cell: bool = False,
     typed_mixer: bool = False,
+    evidence_binding_hub: bool = False,
+    ebh_sourcewise_packet: bool = False,
 ):
     monkeypatch.setenv("DWARF_DISABLE_BNB", "1")
     monkeypatch.setenv("DWARF_LIGER", "0")
@@ -59,6 +61,23 @@ def load_trainer(
             monkeypatch.setenv("DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK", "64")
         else:
             monkeypatch.delenv("DWARF_DSQG_W_TYPED_MIXER", raising=False)
+        if evidence_binding_hub:
+            monkeypatch.setenv("DWARF_DSQG_W_EVIDENCE_BINDING_HUB", "1")
+            monkeypatch.setenv("DWARF_DSQG_W_EBH_BOTTLENECK", "64")
+            monkeypatch.setenv("DWARF_DSQG_W_EBH_GATE_INIT", "-2.0")
+            monkeypatch.setenv("DWARF_DSQG_W_EBH_PHASE_BANDS", "3")
+            monkeypatch.setenv("DWARF_DSQG_W_EBH_SCORE_FEATURES", "0")
+            if ebh_sourcewise_packet:
+                monkeypatch.setenv("DWARF_DSQG_W_EBH_SOURCEWISE_PACKET", "1")
+            else:
+                monkeypatch.delenv("DWARF_DSQG_W_EBH_SOURCEWISE_PACKET", raising=False)
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_EVIDENCE_BINDING_HUB", raising=False)
+            monkeypatch.delenv("DWARF_DSQG_W_EBH_BOTTLENECK", raising=False)
+            monkeypatch.delenv("DWARF_DSQG_W_EBH_GATE_INIT", raising=False)
+            monkeypatch.delenv("DWARF_DSQG_W_EBH_PHASE_BANDS", raising=False)
+            monkeypatch.delenv("DWARF_DSQG_W_EBH_SCORE_FEATURES", raising=False)
+            monkeypatch.delenv("DWARF_DSQG_W_EBH_SOURCEWISE_PACKET", raising=False)
         if sites is not None:
             monkeypatch.setenv("DWARF_DSQG_W_SITES", sites)
         else:
@@ -83,6 +102,7 @@ def load_trainer(
         monkeypatch.delenv("DWARF_DSQG_W_HISA_L3", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_WIDTH_CELL", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_TYPED_MIXER", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_EVIDENCE_BINDING_HUB", raising=False)
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "kernels"))
     try:
@@ -312,6 +332,44 @@ def test_training_candidate_indices_populate_width_semantic_types(monkeypatch) -
     positions = torch.arange(12).view(1, 12, 1)
     assert torch.le(hisa, positions).all()
     assert torch.le(l3_skip, positions).all()
+
+
+def test_evaluate_uses_training_candidate_indices_for_validation_forward(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True, hisa_l3=True)
+    rows = max(2, mod.BATCH_SIZE // 2)
+    data = torch.randint(0, 128, (rows, 9), dtype=torch.long)
+    loss_mask = torch.ones_like(data, dtype=torch.bool)
+    seen = []
+
+    class FakeOut:
+        weight = torch.zeros(128, mod.EMBEDDING_DIM)
+
+    class FakeModel:
+        out = FakeOut()
+
+        def eval(self):
+            return self
+
+        def forward_hidden(self, x, **kwargs):
+            seen.append(kwargs)
+            return torch.zeros(x.shape[0], x.shape[1], mod.EMBEDDING_DIM)
+
+    def fake_loss(hidden, targets, weight, *, chunk_rows, grad_denom=None, loss_mask=None):
+        assert loss_mask is not None
+        return hidden.new_tensor(0.0), int(loss_mask.sum().item())
+
+    monkeypatch.setattr(mod, "_streamed_linear_ce_loss", fake_loss)
+
+    loss = mod.evaluate(FakeModel(), data, "cpu", loss_mask=loss_mask)
+
+    assert loss == 0.0
+    assert seen
+    assert seen[0]["dsqg_w_question_indices"] is not None
+    assert seen[0]["dsqg_w_hisa_evidence_indices"] is not None
+    assert seen[0]["dsqg_w_l3_skip_indices"] is not None
+    assert seen[0]["dsqg_w_question_indices"].shape == (rows, mod.DSQG_W_K_QUESTION)
+    assert seen[0]["dsqg_w_hisa_evidence_indices"].shape[:2] == data[:, :-1].shape
+    assert seen[0]["dsqg_w_l3_skip_indices"].shape[:2] == data[:, :-1].shape
 
 
 def test_dsqg_w_sites_apply_layer_and_final_recomposers_in_order(monkeypatch) -> None:
@@ -547,6 +605,64 @@ def test_dsqg_w_triton_sourcewise_env_is_training_smoke_accepted_on_cuda(monkeyp
     assert model.dsqg_w_last_telemetry["dsqg_w_triton_sourcewise_recompute_backward"].item() == 0.0
     assert model.dsqg_w_last_telemetry["dsqg_w_triton_compact_read_backward"].item() == 1.0
     assert model.dsqg_w.read_mix.weight.grad is not None
+
+
+def test_dsqg_w_evidence_binding_hub_env_wires_trainable_recomposer(monkeypatch) -> None:
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        sourcewise=True,
+        evidence_binding_hub=True,
+    )
+    model = make_model(mod).train()
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    l3_states = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+
+    out = model._apply_dsqg_w_recomposer(x, l3_states=l3_states)
+    out.float().square().mean().backward()
+
+    assert mod.DSQG_W_EVIDENCE_BINDING_HUB is True
+    assert model.dsqg_w_config.use_evidence_binding_hub is True
+    assert model.dsqg_w_config.ebh_bottleneck == 64
+    assert model.dsqg_w_config.ebh_gate_init == pytest.approx(-2.0)
+    assert model.dsqg_w_config.ebh_phase_bands == 3
+    assert model.dsqg_w_config.ebh_score_features is False
+    assert model.dsqg_w.evidence_binding_hub is not None
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    telemetry = model.dsqg_w_last_telemetry
+    assert telemetry["dsqg_w_ebh_enabled"].item() == 1.0
+    assert telemetry["dsqg_w_sourcewise_ebh_materialized"].item() == 1.0
+    assert model.dsqg_w.evidence_binding_hub.value_proj.weight.grad is not None
+    assert model.dsqg_w.evidence_binding_hub.bind_gate.weight.grad is not None
+
+
+def test_dsqg_w_evidence_binding_hub_sourcewise_packet_env_wires_fast_path(monkeypatch) -> None:
+    mod = load_trainer(
+        monkeypatch,
+        dsqg_w=True,
+        question=True,
+        hisa_l3=True,
+        sourcewise=True,
+        evidence_binding_hub=True,
+        ebh_sourcewise_packet=True,
+    )
+    model = make_model(mod).train()
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+    l3_states = torch.randn(2, 8, mod.EMBEDDING_DIM, requires_grad=True)
+
+    out = model._apply_dsqg_w_recomposer(x, l3_states=l3_states)
+    out.float().square().mean().backward()
+
+    telemetry = model.dsqg_w_last_telemetry
+    assert mod.DSQG_W_EBH_SOURCEWISE_PACKET is True
+    assert telemetry["dsqg_w_sourcewise_ebh_materialized"].item() == pytest.approx(0.0)
+    assert telemetry["dsqg_w_ebh_packet_sourcewise"].item() == pytest.approx(1.0)
+    assert telemetry["dsqg_w_ebh_packet_semantic_approx"].item() == pytest.approx(0.0)
+    assert model.dsqg_w.evidence_binding_hub is not None
+    assert model.dsqg_w.evidence_binding_hub.value_proj.weight.grad is not None
 
 
 def test_dsqg_w_gate_lr_multiplier_puts_all_w_gates_in_dedicated_adamw_group(monkeypatch) -> None:

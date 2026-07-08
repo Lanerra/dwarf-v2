@@ -14,9 +14,18 @@ results/
 runs/
 wandb/
 .codegraph/
+.hermes/
 *.log
 *.ncu-rep
 *.qdstrm
+
+# Keep git focused on implementation source. Research notes, plans,
+# measurement dumps, and ad-hoc JSON outputs stay local unless explicitly
+# whitelisted as required runtime assets.
+docs/
+*.md
+*.json
+!tokenizers/*_tokenizer.json
 
 # Large local artifacts: keep present for local trainer runs, but do not commit.
 datasets/*.pt

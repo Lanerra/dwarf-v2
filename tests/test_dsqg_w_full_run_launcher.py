@@ -246,6 +246,10 @@ def test_full_run_launcher_can_configure_cpt_resume_env(tmp_path: Path) -> None:
     assert env["DWARF_HISA_TOP_M"] == "16"
 
 
+def test_trainer_seq_len_is_env_configurable_for_cpt() -> None:
+    trainer = (ROOT / "train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py").read_text()
+    assert "MAX_SEQ_LEN    = int(os.environ.get('DWARF_SEQ_LEN', '2048'))" in trainer
+
 
 def test_full_run_launcher_dry_run_writes_config_without_executing(tmp_path: Path) -> None:
     mod = load_launcher_module()

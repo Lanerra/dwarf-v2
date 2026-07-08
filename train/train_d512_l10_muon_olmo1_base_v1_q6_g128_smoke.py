@@ -255,7 +255,7 @@ DROPOUT   = 0.1
 BATCH_SIZE     = int(os.environ.get('DWARF_BS', '20'))
 GRAD_ACCUM     = int(os.environ.get('DWARF_GA', '20'))
 MAX_TRAIN_SEQS = int(os.environ.get('DWARF_MAX_TRAIN_SEQS', '976562'))
-MAX_SEQ_LEN    = 2048
+MAX_SEQ_LEN    = int(os.environ.get('DWARF_SEQ_LEN', '2048'))
 MAX_VAL_SEQS   = int(os.environ.get('DWARF_MAX_VAL_SEQS', '8192'))
 CE_CHUNK       = int(os.environ.get('DWARF_CE_ROWS', '2048'))  # rows per streamed final-projection CE chunk
 PIN_DATASET    = os.getenv('DWARF_PIN_DATASET', '0') == '1'
@@ -356,6 +356,7 @@ DSQG_W_ENABLED = os.getenv('DWARF_DSQG_W', '0') == '1'
 DSQG_W_SOURCEWISE = os.getenv('DWARF_DSQG_W_SOURCEWISE', '0') == '1'
 DSQG_W_TRITON_SOURCEWISE = os.getenv('DWARF_DSQG_W_TRITON_SOURCEWISE', '0') == '1'
 DSQG_W_DETACH_RECOMPOSER = os.getenv('DWARF_DSQG_W_DETACH_RECOMPOSER', '0') == '1'
+DSQG_W_ACTIVE_SITE_MODE = os.getenv('DWARF_DSQG_W_ACTIVE_SITE_MODE', 'all').strip().lower()
 DSQG_W_FAST_EVIDENCE_MEAN = os.getenv('DWARF_DSQG_W_FAST_EVIDENCE_MEAN', '0') == '1'
 DSQG_W_MAX_CANDIDATES = int(os.environ.get('DWARF_DSQG_W_MAX_CANDIDATES', '32'))
 DSQG_W_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_BOTTLENECK', '256'))
@@ -373,6 +374,17 @@ DSQG_W_TYPED_MIXER_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_TYPED_MIXER_BOT
 DSQG_W_TYPED_MIXER_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_TYPED_MIXER_GATE_INIT', '-5.0'))
 DSQG_W_QUERY_TYPE_BIAS = os.getenv('DWARF_DSQG_W_QUERY_TYPE_BIAS', '0') == '1'
 DSQG_W_TYPED_HISA_REPS = os.getenv('DWARF_DSQG_W_TYPED_HISA_REPS', '0') == '1'
+DSQG_W_EVIDENCE_BINDING_HUB = os.getenv('DWARF_DSQG_W_EVIDENCE_BINDING_HUB', '0') == '1'
+DSQG_W_EBH_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_EBH_BOTTLENECK', '256'))
+DSQG_W_EBH_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_EBH_GATE_INIT', '-5.0'))
+DSQG_W_EBH_PHASE_BANDS = int(os.environ.get('DWARF_DSQG_W_EBH_PHASE_BANDS', '4'))
+DSQG_W_EBH_SCORE_FEATURES = os.getenv('DWARF_DSQG_W_EBH_SCORE_FEATURES', '1') != '0'
+DSQG_W_EBH_SOURCEWISE_PACKET = os.getenv('DWARF_DSQG_W_EBH_SOURCEWISE_PACKET', '0') == '1'
+DSQG_W_EVIDENCE_PRIOR = os.getenv('DWARF_DSQG_W_EVIDENCE_PRIOR', '0') == '1'
+DSQG_W_EVIDENCE_PRIOR_CLIP = float(os.environ.get('DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP', '2.0'))
+DSQG_W_EVIDENCE_PRIOR_INIT_SCALE = float(os.environ.get('DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE', '0.0'))
+DSQG_W_CANDIDATE_QUOTAS = os.getenv('DWARF_DSQG_W_CANDIDATE_QUOTAS', '0') == '1'
+DSQG_W_QUOTA_HISA_MAX = int(os.environ.get('DWARF_DSQG_W_QUOTA_HISA_MAX', '0'))
 DSQG_W_DSR_CANDIDATES = os.getenv('DWARF_DSQG_W_DSR_CANDIDATES', '1') != '0'
 DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2, 4, 8))
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
@@ -3051,6 +3063,8 @@ class TriadicJ96Dsr(nn.Module):
         }
         self.dsqg_w_has_final_site = 'final' in self.dsqg_w_site_specs
         self.dsqg_w_last_telemetry = {}
+        self._dsqg_w_forward_counter = 0
+        self._dsqg_w_active_site_key = None
         self._dsqg_w_metadata_cache = {}
         self._init_weights(scale_embed_init_val)
         if self.dsqg_w_enabled:
@@ -3087,6 +3101,16 @@ class TriadicJ96Dsr(nn.Module):
                 typed_mixer_gate_init=DSQG_W_TYPED_MIXER_GATE_INIT,
                 use_query_type_bias=DSQG_W_QUERY_TYPE_BIAS,
                 typed_hisa_reps=DSQG_W_TYPED_HISA_REPS,
+                use_evidence_binding_hub=DSQG_W_EVIDENCE_BINDING_HUB,
+                ebh_bottleneck=DSQG_W_EBH_BOTTLENECK,
+                ebh_gate_init=DSQG_W_EBH_GATE_INIT,
+                ebh_phase_bands=DSQG_W_EBH_PHASE_BANDS,
+                ebh_score_features=DSQG_W_EBH_SCORE_FEATURES,
+                use_evidence_prior=DSQG_W_EVIDENCE_PRIOR,
+                evidence_prior_clip=DSQG_W_EVIDENCE_PRIOR_CLIP,
+                evidence_prior_init_scale=DSQG_W_EVIDENCE_PRIOR_INIT_SCALE,
+                use_candidate_quotas=DSQG_W_CANDIDATE_QUOTAS,
+                quota_hisa_max=DSQG_W_QUOTA_HISA_MAX,
             )
             self.dsqg_w_candidate_provider = CandidateProvider(self.dsqg_w_config)
             for site_key in self.dsqg_w_site_keys:
@@ -3136,6 +3160,32 @@ class TriadicJ96Dsr(nn.Module):
                                                 _sac_policy_fn))
         return grad_ckpt(block, x, use_reentrant=False)
 
+    def _begin_dsqg_w_forward(self):
+        if not self.dsqg_w_enabled or not self.training:
+            self._dsqg_w_active_site_key = None
+            return
+        mode = DSQG_W_ACTIVE_SITE_MODE
+        if mode in ('', 'all', 'always'):
+            self._dsqg_w_active_site_key = None
+            return
+        if mode in ('cycle', 'round_robin', 'round-robin'):
+            site_count = max(1, len(self.dsqg_w_site_keys))
+            active_idx = int(self._dsqg_w_forward_counter) % site_count
+            self._dsqg_w_active_site_key = self.dsqg_w_site_keys[active_idx]
+            self._dsqg_w_forward_counter += 1
+            return
+        if mode in self.dsqg_w_site_keys:
+            self._dsqg_w_active_site_key = mode
+            return
+        raise ValueError(
+            'DWARF_DSQG_W_ACTIVE_SITE_MODE must be all, cycle, round_robin, '
+            f'or one of {self.dsqg_w_site_keys}; got {mode!r}'
+        )
+
+    def _dsqg_w_site_active(self, site_key):
+        active_site = self._dsqg_w_active_site_key
+        return active_site is None or str(site_key) == str(active_site)
+
     def _forward_trunk(
         self,
         idx,
@@ -3159,7 +3209,11 @@ class TriadicJ96Dsr(nn.Module):
                 dsr_hisa_evidence_indices, dsr_hisa_evidence_scores = self._dsqg_w_dsr_selected_candidates(idx.shape[1])
             if collect_l3_state and i == self.dsr_layer:
                 l3_state = x
-            if self.dsqg_w_enabled and i in self.dsqg_w_layer_site_map:
+            if (
+                self.dsqg_w_enabled
+                and i in self.dsqg_w_layer_site_map
+                and self._dsqg_w_site_active(self.dsqg_w_layer_site_map[i])
+            ):
                 x = self._apply_dsqg_w_recomposer(
                     x,
                     site_key=self.dsqg_w_layer_site_map[i],
@@ -3406,6 +3460,7 @@ class TriadicJ96Dsr(nn.Module):
             merged_telemetry['dsqg_w_site_key'] = site_key
             merged_telemetry['dsqg_w_metadata_cache_hit'] = x.new_tensor(0.0).detach()
             merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if effective_detach_recomposer else 0.0).detach()
+            merged_telemetry['dsqg_w_active_site_cycle'] = x.new_tensor(1.0 if self._dsqg_w_active_site_key is not None else 0.0).detach()
             merged_telemetry['dsqg_w_fast_evidence_mean_bypass'] = x.new_tensor(1.0).detach()
             self.dsqg_w_last_telemetry = merged_telemetry
             if effective_detach_recomposer:
@@ -3430,6 +3485,9 @@ class TriadicJ96Dsr(nn.Module):
                         candidates.cand_mask,
                         l3_states=recomposer_l3_states,
                         cand_scores=candidates.cand_scores,
+                        evidence_bits=candidates.evidence_bits,
+                        evidence_count=candidates.evidence_count,
+                        candidate_distances=candidates.candidate_distances,
                         needed_source_ids=candidates.active_source_ids,
                     )
                 else:
@@ -3450,12 +3508,16 @@ class TriadicJ96Dsr(nn.Module):
                         candidates.cand_sources,
                         candidates.cand_mask,
                         cand_scores=candidates.cand_scores,
+                        evidence_bits=candidates.evidence_bits,
+                        evidence_count=candidates.evidence_count,
+                        candidate_distances=candidates.candidate_distances,
                     )
         merged_telemetry = dict(candidates.telemetry)
         merged_telemetry.update(telemetry)
         merged_telemetry['dsqg_w_site_key'] = site_key
         merged_telemetry['dsqg_w_metadata_cache_hit'] = x.new_tensor(1.0 if metadata_cache_hit else 0.0).detach()
         merged_telemetry['dsqg_w_detached_recomposer'] = x.new_tensor(1.0 if effective_detach_recomposer else 0.0).detach()
+        merged_telemetry['dsqg_w_active_site_cycle'] = x.new_tensor(1.0 if self._dsqg_w_active_site_key is not None else 0.0).detach()
         merged_telemetry['dsqg_w_fast_evidence_mean_requested'] = x.new_tensor(1.0 if DSQG_W_FAST_EVIDENCE_MEAN else 0.0).detach()
         merged_telemetry['dsqg_w_fast_evidence_mean_bypass'] = x.new_tensor(0.0).detach()
         merged_telemetry['dsqg_w_force_trainable_candidate_path'] = x.new_tensor(1.0 if force_trainable_candidate_path else 0.0).detach()
@@ -3473,6 +3535,7 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_l3_skip_indices=None,
     ):
         self._dsqg_w_metadata_cache = {}
+        self._begin_dsqg_w_forward()
         if self.dsqg_w_enabled:
             trunk_out, l3_state, dsr_hisa_indices, dsr_hisa_scores = self._forward_trunk(
                 idx,
@@ -3485,7 +3548,7 @@ class TriadicJ96Dsr(nn.Module):
             trunk_out = self._forward_trunk(idx)
             l3_state = None
         x = trunk_out
-        if self.dsqg_w_enabled and self.dsqg_w_has_final_site:
+        if self.dsqg_w_enabled and self.dsqg_w_has_final_site and self._dsqg_w_site_active('final'):
             x = self._apply_dsqg_w_recomposer(
                 trunk_out,
                 site_key='final',
@@ -3510,6 +3573,7 @@ class TriadicJ96Dsr(nn.Module):
         dsqg_w_l3_skip_indices=None,
     ):
         self._dsqg_w_metadata_cache = {}
+        self._begin_dsqg_w_forward()
         if self.dsqg_w_enabled:
             trunk_out, l3_state, dsr_hisa_indices, dsr_hisa_scores = self._forward_trunk(
                 idx,
@@ -3522,7 +3586,7 @@ class TriadicJ96Dsr(nn.Module):
             trunk_out = self._forward_trunk(idx)
             l3_state = None
         x = trunk_out
-        if self.dsqg_w_enabled and self.dsqg_w_has_final_site:
+        if self.dsqg_w_enabled and self.dsqg_w_has_final_site and self._dsqg_w_site_active('final'):
             x = self._apply_dsqg_w_recomposer(
                 trunk_out,
                 site_key='final',
@@ -3715,6 +3779,7 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'hisa_l3_enabled': DSQG_W_HISA_L3_ENABLED,
                 'k_hisa_evidence': DSQG_W_K_HISA_EVIDENCE,
                 'k_l3_skip': DSQG_W_K_L3_SKIP,
+                'ebh_sourcewise_packet': DSQG_W_EBH_SOURCEWISE_PACKET,
                 'candidate_path': _dsqg_w_candidate_path_label(),
             },
             'params': n_params,
@@ -4180,8 +4245,14 @@ def evaluate(model, data, device, loss_mask=None):
         target_mask = None
         if loss_mask is not None:
             target_mask = loss_mask[i:i+bs, 1:].to(device, non_blocking=True)
+        dsqg_w_question_indices, dsqg_w_hisa_evidence_indices, dsqg_w_l3_skip_indices = _dsqg_w_training_candidate_indices(x)
         with _amp_context(device):
-            hidden = model.forward_hidden(x)
+            hidden = model.forward_hidden(
+                x,
+                dsqg_w_question_indices=dsqg_w_question_indices,
+                dsqg_w_hisa_evidence_indices=dsqg_w_hisa_evidence_indices,
+                dsqg_w_l3_skip_indices=dsqg_w_l3_skip_indices,
+            )
             loss_sum, n_rows = _streamed_linear_ce_loss(
                 hidden, y, model_ref.out.weight,
                 chunk_rows=CE_CHUNK,
@@ -4366,6 +4437,9 @@ def train():
               f'width_entropy_floor={DSQG_W_WIDTH_ENTROPY_FLOOR} width_entropy_weight={DSQG_W_WIDTH_ENTROPY_WEIGHT} '
               f'typed_mixer={DSQG_W_TYPED_MIXER} typed_mixer_bottleneck={DSQG_W_TYPED_MIXER_BOTTLENECK} '
               f'typed_mixer_gate_init={DSQG_W_TYPED_MIXER_GATE_INIT} query_type_bias={DSQG_W_QUERY_TYPE_BIAS} '
+              f'evidence_binding_hub={DSQG_W_EVIDENCE_BINDING_HUB} ebh_bottleneck={DSQG_W_EBH_BOTTLENECK} '
+              f'ebh_gate_init={DSQG_W_EBH_GATE_INIT} ebh_phase_bands={DSQG_W_EBH_PHASE_BANDS} '
+              f'ebh_score_features={DSQG_W_EBH_SCORE_FEATURES} ebh_sourcewise_packet={DSQG_W_EBH_SOURCEWISE_PACKET} '
               f'typed_hisa_reps={DSQG_W_TYPED_HISA_REPS} dsr_candidates={DSQG_W_DSR_CANDIDATES} '
               f'candidates={candidate_path}')
     else:
@@ -4413,6 +4487,11 @@ def train():
     # Keep cached sequences compact on host; cast targets to int64 per batch for CE.
     train_data = _cache['train'].to(dtype=torch.int32).contiguous()
     val_data = _cache['val'].to(dtype=torch.int32).contiguous()
+    if train_data.size(1) != MAX_SEQ_LEN or val_data.size(1) != MAX_SEQ_LEN:
+        raise ValueError(
+            f'Dataset sequence length mismatch: train={train_data.size(1)} val={val_data.size(1)} '
+            f'but DWARF_SEQ_LEN/MAX_SEQ_LEN={MAX_SEQ_LEN}'
+        )
     train_loss_mask, val_loss_mask, loss_mask_stats = _prepare_dataset_loss_masks(
         _cache, train_data, val_data, use_liger_ce=USE_LIGER_CE
     )
@@ -4536,8 +4615,15 @@ def train():
     if resume_path and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            incompatible = model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                print(
+                    f'  [resume] missing_keys={len(incompatible.missing_keys)} '
+                    f'unexpected_keys={len(incompatible.unexpected_keys)}',
+                    flush=True,
+                )
             skip_opt = os.getenv('DWARF_SKIP_OPT', '0') == '1'
+            skip_sched = os.getenv('DWARF_SKIP_SCHED', '0') == '1'
             if not skip_opt:
                 try:
                     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -4545,7 +4631,9 @@ def train():
                     print(f'  [resume] optimizer state mismatch ({_oe}); starting fresh optimizer')
             else:
                 print('  [resume] skipping optimizer state (DWARF_SKIP_OPT=1)')
-            if 'scheduler_state_dict' in ckpt:
+            if skip_sched:
+                print('  [resume] skipping scheduler state (DWARF_SKIP_SCHED=1)')
+            elif 'scheduler_state_dict' in ckpt:
                 scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         else:
             model.load_state_dict(ckpt, strict=False)
@@ -4752,10 +4840,16 @@ def train():
                         ('dsqg_w_width_entropy_penalty', 'w_width_ep'),
                         ('dsqg_w_width_rel_diff_score_norm', 'w_rel_diff'),
                         ('dsqg_w_width_rel_prod_score_norm', 'w_rel_prod'),
+                        ('dsqg_w_ebh_enabled', 'w_ebh'),
+                        ('dsqg_w_ebh_delta_to_x_ratio', 'w_ebh_dx'),
+                        ('dsqg_w_ebh_bound_packet_norm', 'w_ebh_pkt'),
+                        ('dsqg_w_ebh_active_row_fraction', 'w_ebh_active'),
+                        ('dsqg_w_sourcewise_ebh_materialized', 'w_ebh_mat'),
                         ('dsqg_w_metadata_cache_hit', 'w_cache'),
                         ('dsqg_w_static_source_count', 'w_srcs'),
                         ('dsqg_w_candidate_slot_count', 'w_j'),
                         ('dsqg_w_detached_recomposer', 'w_det'),
+                        ('dsqg_w_active_site_cycle', 'w_site_cycle'),
                         ('dsqg_w_fast_evidence_mean', 'w_fast'),
                         ('dsqg_w_fast_evidence_mean_bypass', 'w_fast_bypass'),
                         ('dsqg_w_force_trainable_candidate_path', 'w_trainable'),
@@ -4763,6 +4857,7 @@ def train():
                         ('dsqg_w_triton_sourcewise_semantic_bypass', 'w_sem_bypass'),
                         ('dsqg_w_geometry_fixed_slots', 'w_fixed'),
                         ('dsqg_w_geometry_slab_candidate_slots', 'w_slab'),
+                        ('dsqg_w_triton_backward_source_grad_every', 'w_src_every'),
                     ]:
                         _val = _tel_float(_name)
                         if _val is not None and math.isfinite(_val):
@@ -4771,6 +4866,7 @@ def train():
                         ('dsqg_w_gate_logit_mean', 'w_gate_logit'),
                         ('dsqg_w_typed_mixer_gate_logit_mean', 'w_mix_gate_logit'),
                         ('dsqg_w_width_gate_logit_mean', 'w_width_gate_logit'),
+                        ('dsqg_w_ebh_bind_gate_logit_mean', 'w_ebh_gate_logit'),
                     ]:
                         _val = _tel_float(_name)
                         if _val is not None and math.isfinite(_val):
