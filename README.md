@@ -36,13 +36,7 @@ The default tokenizer is committed at:
 tokenizers/olmo1_gpt_neox_dolma_v1_5_tokenizer.json
 ```
 
-Training data is not committed. Place a compatible tokenized dataset at the default path:
-
-```text
-datasets/dwarf_base_v1_olmo1tok_2048_2b.pt
-```
-
-or pass another dataset path with `--dataset` / `DWARF_DATASET`.
+Training data is not committed. Compatible tokenized datasets can be passed via `--dataset` / `DWARF_DATASET`.
 
 ## Run a small training smoke
 
