@@ -25,6 +25,7 @@ wandb/
 docs/
 *.md
 *.json
+!README.md
 !tokenizers/*_tokenizer.json
 
 # Large local artifacts: keep present for local trainer runs, but do not commit.
