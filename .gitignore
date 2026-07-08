@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.venv
 .venv/
 venv/
 
@@ -19,6 +20,8 @@ wandb/
 *.qdstrm
 
 # Large local artifacts: keep present for local trainer runs, but do not commit.
+datasets
+datasets/
 datasets/*.pt
 datasets/*.pth
 datasets/*.npy
@@ -32,3 +35,14 @@ checkpoints/*.pth
 .DS_Store
 .vscode/
 .idea/
+
+# Public/source-only repository hygiene.
+# Keep README.md for GitHub rendering; keep tokenizer asset JSONs; keep docs,
+# measurement reports, plans, run manifests, and eval outputs local.
+docs/
+.hermes/
+*.md
+!README.md
+*.json
+!tokenizers/
+!tokenizers/*_tokenizer.json
