@@ -240,6 +240,7 @@ SCALE_EMBED_INIT_VAL = 0.15
 SCALE_EMBED_LR_MULT  = float(os.environ.get('DWARF_SCALE_EMBED_LR_MULT', '8.0'))
 EMA_INIT  = 0.020833
 EMA_FLOOR = 0.00001
+PRE_HISA_EMA_ENABLED = os.getenv('DWARF_PRE_HISA_EMA', '1') == '1'
 LR        = float(os.environ.get('DWARF_LR', '3e-4'))
 WEIGHT_DECAY = float(os.environ.get('DWARF_WEIGHT_DECAY', '0.1'))
 PHASE_LR_MULT = float(os.environ.get('DWARF_PHASE_LR_MULT', '10.0'))
@@ -379,7 +380,11 @@ DSQG_W_EBH_BOTTLENECK = int(os.environ.get('DWARF_DSQG_W_EBH_BOTTLENECK', '256')
 DSQG_W_EBH_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_EBH_GATE_INIT', '-5.0'))
 DSQG_W_EBH_PHASE_BANDS = int(os.environ.get('DWARF_DSQG_W_EBH_PHASE_BANDS', '4'))
 DSQG_W_EBH_SCORE_FEATURES = os.getenv('DWARF_DSQG_W_EBH_SCORE_FEATURES', '1') != '0'
+DSQG_W_EBH_PAIR_MIXER = os.getenv('DWARF_DSQG_W_EBH_PAIR_MIXER', '0') == '1'
+DSQG_W_EBH_PAIR_RANK = int(os.environ.get('DWARF_DSQG_W_EBH_PAIR_RANK', '64'))
+DSQG_W_EBH_PAIR_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_EBH_PAIR_GATE_INIT', '-2.5'))
 DSQG_W_EBH_SOURCEWISE_PACKET = os.getenv('DWARF_DSQG_W_EBH_SOURCEWISE_PACKET', '0') == '1'
+DSQG_W_EBH_TRITON_LANE_ACCUM = os.getenv('DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM', '0') == '1'
 DSQG_W_EVIDENCE_PRIOR = os.getenv('DWARF_DSQG_W_EVIDENCE_PRIOR', '0') == '1'
 DSQG_W_EVIDENCE_PRIOR_CLIP = float(os.environ.get('DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP', '2.0'))
 DSQG_W_EVIDENCE_PRIOR_INIT_SCALE = float(os.environ.get('DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE', '0.0'))
@@ -532,9 +537,75 @@ _PURE_DSQG_LAYER_LAYOUT = [
     ('C', GROUP_C, J_SMALL_C, J_LARGE_C, False),   # L09
 ]
 
-LAYER_LAYOUT = _PURE_DSQG_LAYER_LAYOUT if PURE_DSQG_BASELINE else _HISA_LAYER_LAYOUT
+_BASE_LAYER_LAYOUT = _PURE_DSQG_LAYER_LAYOUT if PURE_DSQG_BASELINE else _HISA_LAYER_LAYOUT
+LAYER_LAYOUT = [
+    (label, offsets, js, jl, has_if and PRE_HISA_EMA_ENABLED)
+    for label, offsets, js, jl, has_if in _BASE_LAYER_LAYOUT
+]
 
 assert len(LAYER_LAYOUT) == NUM_LAYERS
+if not PRE_HISA_EMA_ENABLED:
+    print('  Pre-HISA causal EMA/preIF disabled (DWARF_PRE_HISA_EMA=0)')
+
+
+def _env_float_or_none(name):
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == '':
+        return None
+    return float(raw)
+
+
+def _dsqg_w_legacy_mode_labels():
+    labels = []
+    if DSQG_W_EVIDENCE_BINDING_HUB and not DSQG_W_EBH_SOURCEWISE_PACKET:
+        labels.append('legacy_materialized_ebh')
+    if DSQG_W_EVIDENCE_BINDING_HUB and DSQG_W_EBH_SOURCEWISE_PACKET and not DSQG_W_EBH_SCORE_FEATURES:
+        labels.append('legacy_packet_no_score')
+    if DSQG_W_EBH_PAIR_MIXER:
+        labels.append('legacy_ebh_pair_mixer')
+    if DSQG_W_EVIDENCE_BINDING_HUB and DSQG_W_EBH_SOURCEWISE_PACKET and (DSQG_W_WIDTH_CELL or DSQG_W_TYPED_MIXER):
+        labels.append('legacy_packet_semantic_approx')
+    if os.getenv('DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL', '0') == '1':
+        labels.append('legacy_projected_width_control')
+    if DSQG_W_FAST_EVIDENCE_MEAN and os.getenv('DWARF_DSQG_W_ALLOW_FAST_EVIDENCE_MEAN_BYPASS', '0') == '1':
+        labels.append('legacy_fast_evidence_mean_bypass')
+    if not PRE_HISA_EMA_ENABLED:
+        labels.append('legacy_no_pre_hisa_ema')
+    return labels
+
+
+def _dsqg_w_lane_label():
+    if not DSQG_W_ENABLED:
+        return 'disabled'
+    if _dsqg_w_legacy_mode_labels():
+        return 'legacy_guarded'
+    if (
+        DSQG_W_SOURCEWISE
+        and DSQG_W_TRITON_SOURCEWISE
+        and DSQG_W_WIDTH_CELL
+        and DSQG_W_TYPED_MIXER
+        and not DSQG_W_EVIDENCE_BINDING_HUB
+        and PRE_HISA_EMA_ENABLED
+    ):
+        return 'lane_a_no_ebh_lateral_open'
+    if (
+        DSQG_W_SOURCEWISE
+        and DSQG_W_TRITON_SOURCEWISE
+        and DSQG_W_EVIDENCE_BINDING_HUB
+        and DSQG_W_EBH_SOURCEWISE_PACKET
+        and DSQG_W_EBH_SCORE_FEATURES
+        and DSQG_W_EBH_TRITON_LANE_ACCUM
+        and not DSQG_W_WIDTH_CELL
+        and not DSQG_W_TYPED_MIXER
+        and PRE_HISA_EMA_ENABLED
+    ):
+        return 'lane_b_ebh_packet_triton_score'
+    return 'other'
+
+
+def _layer_layout_marker():
+    payload = [(label, len(offsets) if offsets is not None else 0, js, jl, has_if) for label, offsets, js, jl, has_if in LAYER_LAYOUT]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()[:16]
 
 
 # =============================================================================
@@ -3106,6 +3177,9 @@ class TriadicJ96Dsr(nn.Module):
                 ebh_gate_init=DSQG_W_EBH_GATE_INIT,
                 ebh_phase_bands=DSQG_W_EBH_PHASE_BANDS,
                 ebh_score_features=DSQG_W_EBH_SCORE_FEATURES,
+                ebh_pair_mixer=DSQG_W_EBH_PAIR_MIXER,
+                ebh_pair_rank=DSQG_W_EBH_PAIR_RANK,
+                ebh_pair_gate_init=DSQG_W_EBH_PAIR_GATE_INIT,
                 use_evidence_prior=DSQG_W_EVIDENCE_PRIOR,
                 evidence_prior_clip=DSQG_W_EVIDENCE_PRIOR_CLIP,
                 evidence_prior_init_scale=DSQG_W_EVIDENCE_PRIOR_INIT_SCALE,
@@ -3767,10 +3841,16 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'width_cell': DSQG_W_WIDTH_CELL,
                 'width_bottleneck': DSQG_W_WIDTH_BOTTLENECK,
                 'width_gate_init': DSQG_W_WIDTH_GATE_INIT,
+                'force_width_gate': _env_float_or_none('DWARF_DSQG_W_FORCE_WIDTH_GATE'),
                 'width_aux_weight': DSQG_W_WIDTH_AUX_WEIGHT,
                 'width_entropy_floor': DSQG_W_WIDTH_ENTROPY_FLOOR,
                 'width_entropy_weight': DSQG_W_WIDTH_ENTROPY_WEIGHT,
+                'typed_mixer': DSQG_W_TYPED_MIXER,
+                'typed_mixer_bottleneck': DSQG_W_TYPED_MIXER_BOTTLENECK,
+                'typed_mixer_gate_init': DSQG_W_TYPED_MIXER_GATE_INIT,
+                'force_typed_mixer_gate': _env_float_or_none('DWARF_DSQG_W_FORCE_TYPED_MIXER_GATE'),
                 'typed_hisa_reps': DSQG_W_TYPED_HISA_REPS,
+                'query_type_bias': DSQG_W_QUERY_TYPE_BIAS,
                 'dsr_candidates': DSQG_W_DSR_CANDIDATES,
                 'local_offsets': list(DSQG_W_LOCAL_OFFSETS),
                 'long_offsets': list(DSQG_W_LONG_OFFSETS),
@@ -3779,10 +3859,40 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'hisa_l3_enabled': DSQG_W_HISA_L3_ENABLED,
                 'k_hisa_evidence': DSQG_W_K_HISA_EVIDENCE,
                 'k_l3_skip': DSQG_W_K_L3_SKIP,
+                'evidence_binding_hub': DSQG_W_EVIDENCE_BINDING_HUB,
+                'ebh_bottleneck': DSQG_W_EBH_BOTTLENECK,
+                'ebh_gate_init': DSQG_W_EBH_GATE_INIT,
+                'force_ebh_gate': _env_float_or_none('DWARF_DSQG_W_FORCE_EBH_GATE'),
+                'ebh_phase_bands': DSQG_W_EBH_PHASE_BANDS,
+                'ebh_score_features': DSQG_W_EBH_SCORE_FEATURES,
                 'ebh_sourcewise_packet': DSQG_W_EBH_SOURCEWISE_PACKET,
+                'ebh_triton_lane_accum': DSQG_W_EBH_TRITON_LANE_ACCUM,
+                'ebh_pair_mixer': DSQG_W_EBH_PAIR_MIXER,
+                'ebh_pair_rank': DSQG_W_EBH_PAIR_RANK,
+                'ebh_pair_gate_init': DSQG_W_EBH_PAIR_GATE_INIT,
+                'force_ebh_pair_gate': _env_float_or_none('DWARF_DSQG_W_FORCE_EBH_PAIR_GATE'),
+                'evidence_prior': DSQG_W_EVIDENCE_PRIOR,
+                'evidence_prior_clip': DSQG_W_EVIDENCE_PRIOR_CLIP,
+                'evidence_prior_init_scale': DSQG_W_EVIDENCE_PRIOR_INIT_SCALE,
+                'candidate_quotas': DSQG_W_CANDIDATE_QUOTAS,
+                'quota_hisa_max': DSQG_W_QUOTA_HISA_MAX,
+                'sourcewise_width_cell_fusion': os.getenv('DWARF_DSQG_W_SOURCEWISE_WIDTH_CELL_FUSION', '0') == '1',
+                'projected_width_control': os.getenv('DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL', '0') == '1',
+                'triton_transformed_compact_read': os.getenv('DWARF_DSQG_W_TRITON_TRANSFORMED_COMPACT_READ', '0') == '1',
+                'triton_compact_read_backward': os.getenv('DWARF_DSQG_W_TRITON_COMPACT_READ_BACKWARD', 'triton'),
+                'triton_backward_organization': os.getenv('DWARF_DSQG_W_TRITON_BACKWARD_ORGANIZATION', 'monolithic'),
+                'triton_backward_source_grads': os.getenv('DWARF_DSQG_W_TRITON_BACKWARD_SOURCE_GRADS', '1') != '0',
+                'active_site_mode': 'multi_site' if len(DSQG_W_SITE_SPECS) > 1 else 'single_site',
+                'site_scheduling_policy': 'fixed_env_order',
+                'sites': [_dsqg_w_site_key(site) for site in DSQG_W_SITE_SPECS],
+                'pre_hisa_ema_policy': 'enabled_required_for_promoted_lanes' if PRE_HISA_EMA_ENABLED else 'legacy_ablation_disabled',
+                'layer_layout_marker': _layer_layout_marker(),
+                'lane_label': _dsqg_w_lane_label(),
+                'legacy_guarded_modes': _dsqg_w_legacy_mode_labels(),
                 'candidate_path': _dsqg_w_candidate_path_label(),
             },
             'params': n_params,
+            'pre_hisa_ema': PRE_HISA_EMA_ENABLED,
             'layer_layout': [(label, len(offsets) if offsets is not None else 0, has_if)
                              for label, offsets, _, _, has_if in LAYER_LAYOUT],
         },
@@ -4830,7 +4940,9 @@ def train():
                         ('dsqg_w_candidate_score_bias_norm', 'w_score'),
                         ('dsqg_w_candidate_score_mean', 'w_smean'),
                         ('dsqg_w_typed_mixer_gate_mean', 'w_mix_gate'),
+                        ('dsqg_w_typed_mixer_forced_gate', 'w_mix_forced'),
                         ('dsqg_w_width_gate_mean', 'w_width_gate'),
+                        ('dsqg_w_width_forced_gate', 'w_width_forced'),
                         ('dsqg_w_width_delta_norm', 'w_width_delta'),
                         ('dsqg_w_width_entropy', 'w_width_ent'),
                         ('dsqg_w_width_self_mass', 'w_width_self'),
@@ -4841,10 +4953,24 @@ def train():
                         ('dsqg_w_width_rel_diff_score_norm', 'w_rel_diff'),
                         ('dsqg_w_width_rel_prod_score_norm', 'w_rel_prod'),
                         ('dsqg_w_ebh_enabled', 'w_ebh'),
+                        ('dsqg_w_ebh_bind_gate_mean', 'w_ebh_gate'),
+                        ('dsqg_w_ebh_forced_gate', 'w_ebh_forced'),
                         ('dsqg_w_ebh_delta_to_x_ratio', 'w_ebh_dx'),
+                        ('dsqg_w_ebh_gated_delta_to_x_ratio', 'w_ebh_gdx'),
                         ('dsqg_w_ebh_bound_packet_norm', 'w_ebh_pkt'),
                         ('dsqg_w_ebh_active_row_fraction', 'w_ebh_active'),
+                        ('dsqg_w_ebh_pair_mixer_enabled', 'w_ebh_pair'),
+                        ('dsqg_w_ebh_pair_gate_mean', 'w_ebh_pair_gate'),
+                        ('dsqg_w_ebh_pair_forced_gate', 'w_ebh_pair_forced'),
+                        ('dsqg_w_ebh_pair_entropy', 'w_ebh_pair_ent'),
+                        ('dsqg_w_ebh_pair_self_mass', 'w_ebh_pair_self'),
+                        ('dsqg_w_ebh_pair_delta_norm', 'w_ebh_pair_delta'),
+                        ('dsqg_w_ebh_pair_question_to_hisa_mass', 'w_ebh_pair_qh'),
+                        ('dsqg_w_ebh_pair_hisa_to_question_mass', 'w_ebh_pair_hq'),
                         ('dsqg_w_sourcewise_ebh_materialized', 'w_ebh_mat'),
+                        ('dsqg_w_ebh_packet_sourcewise', 'w_ebh_packet'),
+                        ('dsqg_w_ebh_packet_triton', 'w_ebh_triton'),
+                        ('dsqg_w_ebh_packet_semantic_approx', 'w_ebh_sem_approx'),
                         ('dsqg_w_metadata_cache_hit', 'w_cache'),
                         ('dsqg_w_static_source_count', 'w_srcs'),
                         ('dsqg_w_candidate_slot_count', 'w_j'),
@@ -4867,6 +4993,7 @@ def train():
                         ('dsqg_w_typed_mixer_gate_logit_mean', 'w_mix_gate_logit'),
                         ('dsqg_w_width_gate_logit_mean', 'w_width_gate_logit'),
                         ('dsqg_w_ebh_bind_gate_logit_mean', 'w_ebh_gate_logit'),
+                        ('dsqg_w_ebh_pair_gate_logit_mean', 'w_ebh_pair_gate_logit'),
                     ]:
                         _val = _tel_float(_name)
                         if _val is not None and math.isfinite(_val):

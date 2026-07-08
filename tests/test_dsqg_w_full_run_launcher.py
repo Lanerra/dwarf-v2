@@ -54,6 +54,13 @@ def test_full_run_launcher_builds_winning_layout_env(tmp_path: Path) -> None:
     assert env["DWARF_GA"] == "1"
     assert env["DWARF_CKPT_BASE_NAME"].endswith("unit")
     assert Path(env["DWARF_CHECKPOINT_DIR"]).name == "checkpoints"
+    manifest = cfg["manifest"]["dsqg_w"]
+    assert manifest["typed_mixer"] is False
+    assert manifest["force_width_gate"] is None
+    assert manifest["evidence_binding_hub"] is False
+    assert manifest["ebh_score_features"] is True
+    assert manifest["pre_hisa_ema_policy"] == "enabled_required_for_promoted_lanes"
+    assert manifest["active_site_mode"] == "multi_site"
 
 
 def test_full_run_launcher_can_enable_width_cell_env(tmp_path: Path) -> None:
@@ -182,12 +189,53 @@ def test_full_run_launcher_can_enable_typed_mixer_and_query_rep_hisa_env(tmp_pat
     assert env["DWARF_DSQG_W_FUSE_INIT_STD"] == "0.03"
     assert env["DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK"] == "12"
     assert env["DWARF_DSQG_W_TYPED_MIXER_GATE_INIT"] == "-2.0"
+    assert env["DWARF_DSQG_W_FORCE_TYPED_MIXER_GATE"] == ""
+    assert env["DWARF_DSQG_W_FORCE_WIDTH_GATE"] == ""
     assert env["DWARF_DSQG_W_QUERY_TYPE_BIAS"] == "1"
     assert env["DWARF_DSQG_W_TYPED_HISA_REPS"] == "1"
     assert env["DWARF_DSQG_W_DSR_CANDIDATES"] == "1"
     assert env["DWARF_DSQG_W_LOCAL_OFFSETS"] == "1,2"
     assert env["DWARF_DSQG_W_LONG_OFFSETS"] == "none"
     assert env["DWARF_HISA_STAGE2_REP_R"] == "4"
+
+
+def test_full_run_launcher_can_force_lateral_gate_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "lateral_force",
+        run_name="lateral_force_unit",
+        width_cell=True,
+        typed_mixer=True,
+        force_typed_mixer_gate=0.7,
+        force_width_gate=0.7,
+        force_ebh_gate=0.7,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W_FORCE_TYPED_MIXER_GATE"] == "0.7"
+    assert env["DWARF_DSQG_W_FORCE_WIDTH_GATE"] == "0.7"
+    assert env["DWARF_DSQG_W_FORCE_EBH_GATE"] == "0.7"
+
+
+def test_full_run_launcher_can_enable_ebh_pair_mixer_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "pair_run",
+        run_name="pair_unit",
+        evidence_binding_hub=True,
+        ebh_pair_mixer=True,
+        ebh_pair_rank=32,
+        ebh_pair_gate_init=-1.5,
+        force_ebh_pair_gate=0.7,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W_EBH_PAIR_MIXER"] == "1"
+    assert env["DWARF_DSQG_W_EBH_PAIR_RANK"] == "32"
+    assert env["DWARF_DSQG_W_EBH_PAIR_GATE_INIT"] == "-1.5"
+    assert env["DWARF_DSQG_W_FORCE_EBH_PAIR_GATE"] == "0.7"
 
 
 def test_full_run_launcher_can_enable_evidence_binding_hub_env(tmp_path: Path) -> None:
@@ -202,6 +250,7 @@ def test_full_run_launcher_can_enable_evidence_binding_hub_env(tmp_path: Path) -
         ebh_phase_bands=3,
         ebh_score_features=False,
         ebh_sourcewise_packet=True,
+        ebh_triton_lane_accum=True,
     )
 
     env = cfg["env"]
@@ -211,6 +260,45 @@ def test_full_run_launcher_can_enable_evidence_binding_hub_env(tmp_path: Path) -
     assert env["DWARF_DSQG_W_EBH_PHASE_BANDS"] == "3"
     assert env["DWARF_DSQG_W_EBH_SCORE_FEATURES"] == "0"
     assert env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] == "1"
+    assert env["DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM"] == "1"
+    manifest = cfg["manifest"]["dsqg_w"]
+    assert manifest["evidence_binding_hub"] is True
+    assert manifest["ebh_score_features"] is False
+    assert manifest["ebh_sourcewise_packet"] is True
+    assert manifest["ebh_triton_lane_accum"] is True
+    assert manifest["lane_label"] == "legacy_guarded"
+    assert "legacy_packet_no_score" in manifest["legacy_guarded_modes"]
+
+
+def test_full_run_launcher_manifests_promoted_lane_a_and_lane_b() -> None:
+    mod = load_launcher_module()
+
+    lane_a = mod.build_run_config(
+        output_dir=Path("/tmp/dsqg_w_lane_a_manifest_unit"),
+        run_name="lane_a",
+        sourcewise=True,
+        triton_sourcewise=True,
+        width_cell=True,
+        typed_mixer=True,
+        force_width_gate=0.7,
+        force_typed_mixer_gate=0.7,
+    )["manifest"]["dsqg_w"]
+    assert lane_a["lane_label"] == "lane_a_no_ebh_lateral_open"
+    assert lane_a["force_width_gate"] == 0.7
+    assert lane_a["force_typed_mixer_gate"] == 0.7
+
+    lane_b = mod.build_run_config(
+        output_dir=Path("/tmp/dsqg_w_lane_b_manifest_unit"),
+        run_name="lane_b",
+        sourcewise=True,
+        triton_sourcewise=True,
+        evidence_binding_hub=True,
+        ebh_sourcewise_packet=True,
+        ebh_triton_lane_accum=True,
+    )["manifest"]["dsqg_w"]
+    assert lane_b["lane_label"] == "lane_b_ebh_packet_triton_score"
+    assert lane_b["ebh_score_features"] is True
+    assert lane_b["legacy_guarded_modes"] == []
 
 
 def test_full_run_launcher_can_configure_cpt_resume_env(tmp_path: Path) -> None:
@@ -270,3 +358,4 @@ def test_full_run_launcher_dry_run_writes_config_without_executing(tmp_path: Pat
     assert saved["env"]["DWARF_DSQG_W_SITES"] == "2,6,final"
     assert saved["env"]["DWARF_MAX_ACC_STEPS"] == "2"
     assert Path(saved["stdout_path"]).name == "trainer.stdout.log"
+    assert saved["manifest"]["dsqg_w"]["layer_layout_marker"] == "trainer_runtime_hash"

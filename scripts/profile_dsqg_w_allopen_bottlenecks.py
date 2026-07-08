@@ -175,9 +175,19 @@ def build_case(case: str) -> tuple[DSQGWConfig, dict[str, str | None], str]:
         env["DWARF_DSQG_W_FAST_TELEMETRY"] = "1"
         env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] = "1"
         return allopen_config(width=False, typed=False, ebh=True), env, "sourcewise"
+    if case == "ebh_packet_triton_lane_accum":
+        env["DWARF_DSQG_W_FAST_TELEMETRY"] = "1"
+        env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] = "1"
+        env["DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM"] = "1"
+        return allopen_config(width=False, typed=False, ebh=True), env, "sourcewise"
     if case == "ebh_packet_no_score_features":
         env["DWARF_DSQG_W_FAST_TELEMETRY"] = "1"
         env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] = "1"
+        return allopen_config(width=False, typed=False, ebh=True, ebh_score_features=False), env, "sourcewise"
+    if case == "ebh_packet_triton_no_score_features":
+        env["DWARF_DSQG_W_FAST_TELEMETRY"] = "1"
+        env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] = "1"
+        env["DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM"] = "1"
         return allopen_config(width=False, typed=False, ebh=True, ebh_score_features=False), env, "sourcewise"
     if case == "ebh_packet_bottleneck32":
         env["DWARF_DSQG_W_FAST_TELEMETRY"] = "1"
@@ -186,6 +196,11 @@ def build_case(case: str) -> tuple[DSQGWConfig, dict[str, str | None], str]:
     if case == "ebh_packet_width_typed_approx":
         env["DWARF_DSQG_W_FAST_TELEMETRY"] = "1"
         env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] = "1"
+        return allopen_config(width=True, typed=True, ebh=True), env, "sourcewise"
+    if case == "ebh_packet_width_typed_triton_approx":
+        env["DWARF_DSQG_W_FAST_TELEMETRY"] = "1"
+        env["DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"] = "1"
+        env["DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM"] = "1"
         return allopen_config(width=True, typed=True, ebh=True), env, "sourcewise"
     if case == "allopen_dense_materialized_build":
         env["DWARF_DSQG_W_TRITON_SOURCEWISE"] = "0"

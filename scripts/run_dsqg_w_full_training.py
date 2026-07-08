@@ -20,6 +20,125 @@ def _str(value: Any) -> str:
     return str(value)
 
 
+def _env_bool(env: dict[str, str], key: str) -> bool:
+    return env.get(key, "0") == "1"
+
+
+def _env_float_or_none(env: dict[str, str], key: str) -> float | None:
+    raw = env.get(key, "")
+    if str(raw).strip() == "":
+        return None
+    return float(raw)
+
+
+def _env_offsets(env: dict[str, str], key: str) -> list[int]:
+    raw = env.get(key, "")
+    if str(raw).strip().lower() in {"", "none", "off", "disable", "disabled", "[]"}:
+        return []
+    return [int(part.strip()) for part in str(raw).split(",") if part.strip()]
+
+
+def _dsqg_w_legacy_mode_labels(env: dict[str, str]) -> list[str]:
+    ebh = _env_bool(env, "DWARF_DSQG_W_EVIDENCE_BINDING_HUB")
+    packet = _env_bool(env, "DWARF_DSQG_W_EBH_SOURCEWISE_PACKET")
+    labels: list[str] = []
+    if ebh and not packet:
+        labels.append("legacy_materialized_ebh")
+    if ebh and packet and not _env_bool(env, "DWARF_DSQG_W_EBH_SCORE_FEATURES"):
+        labels.append("legacy_packet_no_score")
+    if _env_bool(env, "DWARF_DSQG_W_EBH_PAIR_MIXER"):
+        labels.append("legacy_ebh_pair_mixer")
+    if ebh and packet and (_env_bool(env, "DWARF_DSQG_W_WIDTH_CELL") or _env_bool(env, "DWARF_DSQG_W_TYPED_MIXER")):
+        labels.append("legacy_packet_semantic_approx")
+    if _env_bool(env, "DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL"):
+        labels.append("legacy_projected_width_control")
+    if _env_bool(env, "DWARF_DSQG_W_FAST_EVIDENCE_MEAN") and _env_bool(env, "DWARF_DSQG_W_ALLOW_FAST_EVIDENCE_MEAN_BYPASS"):
+        labels.append("legacy_fast_evidence_mean_bypass")
+    if not _env_bool(env, "DWARF_PRE_HISA_EMA"):
+        labels.append("legacy_no_pre_hisa_ema")
+    return labels
+
+
+def _dsqg_w_lane_label(env: dict[str, str]) -> str:
+    if not _env_bool(env, "DWARF_DSQG_W"):
+        return "disabled"
+    if _dsqg_w_legacy_mode_labels(env):
+        return "legacy_guarded"
+    if (
+        _env_bool(env, "DWARF_DSQG_W_SOURCEWISE")
+        and _env_bool(env, "DWARF_DSQG_W_TRITON_SOURCEWISE")
+        and _env_bool(env, "DWARF_DSQG_W_WIDTH_CELL")
+        and _env_bool(env, "DWARF_DSQG_W_TYPED_MIXER")
+        and not _env_bool(env, "DWARF_DSQG_W_EVIDENCE_BINDING_HUB")
+        and _env_bool(env, "DWARF_PRE_HISA_EMA")
+    ):
+        return "lane_a_no_ebh_lateral_open"
+    if (
+        _env_bool(env, "DWARF_DSQG_W_SOURCEWISE")
+        and _env_bool(env, "DWARF_DSQG_W_TRITON_SOURCEWISE")
+        and _env_bool(env, "DWARF_DSQG_W_EVIDENCE_BINDING_HUB")
+        and _env_bool(env, "DWARF_DSQG_W_EBH_SOURCEWISE_PACKET")
+        and _env_bool(env, "DWARF_DSQG_W_EBH_SCORE_FEATURES")
+        and _env_bool(env, "DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM")
+        and not _env_bool(env, "DWARF_DSQG_W_WIDTH_CELL")
+        and not _env_bool(env, "DWARF_DSQG_W_TYPED_MIXER")
+        and _env_bool(env, "DWARF_PRE_HISA_EMA")
+    ):
+        return "lane_b_ebh_packet_triton_score"
+    return "other"
+
+
+def _dsqg_w_manifest(env: dict[str, str]) -> dict[str, Any]:
+    sites = [part.strip() for part in env["DWARF_DSQG_W_SITES"].split(",") if part.strip()]
+    return {
+        "enabled": _env_bool(env, "DWARF_DSQG_W"),
+        "sourcewise": _env_bool(env, "DWARF_DSQG_W_SOURCEWISE"),
+        "triton_sourcewise": _env_bool(env, "DWARF_DSQG_W_TRITON_SOURCEWISE"),
+        "max_candidates": int(env["DWARF_DSQG_W_MAX_CANDIDATES"]),
+        "bottleneck": int(env["DWARF_DSQG_W_BOTTLENECK"]),
+        "gate_init": float(env["DWARF_DSQG_W_GATE_INIT"]),
+        "fuse_init_std": float(env["DWARF_DSQG_W_FUSE_INIT_STD"]),
+        "typed_mixer": _env_bool(env, "DWARF_DSQG_W_TYPED_MIXER"),
+        "typed_mixer_bottleneck": int(env["DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK"]),
+        "typed_mixer_gate_init": float(env["DWARF_DSQG_W_TYPED_MIXER_GATE_INIT"]),
+        "force_typed_mixer_gate": _env_float_or_none(env, "DWARF_DSQG_W_FORCE_TYPED_MIXER_GATE"),
+        "width_cell": _env_bool(env, "DWARF_DSQG_W_WIDTH_CELL"),
+        "width_bottleneck": int(env["DWARF_DSQG_W_WIDTH_BOTTLENECK"]),
+        "width_gate_init": float(env["DWARF_DSQG_W_WIDTH_GATE_INIT"]),
+        "force_width_gate": _env_float_or_none(env, "DWARF_DSQG_W_FORCE_WIDTH_GATE"),
+        "evidence_binding_hub": _env_bool(env, "DWARF_DSQG_W_EVIDENCE_BINDING_HUB"),
+        "ebh_bottleneck": int(env["DWARF_DSQG_W_EBH_BOTTLENECK"]),
+        "ebh_gate_init": float(env["DWARF_DSQG_W_EBH_GATE_INIT"]),
+        "force_ebh_gate": _env_float_or_none(env, "DWARF_DSQG_W_FORCE_EBH_GATE"),
+        "ebh_phase_bands": int(env["DWARF_DSQG_W_EBH_PHASE_BANDS"]),
+        "ebh_score_features": _env_bool(env, "DWARF_DSQG_W_EBH_SCORE_FEATURES"),
+        "ebh_sourcewise_packet": _env_bool(env, "DWARF_DSQG_W_EBH_SOURCEWISE_PACKET"),
+        "ebh_triton_lane_accum": _env_bool(env, "DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM"),
+        "ebh_pair_mixer": _env_bool(env, "DWARF_DSQG_W_EBH_PAIR_MIXER"),
+        "ebh_pair_rank": int(env["DWARF_DSQG_W_EBH_PAIR_RANK"]),
+        "ebh_pair_gate_init": float(env["DWARF_DSQG_W_EBH_PAIR_GATE_INIT"]),
+        "force_ebh_pair_gate": _env_float_or_none(env, "DWARF_DSQG_W_FORCE_EBH_PAIR_GATE"),
+        "query_type_bias": _env_bool(env, "DWARF_DSQG_W_QUERY_TYPE_BIAS"),
+        "evidence_prior": _env_bool(env, "DWARF_DSQG_W_EVIDENCE_PRIOR"),
+        "evidence_prior_clip": float(env["DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP"]),
+        "evidence_prior_init_scale": float(env["DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE"]),
+        "candidate_quotas": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_QUOTAS"),
+        "quota_hisa_max": int(env["DWARF_DSQG_W_QUOTA_HISA_MAX"]),
+        "local_offsets": _env_offsets(env, "DWARF_DSQG_W_LOCAL_OFFSETS"),
+        "long_offsets": _env_offsets(env, "DWARF_DSQG_W_LONG_OFFSETS"),
+        "sourcewise_width_cell_fusion": _env_bool(env, "DWARF_DSQG_W_SOURCEWISE_WIDTH_CELL_FUSION"),
+        "projected_width_control": _env_bool(env, "DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL"),
+        "triton_transformed_compact_read": _env_bool(env, "DWARF_DSQG_W_TRITON_TRANSFORMED_COMPACT_READ"),
+        "active_site_mode": "multi_site" if len(sites) > 1 else "single_site",
+        "site_scheduling_policy": "fixed_env_order",
+        "sites": sites,
+        "pre_hisa_ema_policy": "enabled_required_for_promoted_lanes" if _env_bool(env, "DWARF_PRE_HISA_EMA") else "legacy_ablation_disabled",
+        "layer_layout_marker": "trainer_runtime_hash",
+        "lane_label": _dsqg_w_lane_label(env),
+        "legacy_guarded_modes": _dsqg_w_legacy_mode_labels(env),
+    }
+
+
 def build_run_config(
     *,
     output_dir: Path | str,
@@ -50,15 +169,23 @@ def build_run_config(
     width_aux_weight: float = 0.0,
     width_entropy_floor: float = 1.5,
     width_entropy_weight: float = 0.25,
+    force_width_gate: float | None = None,
     typed_mixer: bool = False,
     typed_mixer_bottleneck: int = 64,
     typed_mixer_gate_init: float = -2.5,
+    force_typed_mixer_gate: float | None = None,
     evidence_binding_hub: bool = False,
     ebh_bottleneck: int = 256,
     ebh_gate_init: float = -5.0,
+    force_ebh_gate: float | None = None,
     ebh_phase_bands: int = 4,
     ebh_score_features: bool = True,
+    ebh_pair_mixer: bool = False,
+    ebh_pair_rank: int = 64,
+    ebh_pair_gate_init: float = -2.5,
+    force_ebh_pair_gate: float | None = None,
     ebh_sourcewise_packet: bool = False,
+    ebh_triton_lane_accum: bool = False,
     evidence_prior: bool = False,
     evidence_prior_clip: float = 2.0,
     evidence_prior_init_scale: float = 0.0,
@@ -75,6 +202,7 @@ def build_run_config(
     k_hisa_evidence: int = 4,
     k_l3_skip: int = 2,
     pure_dsqg: bool = False,
+    pre_hisa_ema: bool = True,
     lr: float | None = None,
     min_lr_ratio: float | None = None,
     lr_warmup_steps: int | None = None,
@@ -124,15 +252,23 @@ def build_run_config(
         "DWARF_DSQG_W_WIDTH_AUX_WEIGHT": str(float(width_aux_weight)),
         "DWARF_DSQG_W_WIDTH_ENTROPY_FLOOR": str(float(width_entropy_floor)),
         "DWARF_DSQG_W_WIDTH_ENTROPY_WEIGHT": str(float(width_entropy_weight)),
+        "DWARF_DSQG_W_FORCE_WIDTH_GATE": "" if force_width_gate is None else str(float(force_width_gate)),
         "DWARF_DSQG_W_TYPED_MIXER": "1" if typed_mixer else "0",
         "DWARF_DSQG_W_TYPED_MIXER_BOTTLENECK": str(int(typed_mixer_bottleneck)),
         "DWARF_DSQG_W_TYPED_MIXER_GATE_INIT": str(float(typed_mixer_gate_init)),
+        "DWARF_DSQG_W_FORCE_TYPED_MIXER_GATE": "" if force_typed_mixer_gate is None else str(float(force_typed_mixer_gate)),
         "DWARF_DSQG_W_EVIDENCE_BINDING_HUB": "1" if evidence_binding_hub else "0",
         "DWARF_DSQG_W_EBH_BOTTLENECK": str(int(ebh_bottleneck)),
         "DWARF_DSQG_W_EBH_GATE_INIT": str(float(ebh_gate_init)),
+        "DWARF_DSQG_W_FORCE_EBH_GATE": "" if force_ebh_gate is None else str(float(force_ebh_gate)),
         "DWARF_DSQG_W_EBH_PHASE_BANDS": str(int(ebh_phase_bands)),
         "DWARF_DSQG_W_EBH_SCORE_FEATURES": "1" if ebh_score_features else "0",
+        "DWARF_DSQG_W_EBH_PAIR_MIXER": "1" if ebh_pair_mixer else "0",
+        "DWARF_DSQG_W_EBH_PAIR_RANK": str(int(ebh_pair_rank)),
+        "DWARF_DSQG_W_EBH_PAIR_GATE_INIT": str(float(ebh_pair_gate_init)),
+        "DWARF_DSQG_W_FORCE_EBH_PAIR_GATE": "" if force_ebh_pair_gate is None else str(float(force_ebh_pair_gate)),
         "DWARF_DSQG_W_EBH_SOURCEWISE_PACKET": "1" if ebh_sourcewise_packet else "0",
+        "DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM": "1" if ebh_triton_lane_accum else "0",
         "DWARF_DSQG_W_EVIDENCE_PRIOR": "1" if evidence_prior else "0",
         "DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP": str(float(evidence_prior_clip)),
         "DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE": str(float(evidence_prior_init_scale)),
@@ -153,8 +289,12 @@ def build_run_config(
         "DWARF_LIGER": "0",
         "DWARF_Q6_G128": "0",
         "DWARF_PURE_DSQG": "1" if pure_dsqg else "0",
+        "DWARF_PRE_HISA_EMA": "1" if pre_hisa_ema else "0",
         "DWARF_PIN_DATASET": "0",
     }
+    env.setdefault("DWARF_DSQG_W_SOURCEWISE_WIDTH_CELL_FUSION", "0")
+    env.setdefault("DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL", "0")
+    env.setdefault("DWARF_DSQG_W_TRITON_TRANSFORMED_COMPACT_READ", "0")
     if lr is not None:
         env["DWARF_LR"] = str(float(lr))
     if min_lr_ratio is not None:
@@ -182,6 +322,7 @@ def build_run_config(
         "config_path": str(out / "run_config.json"),
         "command": [py, str(TRAINER.relative_to(ROOT))],
         "env": env,
+        "manifest": {"dsqg_w": _dsqg_w_manifest(env)},
     }
 
 
@@ -259,15 +400,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width-aux-weight", type=float, default=0.0)
     parser.add_argument("--width-entropy-floor", type=float, default=1.5)
     parser.add_argument("--width-entropy-weight", type=float, default=0.25)
+    parser.add_argument("--force-width-gate", type=float, default=None, help="Hard-clamp width-cell gate value in [0,1] for lateral-open probes.")
     parser.add_argument("--typed-mixer", action="store_true", help="Enable the typed candidate-set mixer before DSQG-W scoring.")
     parser.add_argument("--typed-mixer-bottleneck", type=int, default=64)
     parser.add_argument("--typed-mixer-gate-init", type=float, default=-2.5)
+    parser.add_argument("--force-typed-mixer-gate", type=float, default=None, help="Hard-clamp typed-mixer gate value in [0,1] for lateral-open probes.")
     parser.add_argument("--evidence-binding-hub", action="store_true", help="Enable the TPJ-like DSQG-W evidence binding hub before W scoring/readout.")
     parser.add_argument("--ebh-bottleneck", type=int, default=256)
     parser.add_argument("--ebh-gate-init", type=float, default=-5.0)
+    parser.add_argument("--force-ebh-gate", type=float, default=None, help="Hard-clamp EBH output/bind gate value in [0,1] for admission probes.")
     parser.add_argument("--ebh-phase-bands", type=int, default=4)
     parser.add_argument("--no-ebh-score-features", action="store_true", help="Disable scalar score features in the EBH alignment path.")
+    parser.add_argument("--ebh-pair-mixer", action="store_true", help="Enable bounded low-rank O(K^2) EBH candidate-candidate mixing before lane reduction.")
+    parser.add_argument("--ebh-pair-rank", type=int, default=64)
+    parser.add_argument("--ebh-pair-gate-init", type=float, default=-2.5)
+    parser.add_argument("--force-ebh-pair-gate", type=float, default=None, help="Hard-clamp EBH pair-mixer gate value in [0,1].")
     parser.add_argument("--ebh-sourcewise-packet", action="store_true", help="Use sourcewise EBH packet accumulation instead of materializing [B,T,J,D] candidate states.")
+    parser.add_argument("--ebh-triton-lane-accum", action="store_true", help="Use the Triton-backed EBH sourcewise packet lane-accumulation fast path.")
     parser.add_argument("--evidence-prior", action="store_true", help="Enable the DSQG-W scalar evidence/source/type prior composer.")
     parser.add_argument("--evidence-prior-clip", type=float, default=2.0)
     parser.add_argument("--evidence-prior-init-scale", type=float, default=0.0)
@@ -284,6 +433,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--k-hisa-evidence", type=int, default=4, help="Number of DSQG-W HISA evidence candidates; use 0 to disable.")
     parser.add_argument("--k-l3-skip", type=int, default=2, help="Number of DSQG-W L3 skip candidates; use 0 to disable.")
     parser.add_argument("--pure-dsqg", action="store_true", help="Disable HISA/DSR and run the pure DSQG-D v1 control layout.")
+    parser.add_argument("--disable-pre-hisa-ema", action="store_true", help="Disable the L2 pre-HISA causal EMA/preIF K/V injection path.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--min-lr-ratio", type=float, default=None)
     parser.add_argument("--lr-warmup-steps", type=int, default=None)
@@ -330,15 +480,23 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         width_aux_weight=args.width_aux_weight,
         width_entropy_floor=args.width_entropy_floor,
         width_entropy_weight=args.width_entropy_weight,
+        force_width_gate=args.force_width_gate,
         typed_mixer=args.typed_mixer,
         typed_mixer_bottleneck=args.typed_mixer_bottleneck,
         typed_mixer_gate_init=args.typed_mixer_gate_init,
+        force_typed_mixer_gate=args.force_typed_mixer_gate,
         evidence_binding_hub=args.evidence_binding_hub,
         ebh_bottleneck=args.ebh_bottleneck,
         ebh_gate_init=args.ebh_gate_init,
+        force_ebh_gate=args.force_ebh_gate,
         ebh_phase_bands=args.ebh_phase_bands,
         ebh_score_features=not args.no_ebh_score_features,
+        ebh_pair_mixer=args.ebh_pair_mixer,
+        ebh_pair_rank=args.ebh_pair_rank,
+        ebh_pair_gate_init=args.ebh_pair_gate_init,
+        force_ebh_pair_gate=args.force_ebh_pair_gate,
         ebh_sourcewise_packet=args.ebh_sourcewise_packet,
+        ebh_triton_lane_accum=args.ebh_triton_lane_accum,
         evidence_prior=args.evidence_prior,
         evidence_prior_clip=args.evidence_prior_clip,
         evidence_prior_init_scale=args.evidence_prior_init_scale,
@@ -355,6 +513,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         k_hisa_evidence=args.k_hisa_evidence,
         k_l3_skip=args.k_l3_skip,
         pure_dsqg=args.pure_dsqg,
+        pre_hisa_ema=not args.disable_pre_hisa_ema,
         lr=args.lr,
         min_lr_ratio=args.min_lr_ratio,
         lr_warmup_steps=args.lr_warmup_steps,

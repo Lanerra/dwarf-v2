@@ -13,14 +13,103 @@ from kernels.dsqg_w.dsqg_w_mvp import (
     CandidateType,
     DSQGWBlock,
     DSQGWConfig,
+    DSQGWEvidenceBindingHub,
     DSQGWEvidencePriorComposer,
     DSQGWTypedCandidateMixer,
+    DSQGWWidthCell,
     answer_masked_loss,
     conditional_copy_unlikelihood_loss,
     entropy_floor_loss,
     local_mass_cap_loss,
     width_pair_transfer_loss,
 )
+
+
+def test_dsqg_w_mvp_public_surface_uses_split_module_canonical_objects() -> None:
+    import kernels.dsqg_w as pkg
+    import kernels.dsqg_w.block as block_module
+    import kernels.dsqg_w.candidate_batch as candidate_batch
+    import kernels.dsqg_w.candidate_provider as candidate_provider
+    import kernels.dsqg_w.candidate_types as candidate_types
+    import kernels.dsqg_w.config as config
+    import kernels.dsqg_w.dsqg_w_mvp as mvp
+    import kernels.dsqg_w.ebh_packet as ebh_packet
+    import kernels.dsqg_w.evidence_prior as evidence_prior
+    import kernels.dsqg_w.losses as losses
+    import kernels.dsqg_w.sourcewise_gather as sourcewise_gather
+    import kernels.dsqg_w.sourcewise_read as sourcewise_read
+    import kernels.dsqg_w.typed_mixer as typed_mixer
+    import kernels.dsqg_w.width_cell as width_cell
+
+    assert mvp.DSQGWConfig is config.DSQGWConfig
+    assert pkg.DSQGWConfig is config.DSQGWConfig
+    assert mvp.CandidateType is candidate_types.CandidateType
+    assert mvp.CandidateSource is candidate_types.CandidateSource
+    assert mvp.CandidateEvidenceBit is candidate_types.CandidateEvidenceBit
+    assert mvp.Candidate is candidate_batch.Candidate
+    assert mvp.CandidateBatch is candidate_batch.CandidateBatch
+    assert mvp.CandidateProvider is candidate_provider.CandidateProvider
+    assert mvp.DSQGWWidthCell is width_cell.DSQGWWidthCell
+    assert mvp.DSQGWTypedCandidateMixer is typed_mixer.DSQGWTypedCandidateMixer
+    assert mvp.DSQGWEvidencePriorComposer is evidence_prior.DSQGWEvidencePriorComposer
+    assert mvp.DSQGWEvidenceBindingHub is ebh_packet.DSQGWEvidenceBindingHub
+    assert mvp.DSQGWBlock is block_module.DSQGWBlock
+    assert mvp.DSQGWEvidenceBindingHub.__module__ == "kernels.dsqg_w.ebh_packet"
+    assert mvp.DSQGWBlock.__module__ == "kernels.dsqg_w.block"
+    assert mvp._DSQGWSourcewiseCandidateStateGather is sourcewise_gather._DSQGWSourcewiseCandidateStateGather
+    assert mvp._dsqg_w_candidate_state_gather_kernel is sourcewise_gather._dsqg_w_candidate_state_gather_kernel
+    assert mvp._dsqg_w_candidate_state_gather_backward_kernel is sourcewise_gather._dsqg_w_candidate_state_gather_backward_kernel
+    assert mvp._DSQGWSourcewiseTritonCompactRead is sourcewise_read._DSQGWSourcewiseTritonCompactRead
+    assert mvp._dsqg_w_sourcewise_read_slots_kernel is sourcewise_read._dsqg_w_sourcewise_read_slots_kernel
+    assert mvp._dsqg_w_sourcewise_read_slots_backward_kernel is sourcewise_read._dsqg_w_sourcewise_read_slots_backward_kernel
+    assert sourcewise_read.CandidateSource is candidate_types.CandidateSource
+    assert mvp.width_pair_transfer_loss is width_cell.width_pair_transfer_loss
+    assert mvp.answer_masked_loss is losses.answer_masked_loss
+    assert mvp.conditional_copy_unlikelihood_loss is losses.conditional_copy_unlikelihood_loss
+    assert mvp.local_mass_cap_loss is losses.local_mass_cap_loss
+    assert mvp.entropy_floor_loss is losses.entropy_floor_loss
+    assert mvp.candidate_recall is losses.candidate_recall
+
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=4,
+        use_width_cell=True,
+        width_bottleneck=8,
+        use_typed_mixer=True,
+        typed_mixer_bottleneck=8,
+        use_evidence_prior=True,
+    )
+    block = DSQGWBlock.from_config(cfg)
+
+    assert isinstance(cfg, config.DSQGWConfig)
+    assert isinstance(block.width_cell, width_cell.DSQGWWidthCell)
+    assert isinstance(block.typed_mixer, typed_mixer.DSQGWTypedCandidateMixer)
+    assert isinstance(block.evidence_prior, evidence_prior.DSQGWEvidencePriorComposer)
+    assert DSQGWBlock._materialize_sourcewise_candidate_states.__globals__["_DSQGWSourcewiseCandidateStateGather"] is sourcewise_gather._DSQGWSourcewiseCandidateStateGather
+    assert DSQGWBlock._forward_sourcewise_triton.__globals__["_DSQGWSourcewiseTritonCompactRead"] is sourcewise_read._DSQGWSourcewiseTritonCompactRead
+    assert DSQGWBlock._forward_sourcewise_triton.__globals__["_dsqg_w_sourcewise_read_slots_kernel"] is sourcewise_read._dsqg_w_sourcewise_read_slots_kernel
+
+
+def test_sourcewise_delete_after_test_recompute_candidates_remain_isolated() -> None:
+    import kernels.dsqg_w.dsqg_w_mvp as mvp
+    import kernels.dsqg_w.sourcewise_read as sourcewise_read
+
+    assert mvp._DSQGWSourcewiseTritonRecompute is sourcewise_read._DSQGWSourcewiseTritonRecompute
+    assert mvp._dsqg_w_sourcewise_functional_recompute is sourcewise_read._dsqg_w_sourcewise_functional_recompute
+    assert mvp._dsqg_w_sourcewise_read_slots_recompute is sourcewise_read._dsqg_w_sourcewise_read_slots_recompute
+
+    live_sourcewise_sources = "\n".join(
+        [
+            inspect.getsource(mvp.DSQGWBlock.forward_sourcewise),
+            inspect.getsource(mvp.DSQGWBlock._forward_sourcewise_triton),
+            inspect.getsource(mvp.DSQGWEvidenceBindingHub.forward_sourcewise_packet),
+            inspect.getsource(mvp.DSQGWEvidenceBindingHub._forward_sourcewise_packet_triton_accum),
+        ]
+    )
+    assert "_DSQGWSourcewiseTritonRecompute.apply" not in live_sourcewise_sources
+    assert "_dsqg_w_sourcewise_read_slots_recompute(" not in live_sourcewise_sources
+    assert "_dsqg_w_sourcewise_functional_recompute(" not in live_sourcewise_sources
 
 
 def make_hidden(batch: int = 2, seq: int = 9, d: int = 16) -> torch.Tensor:
@@ -624,6 +713,101 @@ def test_typed_candidate_mixer_is_bounded_and_near_identity_when_closed() -> Non
     assert telemetry["dsqg_w_typed_mixer_delta_norm"].item() >= 0.0
 
 
+def test_forced_lateral_gates_use_constant_gate_values_and_keep_masked_candidates_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(54)
+    cand_states = torch.randn(1, 3, 5, 16)
+    cand_types = torch.tensor([[[1, 2, 3, 0, 0], [1, 4, 5, 0, 0], [1, 2, 5, 6, 0]]])
+    cand_sources = torch.tensor([[[1, 2, 2, 0, 0], [1, 2, 3, 0, 0], [1, 2, 3, 3, 0]]])
+    cand_mask = torch.tensor([[[1, 1, 1, 0, 0], [1, 1, 1, 0, 0], [1, 1, 1, 1, 0]]], dtype=torch.bool)
+
+    monkeypatch.setenv("DWARF_DSQG_W_FORCE_TYPED_MIXER_GATE", "0.7")
+    monkeypatch.setenv("DWARF_DSQG_W_FORCE_WIDTH_GATE", "0.7")
+
+    typed = DSQGWTypedCandidateMixer(d=16, n_heads=4, n_types=8, bottleneck=8, gate_init=-12.0).eval()
+    mixed, typed_tel = typed(cand_states, cand_types, cand_mask)
+
+    width = DSQGWWidthCell(d=16, n_heads=4, n_types=8, n_sources=4, bottleneck=8, gate_init=-12.0).eval()
+    widened, width_tel = width(mixed, cand_types, cand_sources, cand_mask)
+
+    assert typed_tel["dsqg_w_typed_mixer_forced_gate"].item() == 1.0
+    assert width_tel["dsqg_w_width_forced_gate"].item() == 1.0
+    assert typed_tel["dsqg_w_typed_mixer_gate_mean"].item() == pytest.approx(0.7)
+    assert width_tel["dsqg_w_width_gate_mean"].item() == pytest.approx(0.7)
+    assert torch.allclose(mixed.masked_select(~cand_mask[..., None]), cand_states.masked_select(~cand_mask[..., None]))
+    assert torch.allclose(widened.masked_select(~cand_mask[..., None]), mixed.masked_select(~cand_mask[..., None]))
+
+
+def test_forced_ebh_gate_uses_constant_value_and_zero_evidence_stays_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.manual_seed(63)
+    x = torch.randn(2, 4, 16)
+    cand_states = torch.randn(2, 4, 3, 16)
+    cand_types = torch.zeros(2, 4, 3, dtype=torch.long)
+    cand_sources = torch.zeros(2, 4, 3, dtype=torch.long)
+    cand_mask = torch.zeros(2, 4, 3, dtype=torch.bool)
+
+    monkeypatch.setenv("DWARF_DSQG_W_FORCE_EBH_GATE", "0.7")
+
+    hub = DSQGWEvidenceBindingHub(d=16, n_types=8, n_sources=4, bottleneck=8, gate_init=-12.0).eval()
+    out, telemetry, aux = hub(x, cand_states, cand_types, cand_sources, cand_mask, return_aux=True)
+
+    assert torch.equal(out, x)
+    assert telemetry["dsqg_w_ebh_forced_gate"].item() == 1.0
+    assert telemetry["dsqg_w_ebh_bind_gate_mean"].item() == pytest.approx(0.7)
+    assert telemetry["dsqg_w_ebh_active_row_fraction"].item() == 0.0
+    assert torch.allclose(aux["bind_gate"], torch.full_like(aux["bind_gate"], 0.7))
+
+
+def test_ebh_pair_mixer_is_bounded_k2_and_preserves_invalid_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DWARF_DSQG_W_FORCE_EBH_PAIR_GATE", "0.7")
+    torch.manual_seed(71)
+    hub = DSQGWEvidenceBindingHub(
+        d=16,
+        n_types=len(CandidateType),
+        n_sources=len(CandidateSource),
+        bottleneck=8,
+        gate_init=-2.0,
+        phase_bands=2,
+        use_pair_mixer=True,
+        pair_rank=8,
+    )
+    x = torch.randn(2, 3, 16)
+    cand_states = torch.randn(2, 3, 5, 16)
+    cand_types = torch.tensor(
+        [
+            [[2, 6, 7, 1, 0], [2, 8, 1, 0, 0], [6, 7, 2, 1, 0]],
+            [[2, 6, 1, 0, 0], [7, 2, 6, 1, 0], [2, 1, 0, 0, 0]],
+        ],
+        dtype=torch.long,
+    )
+    cand_sources = torch.tensor(
+        [
+            [[1, 3, 3, 1, 0], [1, 3, 1, 0, 0], [3, 3, 1, 1, 0]],
+            [[1, 3, 1, 0, 0], [3, 1, 3, 1, 0], [1, 1, 0, 0, 0]],
+        ],
+        dtype=torch.long,
+    )
+    cand_mask = cand_types != int(CandidateType.NULL)
+
+    out, telemetry, aux = hub(x, cand_states, cand_types, cand_sources, cand_mask, return_aux=True)
+
+    assert out.shape == x.shape
+    assert aux["aligned_candidates"].shape == cand_states.shape
+    assert aux["ebh_pair_probs"].shape == (2, 3, 5, 5)
+    valid_pair = cand_mask[:, :, :, None] & cand_mask[:, :, None, :]
+    assert torch.equal(
+        aux["ebh_pair_probs"].masked_select(~valid_pair),
+        torch.zeros_like(aux["ebh_pair_probs"]).masked_select(~valid_pair),
+    )
+    assert torch.equal(
+        aux["aligned_candidates"].masked_select(~cand_mask[..., None]),
+        torch.zeros_like(aux["aligned_candidates"]).masked_select(~cand_mask[..., None]),
+    )
+    assert telemetry["dsqg_w_ebh_pair_mixer_enabled"].item() == pytest.approx(1.0)
+    assert telemetry["dsqg_w_ebh_pair_gate_mean"].item() == pytest.approx(0.7)
+    assert telemetry["dsqg_w_ebh_pair_forced_gate"].item() == pytest.approx(1.0)
+    assert telemetry["dsqg_w_ebh_pair_entropy"].item() > 0.0
+
+
 def test_sourcewise_path_materializes_semantic_candidate_machinery_instead_of_rejecting() -> None:
     torch.manual_seed(57)
     x = make_hidden(batch=1, seq=6, d=16).requires_grad_(True)
@@ -682,6 +866,68 @@ def test_sourcewise_path_materializes_semantic_candidate_machinery_instead_of_re
     assert telemetry["dsqg_w_triton_sourcewise_semantic_bypass"].item() == 0.0
     assert "dsqg_w_width_gate_mean" in telemetry
     assert "dsqg_w_typed_mixer_gate_mean" in telemetry
+
+
+def test_sourcewise_lane_b_routes_through_ebh_packet_before_w_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DWARF_DSQG_W_EBH_SOURCEWISE_PACKET", "1")
+    torch.manual_seed(58)
+    x = make_hidden(batch=1, seq=5, d=16)
+    cfg = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=6,
+        bottleneck=32,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=1,
+        k_hisa_evidence=2,
+        k_l3_skip=1,
+        use_evidence_binding_hub=True,
+        ebh_score_features=True,
+    )
+    provider = CandidateProvider(cfg)
+    positions = torch.arange(5)
+    metadata = provider.build_metadata(
+        x,
+        question_indices=torch.tensor([[0]]),
+        hisa_evidence_indices=torch.stack([(positions - 1).clamp_min(0), (positions - 2).clamp_min(0)], dim=-1).unsqueeze(0),
+        hisa_evidence_scores=torch.ones(1, 5, 2),
+        l3_skip_indices=(positions - 3).clamp_min(0).reshape(1, 5, 1),
+    )
+    block = DSQGWBlock.from_config(cfg).eval()
+    assert block.evidence_binding_hub is not None
+    calls = {"packet": 0}
+
+    def fake_packet(x_arg, *args, **kwargs):
+        calls["packet"] += 1
+        return x_arg, {
+            "dsqg_w_ebh_packet_sourcewise": x_arg.new_tensor(1.0),
+            "dsqg_w_ebh_packet_triton": x_arg.new_tensor(1.0),
+        }
+
+    monkeypatch.setattr(block.evidence_binding_hub, "forward_sourcewise_packet", fake_packet)
+    out, telemetry = block.forward_sourcewise(
+        x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        cand_scores=metadata.cand_scores,
+    )
+
+    assert calls["packet"] == 1
+    assert out.shape == x.shape
+    assert telemetry["dsqg_w_sourcewise_ebh_materialized"].item() == pytest.approx(0.0)
+    assert telemetry["dsqg_w_ebh_packet_sourcewise"].item() == pytest.approx(1.0)
+    assert telemetry["dsqg_w_ebh_packet_triton"].item() == pytest.approx(1.0)
+
+
+def test_ebh_packet_triton_accum_guard_stays_score_on_lane_b_only() -> None:
+    source = inspect.getsource(DSQGWEvidenceBindingHub.forward_sourcewise_packet)
+    assert "self._forward_sourcewise_packet_triton_accum" in source
+    assert "DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM" in source
+    assert "self.use_score_features" in source
+    assert "not self.use_pair_mixer" in source
 
 
 def test_query_conditioned_type_bias_can_route_scores_to_hisa_rep_candidate() -> None:
