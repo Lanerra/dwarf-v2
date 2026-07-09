@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .candidate_provider import CandidateProvider
 from .candidate_types import CandidateSource, CandidateType
+from .candidate_workspace import CandidateWorkspace
 from .config import DSQGWConfig
 from .ebh_packet import DSQGWEvidenceBindingHub
 from .evidence_prior import DSQGWEvidencePriorComposer
@@ -109,6 +110,12 @@ class DSQGWBlock(nn.Module):
         ebh_pair_mixer: bool = False,
         ebh_pair_rank: int = 64,
         ebh_pair_gate_init: float = -2.5,
+        use_candidate_workspace: bool = False,
+        candidate_workspace_dim: int = 64,
+        candidate_workspace_phase_bands: int = 4,
+        candidate_workspace_score_features: bool = True,
+        candidate_workspace_pair_transfer: bool = False,
+        candidate_workspace_pair_gate_init: float = -2.5,
         read_type_ids: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
@@ -175,6 +182,20 @@ class DSQGWBlock(nn.Module):
             if use_evidence_binding_hub
             else None
         )
+        self.candidate_workspace = (
+            CandidateWorkspace(
+                d=d,
+                n_types=n_types,
+                n_sources=n_sources,
+                workspace_dim=candidate_workspace_dim,
+                phase_bands=candidate_workspace_phase_bands,
+                use_score_features=candidate_workspace_score_features,
+                use_pair_transfer=candidate_workspace_pair_transfer,
+                pair_gate_init=candidate_workspace_pair_gate_init,
+            )
+            if use_candidate_workspace
+            else None
+        )
 
         self.norm_x = nn.LayerNorm(d)
         self.norm_c = nn.LayerNorm(d)
@@ -230,6 +251,12 @@ class DSQGWBlock(nn.Module):
             ebh_pair_mixer=config.ebh_pair_mixer,
             ebh_pair_rank=config.ebh_pair_rank,
             ebh_pair_gate_init=config.ebh_pair_gate_init,
+            use_candidate_workspace=config.use_candidate_workspace,
+            candidate_workspace_dim=config.candidate_workspace_dim,
+            candidate_workspace_phase_bands=config.candidate_workspace_phase_bands,
+            candidate_workspace_score_features=config.candidate_workspace_score_features,
+            candidate_workspace_pair_transfer=config.candidate_workspace_pair_transfer,
+            candidate_workspace_pair_gate_init=config.candidate_workspace_pair_gate_init,
             read_type_ids=_read_type_ids_from_config(config),
         )
 
@@ -1292,6 +1319,24 @@ class DSQGWBlock(nn.Module):
             )
             telemetry["dsqg_w_ebh_packet_semantic_approx"] = x.new_tensor(1.0 if semantic_approx else 0.0).detach()
             return x_out, telemetry
+        workspace_telemetry: dict[str, torch.Tensor] = {}
+        if self.candidate_workspace is not None:
+            with _dsqg_w_profile_range("candidate_workspace"):
+                workspace_out = self.candidate_workspace.forward_sourcewise(
+                    x,
+                    cand_token_indices,
+                    cand_types,
+                    cand_sources,
+                    cand_mask,
+                    l3_states=l3_states,
+                    chunk_rep_states=chunk_rep_states,
+                    cand_scores=cand_scores,
+                    candidate_distances=candidate_distances,
+                    needed_source_ids=needed_source_ids,
+                )
+            workspace_bias = workspace_out.score_bias
+            cand_scores = workspace_bias if cand_scores is None else cand_scores.to(workspace_bias.dtype) + workspace_bias
+            workspace_telemetry = workspace_out.telemetry
         if self.width_cell is not None or self.typed_mixer is not None or self.evidence_binding_hub is not None:
             semantic_telemetry: dict[str, torch.Tensor] = {}
             projected_width_control = (
@@ -1342,6 +1387,7 @@ class DSQGWBlock(nn.Module):
                     needed_source_ids=needed_source_ids,
                 )
                 telemetry.update(semantic_telemetry)
+                telemetry.update(workspace_telemetry)
                 telemetry["dsqg_w_sourcewise_semantic_materialized"] = x.new_tensor(0.0).detach()
                 telemetry["dsqg_w_sourcewise_width_cell_fusion"] = x.new_tensor(0.0).detach()
                 telemetry["dsqg_w_projected_width_semantic_control"] = x.new_tensor(1.0).detach()
@@ -1466,6 +1512,7 @@ class DSQGWBlock(nn.Module):
                 precomputed_semantic_telemetry=semantic_telemetry if sourcewise_width_fused else None,
             )
             telemetry["dsqg_w_sourcewise_semantic_materialized"] = x.new_tensor(0.0 if sourcewise_width_fused else 1.0).detach()
+            telemetry.update(workspace_telemetry)
             telemetry["dsqg_w_sourcewise_width_cell_fusion"] = x.new_tensor(1.0 if sourcewise_width_fused else 0.0).detach()
             telemetry["dsqg_w_sourcewise_ebh_materialized"] = x.new_tensor(
                 1.0 if self.evidence_binding_hub is not None and not sourcewise_width_fused else 0.0
@@ -1473,7 +1520,7 @@ class DSQGWBlock(nn.Module):
             telemetry["dsqg_w_triton_sourcewise_semantic_bypass"] = x.new_tensor(0.0).detach()
             return x_out, telemetry
         if os.getenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "0") == "1":
-            return self._forward_sourcewise_triton(
+            x_out, telemetry = self._forward_sourcewise_triton(
                 x,
                 cand_token_indices,
                 cand_types,
@@ -1488,6 +1535,8 @@ class DSQGWBlock(nn.Module):
                 return_routing=return_routing,
                 needed_source_ids=needed_source_ids,
             )
+            telemetry.update(workspace_telemetry)
+            return x_out, telemetry
 
         h = self.n_heads
         dh = self.dh
@@ -1634,6 +1683,7 @@ class DSQGWBlock(nn.Module):
         telemetry["dsqg_w_l3_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.L3.name.lower()}_source_mass"]
         telemetry["dsqg_w_final_source_mass"] = telemetry[f"dsqg_w_{CandidateSource.FINAL.name.lower()}_source_mass"]
         telemetry.update(prior_telemetry)
+        telemetry.update(workspace_telemetry)
         if return_routing:
             telemetry["dsqg_w_probs"] = probs
         return x_out, telemetry

@@ -9,6 +9,8 @@ _LEGACY_PUBLIC_EXPORTS = {
     "Candidate",
     "CandidateBatch",
     "CandidateLayout",
+    "CandidateWorkspace",
+    "CandidateWorkspaceOutput",
     "CandidateType",
     "CandidateSource",
     "CandidateEvidenceBit",

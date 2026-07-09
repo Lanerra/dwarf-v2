@@ -47,6 +47,12 @@ class DSQGWConfig:
     ebh_pair_mixer: bool = False
     ebh_pair_rank: int = 64
     ebh_pair_gate_init: float = -2.5
+    use_candidate_workspace: bool = False
+    candidate_workspace_dim: int = 64
+    candidate_workspace_phase_bands: int = 4
+    candidate_workspace_score_features: bool = True
+    candidate_workspace_pair_transfer: bool = False
+    candidate_workspace_pair_gate_init: float = -2.5
     use_candidate_quotas: bool = False
     quota_hisa_max: int = 0
     read_type_ids: tuple[int, ...] | None = None
@@ -80,6 +86,10 @@ class DSQGWConfig:
             raise ValueError("ebh_phase_bands must be positive")
         if self.ebh_pair_rank <= 0:
             raise ValueError("ebh_pair_rank must be positive")
+        if self.candidate_workspace_dim <= 0:
+            raise ValueError("candidate_workspace_dim must be positive")
+        if self.candidate_workspace_phase_bands <= 0:
+            raise ValueError("candidate_workspace_phase_bands must be positive")
         if self.quota_hisa_max < 0:
             raise ValueError("quota_hisa_max must be non-negative")
         if self.read_type_ids is not None:

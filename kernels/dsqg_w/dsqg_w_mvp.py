@@ -39,6 +39,7 @@ from .width_cell import (
     width_pair_transfer_loss,
 )
 from .evidence_prior import DSQGWEvidencePriorComposer
+from .candidate_workspace import CandidateWorkspace, CandidateWorkspaceOutput
 from .typed_mixer import DSQGWTypedCandidateMixer
 from .ebh_packet import DSQGWEvidenceBindingHub
 from .sourcewise_read import (
@@ -69,6 +70,8 @@ __all__ = [
     "Candidate",
     "CandidateBatch",
     "CandidateLayout",
+    "CandidateWorkspace",
+    "CandidateWorkspaceOutput",
     "CandidateEvidenceBit",
     "CandidateProvider",
     "CandidateSource",

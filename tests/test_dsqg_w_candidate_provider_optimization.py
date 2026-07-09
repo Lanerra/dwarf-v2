@@ -306,6 +306,136 @@ def test_dsr_selected_metadata_uses_static_slot_layout(monkeypatch) -> None:
     assert metadata.cand_states.numel() == 0
 
 
+def test_candidate_workspace_builds_low_rank_sourcewise_bias() -> None:
+    from kernels.dsqg_w.dsqg_w_mvp import CandidateWorkspace
+
+    torch.manual_seed(20260710)
+    config = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        null_fallback=True,
+        typed_hisa_reps=True,
+        use_candidate_workspace=True,
+        candidate_workspace_dim=5,
+    )
+    provider = CandidateProvider(config)
+    workspace = CandidateWorkspace.from_config(config)
+    x = torch.randn(2, 7, 16)
+    l3 = torch.randn(2, 7, 16)
+    positions = torch.arange(7)
+    question = torch.tensor([[0, 3, 3, 9], [0, 2, 5, 9]], dtype=torch.long)
+    hisa = torch.stack(
+        [
+            (positions - 1).clamp_min(0),
+            (positions - 3).clamp_min(0),
+            (positions - 5).clamp_min(0),
+            torch.full_like(positions, 99),
+        ],
+        dim=-1,
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    hisa_scores = torch.tensor([0.5, 0.2, -0.1, 3.0], dtype=x.dtype).reshape(1, 1, 4).expand(2, 7, -1)
+    l3_skip = torch.stack(
+        [(positions - 2).clamp_min(0), (positions - 4).clamp_min(0)], dim=-1
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    metadata = provider.build_metadata(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+
+    projected_shapes = []
+    original_source_proj = workspace.source_proj.forward
+
+    def source_proj_spy(arg):
+        projected_shapes.append(tuple(arg.shape))
+        assert arg.ndim == 3
+        assert arg.shape[-1] == config.d
+        return original_source_proj(arg)
+
+    workspace.source_proj.forward = source_proj_spy
+    result = workspace.forward_sourcewise(
+        x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=l3,
+        cand_scores=metadata.cand_scores,
+        candidate_distances=metadata.candidate_distances,
+    )
+
+    assert projected_shapes
+    assert result.workspace.shape == (*metadata.cand_mask.shape, config.candidate_workspace_dim)
+    assert result.score_bias.shape == metadata.cand_mask.shape
+    assert result.score_bias.dtype == x.dtype
+    assert torch.isfinite(result.score_bias).all()
+    assert torch.equal(result.score_bias.masked_select(~metadata.cand_mask), torch.zeros_like(result.score_bias.masked_select(~metadata.cand_mask)))
+    assert result.telemetry["dsqg_w_candidate_workspace_enabled"].item() == 1.0
+    assert result.telemetry["dsqg_w_candidate_workspace_dim"].item() == float(config.candidate_workspace_dim)
+
+
+def test_sourcewise_path_uses_candidate_workspace_without_materializing_d_candidates(monkeypatch) -> None:
+    torch.manual_seed(20260711)
+    base_config, x, l3, question, hisa, hisa_scores, l3_skip = _sourcewise_fixture()
+    config = DSQGWConfig(
+        d=base_config.d,
+        n_heads=base_config.n_heads,
+        max_candidates=base_config.max_candidates,
+        local_offsets=base_config.local_offsets,
+        long_offsets=base_config.long_offsets,
+        k_question=base_config.k_question,
+        k_hisa_evidence=base_config.k_hisa_evidence,
+        k_l3_skip=base_config.k_l3_skip,
+        k_chunk=base_config.k_chunk,
+        gate_init=base_config.gate_init,
+        fuse_init_std=base_config.fuse_init_std,
+        use_query_type_bias=base_config.use_query_type_bias,
+        use_candidate_workspace=True,
+        candidate_workspace_dim=6,
+    )
+    provider = CandidateProvider(config)
+    block = DSQGWBlock.from_config(config)
+    metadata = provider.build_metadata(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+
+    def forbidden_materialize(*args, **kwargs):
+        raise AssertionError("candidate workspace sourcewise path must not materialize [B,T,J,D] candidates")
+
+    monkeypatch.setattr(block, "_materialize_sourcewise_candidate_states", forbidden_materialize)
+    out, telemetry = block.forward_sourcewise(
+        x,
+        metadata.cand_token_indices,
+        metadata.cand_types,
+        metadata.cand_sources,
+        metadata.cand_mask,
+        l3_states=l3,
+        cand_scores=metadata.cand_scores,
+        candidate_distances=metadata.candidate_distances,
+    )
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    assert telemetry["dsqg_w_candidate_workspace_enabled"].item() == 1.0
+    assert telemetry["dsqg_w_candidate_workspace_dim"].item() == 6.0
+    assert telemetry["dsqg_w_candidate_workspace_materialized_d_candidates"].item() == 0.0
+
+
 def test_grouped_slot_materialization_matches_general_source_group_path(monkeypatch) -> None:
     torch.manual_seed(20260705)
     config = DSQGWConfig(
