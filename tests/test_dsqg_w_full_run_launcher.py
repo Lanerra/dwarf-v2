@@ -99,6 +99,31 @@ def test_full_run_launcher_can_enable_sourcewise_env(tmp_path: Path) -> None:
     assert cfg["env"]["DWARF_DSQG_W_TRITON_SOURCEWISE"] == "0"
 
 
+def test_full_run_launcher_can_enable_low_rank_candidate_workspace_env(tmp_path: Path) -> None:
+    mod = load_launcher_module()
+
+    cfg = mod.build_run_config(
+        output_dir=tmp_path / "workspace_run",
+        run_name="workspace_unit",
+        sourcewise=True,
+        candidate_workspace=True,
+        candidate_workspace_dim=24,
+        no_candidate_workspace_query_scores=True,
+        candidate_workspace_pair_transfer=True,
+    )
+
+    env = cfg["env"]
+    assert env["DWARF_DSQG_W_SOURCEWISE"] == "1"
+    assert env["DWARF_DSQG_W_CANDIDATE_WORKSPACE"] == "1"
+    assert env["DWARF_DSQG_W_CANDIDATE_WORKSPACE_DIM"] == "24"
+    assert env["DWARF_DSQG_W_CANDIDATE_WORKSPACE_QUERY_SCORES"] == "0"
+    assert env["DWARF_DSQG_W_CANDIDATE_WORKSPACE_PAIR_TRANSFER"] == "1"
+    manifest = cfg["manifest"]["dsqg_w"]
+    assert manifest["candidate_workspace"] is True
+    assert manifest["candidate_workspace_dim"] == 24
+    assert manifest["candidate_workspace_query_scores"] is False
+
+
 def test_full_run_launcher_can_enable_triton_sourcewise_prototype_env(tmp_path: Path) -> None:
     mod = load_launcher_module()
 

@@ -124,6 +124,13 @@ def _dsqg_w_manifest(env: dict[str, str]) -> dict[str, Any]:
         "evidence_prior_init_scale": float(env["DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE"]),
         "candidate_quotas": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_QUOTAS"),
         "quota_hisa_max": int(env["DWARF_DSQG_W_QUOTA_HISA_MAX"]),
+        "candidate_workspace": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_WORKSPACE"),
+        "candidate_workspace_dim": int(env["DWARF_DSQG_W_CANDIDATE_WORKSPACE_DIM"]),
+        "candidate_workspace_phase_bands": int(env["DWARF_DSQG_W_CANDIDATE_WORKSPACE_PHASE_BANDS"]),
+        "candidate_workspace_score_features": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_WORKSPACE_SCORE_FEATURES"),
+        "candidate_workspace_query_scores": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_WORKSPACE_QUERY_SCORES"),
+        "candidate_workspace_pair_transfer": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_WORKSPACE_PAIR_TRANSFER"),
+        "candidate_workspace_pair_gate_init": float(env["DWARF_DSQG_W_CANDIDATE_WORKSPACE_PAIR_GATE_INIT"]),
         "local_offsets": _env_offsets(env, "DWARF_DSQG_W_LOCAL_OFFSETS"),
         "long_offsets": _env_offsets(env, "DWARF_DSQG_W_LONG_OFFSETS"),
         "sourcewise_width_cell_fusion": _env_bool(env, "DWARF_DSQG_W_SOURCEWISE_WIDTH_CELL_FUSION"),
@@ -191,6 +198,13 @@ def build_run_config(
     evidence_prior_init_scale: float = 0.0,
     candidate_quotas: bool = False,
     quota_hisa_max: int = 0,
+    candidate_workspace: bool = False,
+    candidate_workspace_dim: int = 64,
+    candidate_workspace_phase_bands: int = 4,
+    candidate_workspace_score_features: bool = True,
+    no_candidate_workspace_query_scores: bool = False,
+    candidate_workspace_pair_transfer: bool = False,
+    candidate_workspace_pair_gate_init: float = -2.5,
     query_type_bias: bool = False,
     typed_hisa_reps: bool = False,
     dsr_candidates: bool = True,
@@ -274,6 +288,13 @@ def build_run_config(
         "DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE": str(float(evidence_prior_init_scale)),
         "DWARF_DSQG_W_CANDIDATE_QUOTAS": "1" if candidate_quotas else "0",
         "DWARF_DSQG_W_QUOTA_HISA_MAX": str(int(quota_hisa_max)),
+        "DWARF_DSQG_W_CANDIDATE_WORKSPACE": "1" if candidate_workspace else "0",
+        "DWARF_DSQG_W_CANDIDATE_WORKSPACE_DIM": str(int(candidate_workspace_dim)),
+        "DWARF_DSQG_W_CANDIDATE_WORKSPACE_PHASE_BANDS": str(int(candidate_workspace_phase_bands)),
+        "DWARF_DSQG_W_CANDIDATE_WORKSPACE_SCORE_FEATURES": "1" if candidate_workspace_score_features else "0",
+        "DWARF_DSQG_W_CANDIDATE_WORKSPACE_QUERY_SCORES": "0" if no_candidate_workspace_query_scores else "1",
+        "DWARF_DSQG_W_CANDIDATE_WORKSPACE_PAIR_TRANSFER": "1" if candidate_workspace_pair_transfer else "0",
+        "DWARF_DSQG_W_CANDIDATE_WORKSPACE_PAIR_GATE_INIT": str(float(candidate_workspace_pair_gate_init)),
         "DWARF_DSQG_W_QUERY_TYPE_BIAS": "1" if query_type_bias else "0",
         "DWARF_DSQG_W_TYPED_HISA_REPS": "1" if typed_hisa_reps else "0",
         "DWARF_DSQG_W_DSR_CANDIDATES": "1" if dsr_candidates else "0",
@@ -422,6 +443,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evidence-prior-init-scale", type=float, default=0.0)
     parser.add_argument("--candidate-quotas", action="store_true", help="Enable DSQG-W candidate quotas for HISA evidence slots.")
     parser.add_argument("--quota-hisa-max", type=int, default=0)
+    parser.add_argument("--candidate-workspace", action="store_true", help="Enable the low-rank CandidateWorkspace score-bias reader path.")
+    parser.add_argument("--candidate-workspace-dim", type=int, default=64)
+    parser.add_argument("--candidate-workspace-phase-bands", type=int, default=4)
+    parser.add_argument("--no-candidate-workspace-score-features", action="store_true")
+    parser.add_argument("--no-candidate-workspace-query-scores", action="store_true")
+    parser.add_argument("--candidate-workspace-pair-transfer", action="store_true")
+    parser.add_argument("--candidate-workspace-pair-gate-init", type=float, default=-2.5)
     parser.add_argument("--query-type-bias", action="store_true", help="Enable query-conditioned candidate-type score bias.")
     parser.add_argument("--typed-hisa-reps", action="store_true", help="Label first four HISA evidence candidates as representative evidence slots.")
     parser.add_argument("--no-dsr-candidates", action="store_true", help="Disable direct HISA/DSR selected-token candidates and use fallback offset candidates only.")
@@ -502,6 +530,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         evidence_prior_init_scale=args.evidence_prior_init_scale,
         candidate_quotas=args.candidate_quotas,
         quota_hisa_max=args.quota_hisa_max,
+        candidate_workspace=args.candidate_workspace,
+        candidate_workspace_dim=args.candidate_workspace_dim,
+        candidate_workspace_phase_bands=args.candidate_workspace_phase_bands,
+        candidate_workspace_score_features=not args.no_candidate_workspace_score_features,
+        no_candidate_workspace_query_scores=args.no_candidate_workspace_query_scores,
+        candidate_workspace_pair_transfer=args.candidate_workspace_pair_transfer,
+        candidate_workspace_pair_gate_init=args.candidate_workspace_pair_gate_init,
         query_type_bias=args.query_type_bias,
         typed_hisa_reps=args.typed_hisa_reps,
         dsr_candidates=not args.no_dsr_candidates,

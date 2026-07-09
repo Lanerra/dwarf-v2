@@ -390,6 +390,13 @@ DSQG_W_EVIDENCE_PRIOR_CLIP = float(os.environ.get('DWARF_DSQG_W_EVIDENCE_PRIOR_C
 DSQG_W_EVIDENCE_PRIOR_INIT_SCALE = float(os.environ.get('DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE', '0.0'))
 DSQG_W_CANDIDATE_QUOTAS = os.getenv('DWARF_DSQG_W_CANDIDATE_QUOTAS', '0') == '1'
 DSQG_W_QUOTA_HISA_MAX = int(os.environ.get('DWARF_DSQG_W_QUOTA_HISA_MAX', '0'))
+DSQG_W_CANDIDATE_WORKSPACE = os.getenv('DWARF_DSQG_W_CANDIDATE_WORKSPACE', '0') == '1'
+DSQG_W_CANDIDATE_WORKSPACE_DIM = int(os.environ.get('DWARF_DSQG_W_CANDIDATE_WORKSPACE_DIM', '64'))
+DSQG_W_CANDIDATE_WORKSPACE_PHASE_BANDS = int(os.environ.get('DWARF_DSQG_W_CANDIDATE_WORKSPACE_PHASE_BANDS', '4'))
+DSQG_W_CANDIDATE_WORKSPACE_SCORE_FEATURES = os.getenv('DWARF_DSQG_W_CANDIDATE_WORKSPACE_SCORE_FEATURES', '1') != '0'
+DSQG_W_CANDIDATE_WORKSPACE_QUERY_SCORES = os.getenv('DWARF_DSQG_W_CANDIDATE_WORKSPACE_QUERY_SCORES', '1') != '0'
+DSQG_W_CANDIDATE_WORKSPACE_PAIR_TRANSFER = os.getenv('DWARF_DSQG_W_CANDIDATE_WORKSPACE_PAIR_TRANSFER', '0') == '1'
+DSQG_W_CANDIDATE_WORKSPACE_PAIR_GATE_INIT = float(os.environ.get('DWARF_DSQG_W_CANDIDATE_WORKSPACE_PAIR_GATE_INIT', '-2.5'))
 DSQG_W_DSR_CANDIDATES = os.getenv('DWARF_DSQG_W_DSR_CANDIDATES', '1') != '0'
 DSQG_W_LOCAL_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LOCAL_OFFSETS', (1, 2, 4, 8))
 DSQG_W_LONG_OFFSETS = _parse_int_tuple_env('DWARF_DSQG_W_LONG_OFFSETS', (16, 32, 64, 128, 256, 512, 1024, 2048))
@@ -3185,6 +3192,13 @@ class TriadicJ96Dsr(nn.Module):
                 evidence_prior_init_scale=DSQG_W_EVIDENCE_PRIOR_INIT_SCALE,
                 use_candidate_quotas=DSQG_W_CANDIDATE_QUOTAS,
                 quota_hisa_max=DSQG_W_QUOTA_HISA_MAX,
+                use_candidate_workspace=DSQG_W_CANDIDATE_WORKSPACE,
+                candidate_workspace_dim=DSQG_W_CANDIDATE_WORKSPACE_DIM,
+                candidate_workspace_phase_bands=DSQG_W_CANDIDATE_WORKSPACE_PHASE_BANDS,
+                candidate_workspace_score_features=DSQG_W_CANDIDATE_WORKSPACE_SCORE_FEATURES,
+                candidate_workspace_query_scores=DSQG_W_CANDIDATE_WORKSPACE_QUERY_SCORES,
+                candidate_workspace_pair_transfer=DSQG_W_CANDIDATE_WORKSPACE_PAIR_TRANSFER,
+                candidate_workspace_pair_gate_init=DSQG_W_CANDIDATE_WORKSPACE_PAIR_GATE_INIT,
             )
             self.dsqg_w_candidate_provider = CandidateProvider(self.dsqg_w_config)
             for site_key in self.dsqg_w_site_keys:
@@ -3876,6 +3890,13 @@ def _base_checkpoint_config(*, git_hash, tok_path, encoded_path, n_params):
                 'evidence_prior_init_scale': DSQG_W_EVIDENCE_PRIOR_INIT_SCALE,
                 'candidate_quotas': DSQG_W_CANDIDATE_QUOTAS,
                 'quota_hisa_max': DSQG_W_QUOTA_HISA_MAX,
+                'candidate_workspace': DSQG_W_CANDIDATE_WORKSPACE,
+                'candidate_workspace_dim': DSQG_W_CANDIDATE_WORKSPACE_DIM,
+                'candidate_workspace_phase_bands': DSQG_W_CANDIDATE_WORKSPACE_PHASE_BANDS,
+                'candidate_workspace_score_features': DSQG_W_CANDIDATE_WORKSPACE_SCORE_FEATURES,
+                'candidate_workspace_query_scores': DSQG_W_CANDIDATE_WORKSPACE_QUERY_SCORES,
+                'candidate_workspace_pair_transfer': DSQG_W_CANDIDATE_WORKSPACE_PAIR_TRANSFER,
+                'candidate_workspace_pair_gate_init': DSQG_W_CANDIDATE_WORKSPACE_PAIR_GATE_INIT,
                 'sourcewise_width_cell_fusion': os.getenv('DWARF_DSQG_W_SOURCEWISE_WIDTH_CELL_FUSION', '0') == '1',
                 'projected_width_control': os.getenv('DWARF_DSQG_W_PROJECTED_WIDTH_CONTROL', '0') == '1',
                 'triton_transformed_compact_read': os.getenv('DWARF_DSQG_W_TRITON_TRANSFORMED_COMPACT_READ', '0') == '1',
@@ -4971,6 +4992,15 @@ def train():
                         ('dsqg_w_ebh_packet_sourcewise', 'w_ebh_packet'),
                         ('dsqg_w_ebh_packet_triton', 'w_ebh_triton'),
                         ('dsqg_w_ebh_packet_semantic_approx', 'w_ebh_sem_approx'),
+                        ('dsqg_w_candidate_workspace_enabled', 'w_ws'),
+                        ('dsqg_w_candidate_workspace_dim', 'w_ws_dim'),
+                        ('dsqg_w_candidate_workspace_score_bias_norm', 'w_ws_score'),
+                        ('dsqg_w_candidate_workspace_query_conditioned', 'w_ws_q'),
+                        ('dsqg_w_candidate_workspace_query_score_norm', 'w_ws_qscore'),
+                        ('dsqg_w_candidate_workspace_norm', 'w_ws_norm'),
+                        ('dsqg_w_candidate_workspace_pair_transfer', 'w_ws_pair'),
+                        ('dsqg_w_candidate_workspace_pair_gate', 'w_ws_pair_gate'),
+                        ('dsqg_w_candidate_workspace_materialized_d_candidates', 'w_ws_matd'),
                         ('dsqg_w_metadata_cache_hit', 'w_cache'),
                         ('dsqg_w_static_source_count', 'w_srcs'),
                         ('dsqg_w_candidate_slot_count', 'w_j'),

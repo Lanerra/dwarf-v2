@@ -23,6 +23,7 @@ def load_trainer(
     triton_sourcewise: bool = False,
     detach_recomposer: bool = False,
     fast_evidence_mean: bool = False,
+    candidate_workspace: bool = False,
     width_cell: bool = False,
     typed_mixer: bool = False,
     evidence_binding_hub: bool = False,
@@ -51,6 +52,12 @@ def load_trainer(
             monkeypatch.setenv("DWARF_DSQG_W_FAST_EVIDENCE_MEAN", "1")
         else:
             monkeypatch.delenv("DWARF_DSQG_W_FAST_EVIDENCE_MEAN", raising=False)
+        if candidate_workspace:
+            monkeypatch.setenv("DWARF_DSQG_W_CANDIDATE_WORKSPACE", "1")
+            monkeypatch.setenv("DWARF_DSQG_W_CANDIDATE_WORKSPACE_DIM", "8")
+        else:
+            monkeypatch.delenv("DWARF_DSQG_W_CANDIDATE_WORKSPACE", raising=False)
+            monkeypatch.delenv("DWARF_DSQG_W_CANDIDATE_WORKSPACE_DIM", raising=False)
         if width_cell:
             monkeypatch.setenv("DWARF_DSQG_W_WIDTH_CELL", "1")
             monkeypatch.setenv("DWARF_DSQG_W_WIDTH_BOTTLENECK", "64")
@@ -103,6 +110,7 @@ def load_trainer(
         monkeypatch.delenv("DWARF_DSQG_W_WIDTH_CELL", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_TYPED_MIXER", raising=False)
         monkeypatch.delenv("DWARF_DSQG_W_EVIDENCE_BINDING_HUB", raising=False)
+        monkeypatch.delenv("DWARF_DSQG_W_CANDIDATE_WORKSPACE", raising=False)
     sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "kernels"))
     try:
@@ -429,6 +437,36 @@ def test_dsqg_w_sourcewise_env_uses_metadata_recomposer(monkeypatch) -> None:
     assert out.shape == x.shape
     assert calls == ["metadata"]
     assert model.dsqg_w_last_telemetry["dsqg_w_sourcewise"].item() == 1.0
+
+
+def test_dsqg_w_sourcewise_candidate_workspace_plumbed_into_trainer(monkeypatch) -> None:
+    mod = load_trainer(monkeypatch, dsqg_w=True, question=True, hisa_l3=True, sourcewise=True, candidate_workspace=True)
+    model = make_model(mod)
+    x = torch.randn(2, 8, mod.EMBEDDING_DIM)
+    l3_states = torch.randn(2, 8, mod.EMBEDDING_DIM)
+    question_indices = torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)
+    hisa_indices = torch.tensor([[0, 1, 2, 3], [0, 2, 4, 6]], dtype=torch.long)
+    l3_skip_indices = torch.tensor([[0, 4], [1, 5]], dtype=torch.long)
+
+    assert mod.DSQG_W_CANDIDATE_WORKSPACE is True
+    assert model.dsqg_w_config.use_candidate_workspace is True
+    assert model.dsqg_w_config.candidate_workspace_dim == 8
+    assert model.dsqg_w.candidate_workspace is not None
+
+    out = model._apply_dsqg_w_recomposer(
+        x,
+        l3_states=l3_states,
+        question_indices=question_indices,
+        hisa_evidence_indices=hisa_indices,
+        l3_skip_indices=l3_skip_indices,
+    )
+
+    assert out.shape == x.shape
+    assert torch.isfinite(out).all()
+    telemetry = model.dsqg_w_last_telemetry
+    assert telemetry["dsqg_w_candidate_workspace_enabled"].item() == 1.0
+    assert telemetry["dsqg_w_candidate_workspace_query_conditioned"].item() == 1.0
+    assert telemetry["dsqg_w_candidate_workspace_materialized_d_candidates"].item() == 0.0
 
 
 def test_dsqg_w_detach_recomposer_keeps_forward_delta_but_blocks_w_backward(monkeypatch) -> None:
