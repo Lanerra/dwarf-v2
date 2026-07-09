@@ -7,7 +7,7 @@ import os
 
 import torch
 
-from .candidate_batch import Candidate, CandidateBatch
+from .candidate_batch import Candidate, CandidateBatch, CandidateLayout
 from .candidate_types import (
     CandidateEvidenceBit,
     CandidateSource,
@@ -147,6 +147,65 @@ class CandidateProvider:
             and self.config.k_hisa_evidence > 0
             and self.config.k_question > 0
             and self.config.k_l3_skip > 0
+            and self._dsr_selected_static_slot_count() <= self.config.max_candidates
+        )
+
+    def _dsr_selected_static_slot_count(self) -> int:
+        return int(self.config.k_hisa_evidence) + int(self.config.k_question) + int(self.config.k_l3_skip) + (1 if self.config.null_fallback else 0)
+
+    def _dsr_selected_layout(
+        self,
+        device: torch.device,
+        *,
+        has_scores: bool = True,
+        has_distances: bool = True,
+    ) -> CandidateLayout:
+        slot_types: list[int] = []
+        slot_sources: list[int] = []
+        slot_groups: list[int] = []
+        if self.config.typed_hisa_reps:
+            rep_types = [
+                int(CandidateType.HISA_EVIDENCE_REP0),
+                int(CandidateType.HISA_EVIDENCE_REP1),
+                int(CandidateType.HISA_EVIDENCE_REP2),
+                int(CandidateType.HISA_EVIDENCE_REP3),
+            ]
+            for slot in range(int(self.config.k_hisa_evidence)):
+                slot_types.append(rep_types[min(slot, len(rep_types) - 1)])
+                slot_sources.append(int(CandidateSource.HISA))
+                slot_groups.append(0)
+        else:
+            for _ in range(int(self.config.k_hisa_evidence)):
+                slot_types.append(int(CandidateType.HISA_EVIDENCE))
+                slot_sources.append(int(CandidateSource.HISA))
+                slot_groups.append(0)
+        for _ in range(int(self.config.k_question)):
+            slot_types.append(int(CandidateType.QUESTION))
+            slot_sources.append(int(CandidateSource.FINAL))
+            slot_groups.append(1)
+        for _ in range(int(self.config.k_l3_skip)):
+            slot_types.append(int(CandidateType.L3_SKIP))
+            slot_sources.append(int(CandidateSource.L3))
+            slot_groups.append(2)
+        if self.config.null_fallback:
+            slot_types.append(int(CandidateType.NULL))
+            slot_sources.append(int(CandidateSource.NULL))
+            slot_groups.append(3)
+
+        read_type_ids: list[int] = []
+        for type_id in slot_types:
+            if type_id == int(CandidateType.NULL) or type_id in read_type_ids:
+                continue
+            read_type_ids.append(int(type_id))
+        active_sources = tuple(sorted({int(source_id) for source_id in slot_sources}))
+        return CandidateLayout(
+            slot_type=torch.tensor(slot_types, device=device, dtype=torch.long),
+            slot_source=torch.tensor(slot_sources, device=device, dtype=torch.long),
+            slot_group=torch.tensor(slot_groups, device=device, dtype=torch.long),
+            read_type_ids=torch.tensor(read_type_ids, device=device, dtype=torch.long),
+            active_sources=active_sources,
+            has_scores=bool(has_scores),
+            has_distances=bool(has_distances),
         )
 
     @staticmethod
@@ -356,13 +415,7 @@ class CandidateProvider:
         scores = torch.cat([g[4] for g in groups], dim=-1)
         duplicate_count = sum((g[5] for g in groups), torch.zeros((), device=device, dtype=torch.long))
         had_valid = valid.any(dim=-1, keepdim=True)
-        active_source_ids = {
-            int(CandidateSource.FINAL),
-            int(CandidateSource.HISA),
-            int(CandidateSource.L3),
-        }
         if self.config.null_fallback:
-            active_source_ids.add(int(CandidateSource.NULL))
             null_tokens = positions
             null_valid = ~had_valid
             tokens = torch.cat([tokens, null_tokens], dim=-1)
@@ -373,17 +426,14 @@ class CandidateProvider:
         if tokens.shape[-1] == 0 or not valid.any(dim=-1).all():
             raise RuntimeError("CandidateProvider produced an all-invalid DSQG-W candidate row")
 
+        layout = self._dsr_selected_layout(device, has_scores=True, has_distances=True)
+        if int(tokens.shape[-1]) != layout.slot_count:
+            raise RuntimeError(
+                f"static DSR/HISA layout slot count {layout.slot_count} does not match metadata width {tokens.shape[-1]}"
+            )
         raw_valid = valid
         raw_types = types
         raw_sources = sources
-        evidence_bits_all, evidence_count_all = self._collapse_evidence_by_token_source(
-            tokens,
-            sources,
-            self._candidate_type_evidence_bits(types),
-            valid,
-        )
-        candidate_distances_all = (positions - tokens).clamp_min(0).masked_fill(~valid, 0)
-
         priority_table = torch.full((max(self.config.n_types, len(CandidateType)),), 99, device=device, dtype=torch.long)
         for ctype, priority_value in _CANDIDATE_PRIORITY.items():
             priority_table[int(ctype)] = int(priority_value)
@@ -398,25 +448,21 @@ class CandidateProvider:
         )
         keep = valid
         keep, quota_clipped = self._apply_candidate_quotas(sort_key, keep, types)
-        sort_key = sort_key.masked_fill(~keep, float("inf"))
-        order_idx = sort_key.argsort(dim=-1)
-        order_valid = torch.ones_like(order_idx, dtype=torch.bool)
-        j_max = min(int(self.config.max_candidates), int(tokens.shape[-1]))
-        order_idx = order_idx[..., :j_max]
-        order_valid = order_valid[..., :j_max]
 
-        cand_token_indices = tokens.gather(-1, order_idx)
-        cand_types = types.gather(-1, order_idx)
-        cand_sources = sources.gather(-1, order_idx)
-        cand_scores = scores.gather(-1, order_idx)
-        evidence_bits = evidence_bits_all.gather(-1, order_idx)
-        evidence_count = evidence_count_all.gather(-1, order_idx)
-        candidate_distances = candidate_distances_all.gather(-1, order_idx)
-        cand_mask = keep.gather(-1, order_idx) & order_valid
+        cand_token_indices = tokens
+        cand_types = layout.expand_slot_type(bsz, seq_len)
+        cand_sources = layout.expand_slot_source(bsz, seq_len)
+        cand_scores = scores
+        cand_mask = keep
+        evidence_bits, evidence_count = self._collapse_evidence_by_token_source(
+            cand_token_indices,
+            cand_sources,
+            self._candidate_type_evidence_bits(cand_types),
+            cand_mask,
+        )
+        candidate_distances = (positions - cand_token_indices).clamp_min(0).masked_fill(~cand_mask, 0)
         valid_count = cand_mask.sum(dim=-1).to(torch.long)
         cand_token_indices = cand_token_indices.masked_fill(~cand_mask, -1)
-        cand_types = cand_types.masked_fill(~cand_mask, int(CandidateType.NULL))
-        cand_sources = cand_sources.masked_fill(~cand_mask, int(CandidateSource.NULL))
         cand_scores = cand_scores.masked_fill(~cand_mask, 0.0)
         evidence_bits = evidence_bits.masked_fill(~cand_mask, 0)
         evidence_count = evidence_count.masked_fill(~cand_mask, 0)
@@ -425,13 +471,15 @@ class CandidateProvider:
         raw_count = max(int(tokens.shape[-1]), 1)
         invalid_count = (~valid).sum()
         denom = torch.tensor(float(raw_count * bsz * seq_len), device=device, dtype=final_states.dtype).clamp_min(1.0)
+        j_max = layout.slot_count
         telemetry = {
             "dsqg_w_candidate_duplicate_rate": duplicate_count.to(final_states.dtype) / denom,
             "dsqg_w_candidate_invalid_rate": invalid_count.to(final_states.dtype) / denom,
             "dsqg_w_valid_candidate_count": valid_count.float().mean(),
             "dsqg_w_candidate_score_mean": cand_scores.masked_select(cand_mask).mean() if cand_mask.any() else final_states.new_tensor(0.0),
             "dsqg_w_candidate_score_max": cand_scores.masked_select(cand_mask).max() if cand_mask.any() else final_states.new_tensor(0.0),
-            "dsqg_w_static_source_count": final_states.new_tensor(float(len(active_source_ids))),
+            "dsqg_w_static_source_count": final_states.new_tensor(float(len(layout.active_sources))),
+            "dsqg_w_static_layout": final_states.new_tensor(1.0),
             "dsqg_w_candidate_specialized_metadata": final_states.new_tensor(1.0),
             "dsqg_w_candidate_slot_count": final_states.new_tensor(float(j_max)),
         }
@@ -466,7 +514,8 @@ class CandidateProvider:
             evidence_count=evidence_count,
             candidate_distances=candidate_distances,
             telemetry=telemetry,
-            active_source_ids=tuple(sorted(active_source_ids)),
+            active_source_ids=layout.active_sources,
+            candidate_layout=layout,
         )
 
     def _build_vectorized(

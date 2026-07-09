@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from kernels.dsqg_w.dsqg_w_mvp import (
     CandidateEvidenceBit,
+    CandidateLayout,
     CandidateProvider,
     CandidateSource,
     CandidateType,
@@ -48,6 +49,8 @@ def test_dsqg_w_mvp_public_surface_uses_split_module_canonical_objects() -> None
     assert mvp.CandidateEvidenceBit is candidate_types.CandidateEvidenceBit
     assert mvp.Candidate is candidate_batch.Candidate
     assert mvp.CandidateBatch is candidate_batch.CandidateBatch
+    assert mvp.CandidateLayout is candidate_batch.CandidateLayout
+    assert pkg.CandidateLayout is candidate_batch.CandidateLayout
     assert mvp.CandidateProvider is candidate_provider.CandidateProvider
     assert mvp.DSQGWWidthCell is width_cell.DSQGWWidthCell
     assert mvp.DSQGWTypedCandidateMixer is typed_mixer.DSQGWTypedCandidateMixer

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kernels.dsqg_w.dsqg_w_mvp import CandidateProvider, CandidateSource, CandidateType, DSQGWBlock, DSQGWConfig
+from kernels.dsqg_w.dsqg_w_mvp import CandidateLayout, CandidateProvider, CandidateSource, CandidateType, DSQGWBlock, DSQGWConfig
 
 
 def _sourcewise_fixture():
@@ -230,6 +230,80 @@ def test_dsr_selected_metadata_specialization_matches_generic_path(monkeypatch) 
         int(CandidateSource.L3),
         int(CandidateSource.NULL),
     }
+
+
+def test_dsr_selected_metadata_uses_static_slot_layout(monkeypatch) -> None:
+    torch.manual_seed(20260709)
+    config = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=16,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=4,
+        k_hisa_evidence=4,
+        k_l3_skip=2,
+        k_chunk=0,
+        null_fallback=True,
+        typed_hisa_reps=True,
+    )
+    provider = CandidateProvider(config)
+    x = torch.randn(2, 7, 16)
+    l3 = torch.randn(2, 7, 16)
+    positions = torch.arange(7)
+    question = torch.tensor([[0, 3, 3, 9], [0, 2, 5, 9]], dtype=torch.long)
+    hisa = torch.stack(
+        [
+            (positions - 1).clamp_min(0),
+            (positions - 3).clamp_min(0),
+            (positions - 5).clamp_min(0),
+            torch.full_like(positions, 99),
+        ],
+        dim=-1,
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+    hisa_scores = torch.tensor([0.5, 0.2, -0.1, 3.0], dtype=x.dtype).reshape(1, 1, 4).expand(2, 7, -1)
+    l3_skip = torch.stack(
+        [(positions - 2).clamp_min(0), (positions - 4).clamp_min(0)], dim=-1
+    ).unsqueeze(0).expand(2, -1, -1).contiguous()
+
+    monkeypatch.setenv("DWARF_DSQG_W_SPECIALIZED_METADATA", "1")
+    metadata = provider.build_metadata(
+        x,
+        l3_states=l3,
+        question_indices=question,
+        hisa_evidence_indices=hisa,
+        hisa_evidence_scores=hisa_scores,
+        l3_skip_indices=l3_skip,
+    )
+
+    assert isinstance(metadata.candidate_layout, CandidateLayout)
+    layout = metadata.candidate_layout
+    assert layout.slot_type.shape == (11,)
+    assert layout.slot_source.shape == (11,)
+    assert layout.slot_group.shape == (11,)
+    assert layout.has_scores is True
+    assert layout.has_distances is True
+    assert layout.active_sources == metadata.active_source_ids
+    assert torch.equal(
+        layout.slot_type[:4],
+        torch.tensor(
+            [
+                int(CandidateType.HISA_EVIDENCE_REP0),
+                int(CandidateType.HISA_EVIDENCE_REP1),
+                int(CandidateType.HISA_EVIDENCE_REP2),
+                int(CandidateType.HISA_EVIDENCE_REP3),
+            ],
+            device=layout.slot_type.device,
+        ),
+    )
+    assert torch.equal(layout.slot_type[4:8], torch.full((4,), int(CandidateType.QUESTION), device=layout.slot_type.device))
+    assert torch.equal(layout.slot_type[8:10], torch.full((2,), int(CandidateType.L3_SKIP), device=layout.slot_type.device))
+    assert layout.slot_type[10].item() == int(CandidateType.NULL)
+    assert torch.equal(metadata.cand_types, layout.expand_slot_type(2, 7))
+    assert torch.equal(metadata.cand_sources, layout.expand_slot_source(2, 7))
+    assert metadata.cand_types.stride()[:2] == (0, 0)
+    assert metadata.cand_sources.stride()[:2] == (0, 0)
+    assert metadata.cand_states.numel() == 0
 
 
 def test_grouped_slot_materialization_matches_general_source_group_path(monkeypatch) -> None:

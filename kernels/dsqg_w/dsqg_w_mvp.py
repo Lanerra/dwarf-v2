@@ -31,7 +31,7 @@ from .sourcewise_gather import (
     _dsqg_w_candidate_state_gather_kernel,
 )
 from .config import DSQGWConfig
-from .candidate_batch import Candidate, CandidateBatch
+from .candidate_batch import Candidate, CandidateBatch, CandidateLayout
 from .candidate_provider import CandidateProvider
 from .width_cell import (
     DSQGWWidthCell,
@@ -68,6 +68,7 @@ from .losses import (
 __all__ = [
     "Candidate",
     "CandidateBatch",
+    "CandidateLayout",
     "CandidateEvidenceBit",
     "CandidateProvider",
     "CandidateSource",
