@@ -1,0 +1,333 @@
+--- a/kernels/dsqg_w/candidate_provider.py
++++ b/kernels/dsqg_w/candidate_provider.py
+@@ -28,12 +28,26 @@
+     NULL fallback candidates.
+     """
+
++    _CANDIDATE_TYPE_EVIDENCE_BITS_CACHE: dict[str, torch.Tensor] = {}
++
+     def __init__(self, config: DSQGWConfig):
+         self.config = config
+         self._positions_cache: dict[tuple[int, int, str], torch.Tensor] = {}
+         self._priority_table_cache: dict[str, torch.Tensor] = {}
+         self._arange_cache: dict[tuple[int, str], torch.Tensor] = {}
+         self._typed_hisa_rep_type_ids_cache: dict[str, torch.Tensor] = {}
++
++    @staticmethod
++    def _candidate_diagnostics_enabled() -> bool:
++        """Return whether expensive candidate-distribution telemetry is enabled.
++
++        Normal training needs the path/promotion markers, not per-type/source
++        histograms or score summaries. Keep the diagnostic surface opt-in so the
++        hot metadata path avoids masked_selects and enum loops unless explicitly
++        requested for audits.
++        """
++
++        return os.getenv("DWARF_DSQG_W_CANDIDATE_DIAGNOSTICS", "0") == "1"
+
+     @staticmethod
+     def _device_key(device: torch.device) -> str:
+@@ -230,18 +244,32 @@
+
+     @classmethod
+     def _candidate_type_evidence_bits(cls, types: torch.Tensor) -> torch.Tensor:
+-        bits = torch.zeros_like(types, dtype=torch.long)
+-        bits = torch.where(cls._is_hisa_type(types), bits | int(CandidateEvidenceBit.HISA), bits)
+-        for ctype, bit in (
+-            (CandidateType.QUESTION, CandidateEvidenceBit.QUESTION),
+-            (CandidateType.L3_SKIP, CandidateEvidenceBit.L3_SKIP),
+-            (CandidateType.LOCAL, CandidateEvidenceBit.LOCAL),
+-            (CandidateType.LONG_OFFSET, CandidateEvidenceBit.LONG_OFFSET),
+-            (CandidateType.CHUNK_REP, CandidateEvidenceBit.CHUNK_REP),
+-            (CandidateType.NULL, CandidateEvidenceBit.NULL),
+-        ):
+-            bits = torch.where(types == int(ctype), bits | int(bit), bits)
+-        return bits
++        key = str(types.device)
++        table = cls._CANDIDATE_TYPE_EVIDENCE_BITS_CACHE.get(key)
++        max_type_id = max(int(ctype) for ctype in CandidateType)
++        if table is None or table.numel() <= max_type_id or table.device != types.device:
++            table = torch.zeros((max_type_id + 1,), device=types.device, dtype=torch.long)
++            hisa_type_ids = {
++                int(CandidateType.HISA_EVIDENCE),
++                int(CandidateType.HISA_EVIDENCE_REP0),
++                int(CandidateType.HISA_EVIDENCE_REP1),
++                int(CandidateType.HISA_EVIDENCE_REP2),
++                int(CandidateType.HISA_EVIDENCE_REP3),
++            }
++            for type_id in hisa_type_ids:
++                if 0 <= type_id < table.numel():
++                    table[type_id] = int(CandidateEvidenceBit.HISA)
++            for ctype, bit in (
++                (CandidateType.QUESTION, CandidateEvidenceBit.QUESTION),
++                (CandidateType.L3_SKIP, CandidateEvidenceBit.L3_SKIP),
++                (CandidateType.LOCAL, CandidateEvidenceBit.LOCAL),
++                (CandidateType.LONG_OFFSET, CandidateEvidenceBit.LONG_OFFSET),
++                (CandidateType.CHUNK_REP, CandidateEvidenceBit.CHUNK_REP),
++                (CandidateType.NULL, CandidateEvidenceBit.NULL),
++            ):
++                table[int(ctype)] = table[int(ctype)] | int(bit)
++            cls._CANDIDATE_TYPE_EVIDENCE_BITS_CACHE[key] = table
++        return table[types.clamp_min(0).clamp_max(table.numel() - 1)]
+
+     @staticmethod
+     def _evidence_count_from_bits(bits: torch.Tensor) -> torch.Tensor:
+@@ -421,12 +449,12 @@
+             raw_valid = valid
+             raw_types = types
+             raw_sources = sources
+-            evidence_bits_all, evidence_count_all = self._collapse_evidence_by_token_source(
+-                tokens,
+-                sources,
+-                self._candidate_type_evidence_bits(types),
+-                valid,
+-            )
++            # The DSR-selected fast path emits only disjoint source groups
++            # (FINAL/QUESTION, HISA, L3, optional NULL) after same-source dedupe.
++            # Collapsing by token+source is therefore an identity operation on
++            # evidence bits, so avoid the O(R^2) same-key tensor and per-bit loop.
++            evidence_bits_all = self._candidate_type_evidence_bits(types).masked_fill(~valid, 0)
++            evidence_count_all = (evidence_bits_all != 0).to(torch.long).masked_fill(~valid, 0)
+             candidate_distances_all = (positions - tokens).clamp_min(0).masked_fill(~valid, 0)
+
+             priority_table = self._priority_table(device)
+@@ -474,29 +502,35 @@
+                 "dsqg_w_candidate_duplicate_rate": duplicate_count.to(final_states.dtype) / denom,
+                 "dsqg_w_candidate_invalid_rate": invalid_count.to(final_states.dtype) / denom,
+                 "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+-                "dsqg_w_candidate_score_mean": cand_scores.masked_select(cand_mask).mean() if cand_mask.any() else final_states.new_tensor(0.0),
+-                "dsqg_w_candidate_score_max": cand_scores.masked_select(cand_mask).max() if cand_mask.any() else final_states.new_tensor(0.0),
+                 "dsqg_w_static_source_count": final_states.new_tensor(float(len(active_source_ids))),
+                 "dsqg_w_candidate_specialized_metadata": final_states.new_tensor(1.0),
+                 "dsqg_w_candidate_slot_count": final_states.new_tensor(float(j_max)),
+             }
+-            mask_denom = cand_mask.float().sum().clamp_min(1.0)
+-            for ctype in CandidateType:
+-                mask = (cand_types == int(ctype)) & cand_mask
+-                telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
+-            telemetry.update(
+-                self._evidence_telemetry(
+-                    raw_types=raw_types,
+-                    raw_sources=raw_sources,
+-                    raw_valid=raw_valid,
+-                    cand_types=cand_types,
+-                    cand_sources=cand_sources,
+-                    cand_mask=cand_mask,
+-                    evidence_count=evidence_count,
+-                    quota_clipped=quota_clipped,
+-                    dtype=final_states.dtype,
++            if self._candidate_diagnostics_enabled():
++                selected_scores = cand_scores.masked_select(cand_mask) if cand_mask.any() else None
++                telemetry["dsqg_w_candidate_score_mean"] = (
++                    selected_scores.mean() if selected_scores is not None else final_states.new_tensor(0.0)
+                 )
+-            )
++                telemetry["dsqg_w_candidate_score_max"] = (
++                    selected_scores.max() if selected_scores is not None else final_states.new_tensor(0.0)
++                )
++                mask_denom = cand_mask.float().sum().clamp_min(1.0)
++                for ctype in CandidateType:
++                    mask = (cand_types == int(ctype)) & cand_mask
++                    telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
++                telemetry.update(
++                    self._evidence_telemetry(
++                        raw_types=raw_types,
++                        raw_sources=raw_sources,
++                        raw_valid=raw_valid,
++                        cand_types=cand_types,
++                        cand_sources=cand_sources,
++                        cand_mask=cand_mask,
++                        evidence_count=evidence_count,
++                        quota_clipped=quota_clipped,
++                        dtype=final_states.dtype,
++                    )
++                )
+             if _dsqg_w_geometry_audit_enabled():
+                 telemetry.update(_dsqg_w_geometry_telemetry(cand_token_indices, cand_types, cand_sources, cand_mask))
+         return CandidateBatch(
+@@ -749,29 +783,35 @@
+             "dsqg_w_candidate_duplicate_rate": duplicate_count.to(final_states.dtype) / denom,
+             "dsqg_w_candidate_invalid_rate": invalid_count.to(final_states.dtype) / denom,
+             "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+-            "dsqg_w_candidate_score_mean": cand_scores.masked_select(cand_mask).mean() if cand_mask.any() else final_states.new_tensor(0.0),
+-            "dsqg_w_candidate_score_max": cand_scores.masked_select(cand_mask).max() if cand_mask.any() else final_states.new_tensor(0.0),
+             "dsqg_w_static_source_count": final_states.new_tensor(float(len(active_source_ids))),
+             "dsqg_w_candidate_specialized_metadata": final_states.new_tensor(0.0),
+             "dsqg_w_candidate_slot_count": final_states.new_tensor(float(j_max)),
+         }
+-        mask_denom = cand_mask.float().sum().clamp_min(1.0)
+-        for ctype in CandidateType:
+-            mask = (cand_types == int(ctype)) & cand_mask
+-            telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
+-        telemetry.update(
+-            self._evidence_telemetry(
+-                raw_types=raw_types,
+-                raw_sources=raw_sources,
+-                raw_valid=raw_valid,
+-                cand_types=cand_types,
+-                cand_sources=cand_sources,
+-                cand_mask=cand_mask,
+-                evidence_count=evidence_count,
+-                quota_clipped=quota_clipped,
+-                dtype=final_states.dtype,
++        if self._candidate_diagnostics_enabled():
++            selected_scores = cand_scores.masked_select(cand_mask) if cand_mask.any() else None
++            telemetry["dsqg_w_candidate_score_mean"] = (
++                selected_scores.mean() if selected_scores is not None else final_states.new_tensor(0.0)
+             )
+-        )
++            telemetry["dsqg_w_candidate_score_max"] = (
++                selected_scores.max() if selected_scores is not None else final_states.new_tensor(0.0)
++            )
++            mask_denom = cand_mask.float().sum().clamp_min(1.0)
++            for ctype in CandidateType:
++                mask = (cand_types == int(ctype)) & cand_mask
++                telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / mask_denom
++            telemetry.update(
++                self._evidence_telemetry(
++                    raw_types=raw_types,
++                    raw_sources=raw_sources,
++                    raw_valid=raw_valid,
++                    cand_types=cand_types,
++                    cand_sources=cand_sources,
++                    cand_mask=cand_mask,
++                    evidence_count=evidence_count,
++                    quota_clipped=quota_clipped,
++                    dtype=final_states.dtype,
++                )
++            )
+         if _dsqg_w_geometry_audit_enabled():
+             telemetry.update(
+                 _dsqg_w_geometry_telemetry(
+@@ -968,9 +1008,10 @@
+             "dsqg_w_valid_candidate_count": valid_count.float().mean(),
+             "dsqg_w_static_source_count": final_states.new_tensor(float(torch.unique(cand_sources[cand_mask]).numel())),
+         }
+-        for ctype in CandidateType:
+-            mask = (cand_types == int(ctype)) & cand_mask
+-            telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / cand_mask.float().sum().clamp_min(1.0)
++        if self._candidate_diagnostics_enabled():
++            for ctype in CandidateType:
++                mask = (cand_types == int(ctype)) & cand_mask
++                telemetry[f"dsqg_w_candidate_fraction_{ctype.name.lower()}"] = mask.float().sum() / cand_mask.float().sum().clamp_min(1.0)
+         if _dsqg_w_geometry_audit_enabled():
+             telemetry.update(
+                 _dsqg_w_geometry_telemetry(
+--- a/tests/test_dsqg_w_candidate_provider_optimization.py
++++ b/tests/test_dsqg_w_candidate_provider_optimization.py
+@@ -34,7 +34,8 @@
+     return config, final_states, l3_states, question_indices, hisa_indices, hisa_scores, l3_skip_indices
+
+
+-def test_sourcewise_accumulation_matches_dense_forward_and_backward() -> None:
++def test_sourcewise_accumulation_matches_dense_forward_and_backward(monkeypatch) -> None:
++    monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "0")
+     config, x, l3, question, hisa, hisa_scores, l3_skip = _sourcewise_fixture()
+     dense_provider = CandidateProvider(config)
+     sourcewise_provider = CandidateProvider(config)
+@@ -102,6 +103,7 @@
+
+
+ def test_sourcewise_path_does_not_build_candidate_state_or_projected_kv_surfaces(monkeypatch) -> None:
++    monkeypatch.setenv("DWARF_DSQG_W_TRITON_SOURCEWISE", "0")
+     config, x, l3, question, hisa, hisa_scores, l3_skip = _sourcewise_fixture()
+     provider = CandidateProvider(config)
+     block = DSQGWBlock.from_config(config)
+@@ -218,6 +220,12 @@
+
+     assert torch.equal(valid_rows(specialized), valid_rows(generic))
+     assert torch.allclose(specialized.cand_scores[specialized.cand_mask], generic.cand_scores[generic.cand_mask])
++    assert torch.equal(specialized.evidence_bits[specialized.cand_mask], generic.evidence_bits[generic.cand_mask])
++    assert torch.equal(specialized.evidence_count[specialized.cand_mask], generic.evidence_count[generic.cand_mask])
++    assert torch.equal(
++        specialized.candidate_distances[specialized.cand_mask],
++        generic.candidate_distances[generic.cand_mask],
++    )
+     assert specialized.valid_candidate_count.float().mean() == generic.valid_candidate_count.float().mean()
+     assert specialized.active_source_ids == generic.active_source_ids
+     assert specialized.telemetry["dsqg_w_candidate_specialized_metadata"].item() == 1.0
+@@ -299,6 +307,84 @@
+     assert torch.equal(second.cand_mask, first.cand_mask)
+     assert torch.allclose(second.cand_scores, first.cand_scores)
+     assert second.telemetry["dsqg_w_candidate_specialized_metadata"].item() == 1.0
++
++
++def test_candidate_diagnostic_telemetry_is_opt_in(monkeypatch) -> None:
++    torch.manual_seed(202607081)
++    config = DSQGWConfig(
++        d=16,
++        n_heads=4,
++        max_candidates=16,
++        local_offsets=(),
++        long_offsets=(),
++        k_question=4,
++        k_hisa_evidence=4,
++        k_l3_skip=2,
++        k_chunk=0,
++        null_fallback=True,
++        typed_hisa_reps=True,
++    )
++    provider = CandidateProvider(config)
++    final_states = torch.randn(2, 7, 16)
++    l3_states = torch.randn(2, 7, 16)
++    positions = torch.arange(7)
++    question = torch.tensor([[0, 3, 3, 9], [0, 2, 5, 9]], dtype=torch.long)
++    hisa = torch.stack(
++        [
++            (positions - 1).clamp_min(0),
++            (positions - 3).clamp_min(0),
++            (positions - 4).clamp_min(0),
++            torch.full_like(positions, 99),
++        ],
++        dim=-1,
++    ).unsqueeze(0).expand(2, -1, -1).contiguous()
++    hisa_scores = torch.tensor([0.9, 0.1, -0.2, 4.0], dtype=final_states.dtype).reshape(1, 1, 4).expand(2, 7, -1)
++    l3_skip = torch.stack(
++        [(positions - 2).clamp_min(0), (positions - 5).clamp_min(0)], dim=-1
++    ).unsqueeze(0).expand(2, -1, -1).contiguous()
++
++    monkeypatch.delenv("DWARF_DSQG_W_CANDIDATE_DIAGNOSTICS", raising=False)
++    normal = provider.build_metadata(
++        final_states,
++        l3_states=l3_states,
++        question_indices=question,
++        hisa_evidence_indices=hisa,
++        hisa_evidence_scores=hisa_scores,
++        l3_skip_indices=l3_skip,
++    )
++    normal_keys = set(normal.telemetry)
++    assert {
++        "dsqg_w_candidate_duplicate_rate",
++        "dsqg_w_candidate_invalid_rate",
++        "dsqg_w_valid_candidate_count",
++        "dsqg_w_static_source_count",
++        "dsqg_w_candidate_specialized_metadata",
++        "dsqg_w_candidate_slot_count",
++    }.issubset(normal_keys)
++    assert "dsqg_w_candidate_score_mean" not in normal_keys
++    assert "dsqg_w_candidate_fraction_question" not in normal_keys
++    assert "dsqg_w_candidate_multi_evidence_fraction" not in normal_keys
++
++    monkeypatch.setenv("DWARF_DSQG_W_CANDIDATE_DIAGNOSTICS", "1")
++    diagnostic = provider.build_metadata(
++        final_states,
++        l3_states=l3_states,
++        question_indices=question,
++        hisa_evidence_indices=hisa,
++        hisa_evidence_scores=hisa_scores,
++        l3_skip_indices=l3_skip,
++    )
++    diagnostic_keys = set(diagnostic.telemetry)
++    assert torch.equal(diagnostic.cand_token_indices, normal.cand_token_indices)
++    assert torch.equal(diagnostic.cand_types, normal.cand_types)
++    assert torch.equal(diagnostic.cand_sources, normal.cand_sources)
++    assert torch.equal(diagnostic.cand_mask, normal.cand_mask)
++    assert torch.equal(diagnostic.evidence_bits, normal.evidence_bits)
++    assert torch.equal(diagnostic.evidence_count, normal.evidence_count)
++    assert torch.equal(diagnostic.candidate_distances, normal.candidate_distances)
++    assert "dsqg_w_candidate_score_mean" in diagnostic_keys
++    assert "dsqg_w_candidate_fraction_question" in diagnostic_keys
++    assert "dsqg_w_candidate_multi_evidence_fraction" in diagnostic_keys
+
+
+ def test_grouped_slot_materialization_matches_general_source_group_path(monkeypatch) -> None:

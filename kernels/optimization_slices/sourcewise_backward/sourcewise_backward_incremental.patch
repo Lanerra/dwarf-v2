@@ -1,0 +1,206 @@
+--- a/kernels/dsqg_w/sourcewise_read.py
++++ b/kernels/dsqg_w/sourcewise_read.py
+@@ -367,6 +367,8 @@
+         USE_SCORE_BIAS: tl.constexpr,
+         COMPUTE_QUERY: tl.constexpr,
+         COMPUTE_SOURCE: tl.constexpr,
++        HAS_L3_SOURCE: tl.constexpr,
++        HAS_SUMMARY_SOURCE: tl.constexpr,
+     ):
+         pid = tl.program_id(0)
+         h = pid % H
+@@ -380,6 +382,11 @@
+         q = tl.load(q_ptr + q_base, mask=hd_mask, other=0.0).to(tl.float32)
+         lse = tl.load(lse_ptr + (b * N + n) * H + h).to(tl.float32)
+         row_j_base = (b * N + n) * J
++        grad_slot0 = tl.load(
++            grad_slots_ptr + ((b * N + n) * READ_SLOTS + 0) * D + h * HD + offs,
++            mask=hd_mask,
++            other=0.0,
++        ).to(tl.float32)
+
+         sum_p_dp = 0.0
+         for j in tl.static_range(0, J):
+@@ -392,8 +399,10 @@
+             src_base = ((b * N + tok) * H + h) * HD + offs
+             k = tl.zeros((int(BLOCK_HD),), tl.float32)
+             k += tl.load(k_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+-            k += tl.load(k_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+-            k += tl.load(k_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
++            if HAS_L3_SOURCE:
++                k += tl.load(k_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
++            if HAS_SUMMARY_SOURCE:
++                k += tl.load(k_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+             role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+             src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+             score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+@@ -407,9 +416,10 @@
+
+             v = tl.zeros((int(BLOCK_HD),), tl.float32)
+             v += tl.load(v_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+-            v += tl.load(v_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+-            v += tl.load(v_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+-            grad_slot0 = tl.load(grad_slots_ptr + ((b * N + n) * READ_SLOTS + 0) * D + h * HD + offs, mask=hd_mask, other=0.0).to(tl.float32)
++            if HAS_L3_SOURCE:
++                v += tl.load(v_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
++            if HAS_SUMMARY_SOURCE:
++                v += tl.load(v_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+             type_slot = tl.load(type_slot_map_ptr + ctype, mask=valid & (ctype >= 0) & (ctype < N_TYPES), other=-1)
+             grad_type = tl.load(
+                 grad_slots_ptr + ((b * N + n) * READ_SLOTS + type_slot) * D + h * HD + offs,
+@@ -431,8 +441,10 @@
+             src_base = ((b * N + tok) * H + h) * HD + offs
+             k = tl.zeros((int(BLOCK_HD),), tl.float32)
+             k += tl.load(k_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+-            k += tl.load(k_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+-            k += tl.load(k_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
++            if HAS_L3_SOURCE:
++                k += tl.load(k_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
++            if HAS_SUMMARY_SOURCE:
++                k += tl.load(k_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+             role = tl.load(role_key_ptr + ctype * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+             src_role = tl.load(source_key_ptr + source_id * D + h * HD + offs, mask=hd_mask & valid, other=0.0).to(tl.float32)
+             score = tl.sum(q * (k + role + src_role), axis=0) * inv_sqrt
+@@ -446,9 +458,10 @@
+
+             v = tl.zeros((int(BLOCK_HD),), tl.float32)
+             v += tl.load(v_final_ptr + src_base, mask=hd_mask & valid & ((source_id == 1) | (source_id == 5)), other=0.0).to(tl.float32)
+-            v += tl.load(v_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
+-            v += tl.load(v_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+-            grad_slot0 = tl.load(grad_slots_ptr + ((b * N + n) * READ_SLOTS + 0) * D + h * HD + offs, mask=hd_mask, other=0.0).to(tl.float32)
++            if HAS_L3_SOURCE:
++                v += tl.load(v_l3_ptr + src_base, mask=hd_mask & valid & ((source_id == 2) | (source_id == 3)), other=0.0).to(tl.float32)
++            if HAS_SUMMARY_SOURCE:
++                v += tl.load(v_summary_ptr + src_base, mask=hd_mask & valid & (source_id == 4), other=0.0).to(tl.float32)
+             type_slot = tl.load(type_slot_map_ptr + ctype, mask=valid & (ctype >= 0) & (ctype < N_TYPES), other=-1)
+             grad_type = tl.load(
+                 grad_slots_ptr + ((b * N + n) * READ_SLOTS + type_slot) * D + h * HD + offs,
+@@ -469,10 +482,12 @@
+             if COMPUTE_SOURCE:
+                 tl.atomic_add(grad_k_final_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & final_src)
+                 tl.atomic_add(grad_v_final_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & final_src)
+-                tl.atomic_add(grad_k_l3_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & l3_src)
+-                tl.atomic_add(grad_v_l3_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & l3_src)
+-                tl.atomic_add(grad_k_summary_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & summary_src)
+-                tl.atomic_add(grad_v_summary_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & summary_src)
++                if HAS_L3_SOURCE:
++                    tl.atomic_add(grad_k_l3_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & l3_src)
++                    tl.atomic_add(grad_v_l3_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & l3_src)
++                if HAS_SUMMARY_SOURCE:
++                    tl.atomic_add(grad_k_summary_ptr + src_base, d_k_eff, sem="relaxed", mask=hd_mask & valid & summary_src)
++                    tl.atomic_add(grad_v_summary_ptr + src_base, d_v, sem="relaxed", mask=hd_mask & valid & summary_src)
+             if COMPUTE_QUERY:
+                 tl.atomic_add(grad_role_key_ptr + ctype * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+                 tl.atomic_add(grad_source_key_ptr + source_id * D + h * HD + offs, d_k_eff, sem="relaxed", mask=hd_mask & valid)
+@@ -990,6 +1005,8 @@
+         n_types: int,
+         read_slots: int,
+         block_hd: int,
++        has_l3_source: bool,
++        has_summary_source: bool,
+     ):
+         if not _TRITON_SOURCEWISE_AVAILABLE or triton is None or _dsqg_w_sourcewise_read_slots_kernel is None:
+             raise NotImplementedError("DSQG-W sourcewise compact read requires Triton")
+@@ -999,6 +1016,8 @@
+         ctx.n_heads = int(n_heads)
+         ctx.dh = int(dh)
+         ctx.read_slots = int(read_slots)
++        ctx.has_l3_source = bool(has_l3_source)
++        ctx.has_summary_source = bool(has_summary_source)
+         bsz, seq_len = q.shape[:2]
+         schedule = _dsqg_w_triton_schedule(dh, q.device)
+         read_slots_out = torch.empty((bsz, seq_len, int(read_slots), int(d)), device=q.device, dtype=q.dtype)
+@@ -1098,10 +1117,10 @@
+             grad_q = torch.zeros_like(q)
+             grad_k_final = torch.zeros_like(k_final)
+             grad_v_final = torch.zeros_like(v_final)
+-            grad_k_l3 = torch.zeros_like(k_l3)
+-            grad_v_l3 = torch.zeros_like(v_l3)
+-            grad_k_summary = torch.zeros_like(k_summary)
+-            grad_v_summary = torch.zeros_like(v_summary)
++            grad_k_l3 = torch.zeros_like(k_l3) if ctx.has_l3_source else None
++            grad_v_l3 = torch.zeros_like(v_l3) if ctx.has_l3_source else None
++            grad_k_summary = torch.zeros_like(k_summary) if ctx.has_summary_source else None
++            grad_v_summary = torch.zeros_like(v_summary) if ctx.has_summary_source else None
+             grad_role_key = torch.zeros_like(role_key_weight)
+             grad_source_key = torch.zeros_like(source_key_weight)
+             grad_type_bias = torch.zeros_like(type_bias)
+@@ -1111,6 +1130,10 @@
+             empty = torch.empty((0,), device=q.device, dtype=q.dtype)
+             schedule = _dsqg_w_triton_schedule(dh, q.device)
+             grid = (bsz * seq_len * h,)
++            grad_k_l3_arg = grad_k_l3 if grad_k_l3 is not None else grad_k_final
++            grad_v_l3_arg = grad_v_l3 if grad_v_l3 is not None else grad_v_final
++            grad_k_summary_arg = grad_k_summary if grad_k_summary is not None else grad_k_final
++            grad_v_summary_arg = grad_v_summary if grad_v_summary is not None else grad_v_final
+
+             def launch_split_kernel(*, compute_query: bool, compute_source: bool) -> None:
+                 _dsqg_w_sourcewise_read_slots_backward_kernel[grid](
+@@ -1137,10 +1160,10 @@
+                     grad_q,
+                     grad_k_final,
+                     grad_v_final,
+-                    grad_k_l3,
+-                    grad_v_l3,
+-                    grad_k_summary,
+-                    grad_v_summary,
++                    grad_k_l3_arg,
++                    grad_v_l3_arg,
++                    grad_k_summary_arg,
++                    grad_v_summary_arg,
+                     grad_role_key,
+                     grad_source_key,
+                     grad_type_bias,
+@@ -1160,6 +1183,8 @@
+                     USE_SCORE_BIAS=ctx.use_score_bias,
+                     COMPUTE_QUERY=compute_query,
+                     COMPUTE_SOURCE=compute_source,
++                    HAS_L3_SOURCE=ctx.has_l3_source,
++                    HAS_SUMMARY_SOURCE=ctx.has_summary_source,
+                     num_warps=schedule.num_warps,
+                     num_stages=schedule.num_stages,
+                 )
+@@ -1213,6 +1238,8 @@
+                 None,
+                 None,
+                 None,
++                None,
++                None,
+             )
+         gather_tokens = cand_token_indices.clamp(0, max(seq_len - 1, 0))
+         batch_offsets = torch.arange(bsz, device=q.device, dtype=torch.long).reshape(bsz, 1) * seq_len
+@@ -1359,6 +1386,8 @@
+             *grad_list,
+             grad_qtb,
+             grad_score_bias,
++            None,
++            None,
+             None,
+             None,
+             None,
+--- a/kernels/dsqg_w/block.py
++++ b/kernels/dsqg_w/block.py
+@@ -1009,6 +1009,14 @@
+         read_slot_count = self._read_slot_count
+         read_slot_block = self._read_slot_block
+         type_slot_map = self._type_slot_map_for(x)
++        has_l3_source = any(
++            int(source_id) in {int(CandidateSource.L3), int(CandidateSource.HISA)}
++            for source_id in needed_source_ids
++        )
++        has_summary_source = any(
++            int(source_id) == int(CandidateSource.SUMMARY)
++            for source_id in needed_source_ids
++        )
+
+         probs = torch.empty((bsz, seq_len, j_count, h), device=x.device, dtype=x.dtype) if return_routing else empty
+         if needs_backward:
+@@ -1039,6 +1047,8 @@
+                 self.n_types,
+                 read_slot_count,
+                 block_hd,
++                has_l3_source,
++                has_summary_source,
+             )
+             if return_routing:
+                 with torch.no_grad():

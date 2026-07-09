@@ -1,0 +1,312 @@
+--- a/kernels/dsqg_w/evidence_prior.py
++++ b/kernels/dsqg_w/evidence_prior.py
+@@ -7,12 +7,15 @@
+
+
+ class DSQGWEvidencePriorComposer(nn.Module):
+-    """Bounded scalar evidence prior for DSQG-W candidate scoring.
++    """Bounded scalar candidate/evidence prior for DSQG-W candidate scoring.
+
+-    The module is intentionally scalar and row-centered so it can feed the
+-    existing cand_scores path without changing kernel ABI. All learned weights
+-    default to zero, making the composer a strict no-op until enabled scales
+-    learn away from zero.
++    This is the Lean-W cheap candidate-prior substitute for the deprecated EBH
++    path: intentionally scalar and row-centered so it can feed the existing
++    ``cand_scores`` path without changing kernel ABI. The historical
++    ``evidence_prior`` name is kept as the compatibility spelling; new callers
++    may use the ``candidate_prior`` alias below. All learned weights default to
++    zero, making the composer a strict no-op until enabled scales learn away
++    from zero.
+     """
+
+     def __init__(self, *, n_types: int, n_sources: int, clip: float = 2.0, init_scale: float = 0.0) -> None:
+@@ -116,5 +119,7 @@
+             }
+         return clipped.to(dtype=raw_hisa_scores.dtype if raw_hisa_scores is not None else torch.float32), telemetry
+
++DSQGWCandidatePriorComposer = DSQGWEvidencePriorComposer
+
+-__all__ = ["DSQGWEvidencePriorComposer"]
++
++__all__ = ["DSQGWEvidencePriorComposer", "DSQGWCandidatePriorComposer"]
+--- a/kernels/dsqg_w/config.py
++++ b/kernels/dsqg_w/config.py
+@@ -35,6 +35,7 @@
+     use_query_type_bias: bool = False
+     typed_hisa_reps: bool = False
+     use_evidence_prior: bool = False
++    use_candidate_prior: bool = False
+     evidence_prior_clip: float = 2.0
+     evidence_prior_init_scale: float = 0.0
+     use_evidence_binding_hub: bool = False
+@@ -87,5 +88,11 @@
+                 if not 0 <= int(type_id) < self.n_types:
+                     raise ValueError("read_type_ids entries must be valid candidate type ids")
+
++    @property
++    def candidate_prior_enabled(self) -> bool:
++        """Compatibility alias: candidate-prior uses evidence-prior plumbing."""
++
++        return bool(self.use_candidate_prior or self.use_evidence_prior)
++
+
+ __all__ = ["DSQGWConfig"]
+--- a/kernels/dsqg_w/block.py
++++ b/kernels/dsqg_w/block.py
+@@ -99,6 +99,7 @@
+         typed_mixer_gate_init: float = -5.0,
+         use_query_type_bias: bool = False,
+         use_evidence_prior: bool = False,
++        use_candidate_prior: bool = False,
+         evidence_prior_clip: float = 2.0,
+         evidence_prior_init_scale: float = 0.0,
+         use_evidence_binding_hub: bool = False,
+@@ -156,6 +157,7 @@
+             else None
+         )
+         self.use_query_type_bias = bool(use_query_type_bias)
++        candidate_prior_enabled = bool(use_candidate_prior or use_evidence_prior)
+         self.evidence_prior = (
+             DSQGWEvidencePriorComposer(
+                 n_types=n_types,
+@@ -163,9 +165,12 @@
+                 clip=evidence_prior_clip,
+                 init_scale=evidence_prior_init_scale,
+             )
+-            if use_evidence_prior
++            if candidate_prior_enabled
+             else None
+         )
++        # Lean-W calls this the cheap candidate prior; evidence_prior remains the
++        # historical compatibility name used by checkpoints/env flags.
++        self.candidate_prior = self.evidence_prior
+         self.evidence_binding_hub = (
+             DSQGWEvidenceBindingHub(
+                 d=d,
+@@ -231,6 +236,7 @@
+             typed_mixer_gate_init=config.typed_mixer_gate_init,
+             use_query_type_bias=config.use_query_type_bias,
+             use_evidence_prior=config.use_evidence_prior,
++            use_candidate_prior=config.use_candidate_prior,
+             evidence_prior_clip=config.evidence_prior_clip,
+             evidence_prior_init_scale=config.evidence_prior_init_scale,
+             use_evidence_binding_hub=config.use_evidence_binding_hub,
+@@ -329,13 +335,13 @@
+         evidence_count: torch.Tensor | None = None,
+         candidate_distances: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+-        if self.evidence_prior is None:
++        if self.candidate_prior is None:
+             return cand_scores, {}
+         if evidence_bits is None:
+             evidence_bits = CandidateProvider._candidate_type_evidence_bits(cand_types).masked_fill(~cand_mask, 0)
+         if evidence_count is None:
+             evidence_count = CandidateProvider._evidence_count_from_bits(evidence_bits).masked_fill(~cand_mask, 0)
+-        prior, telemetry = self.evidence_prior(
++        prior, telemetry = self.candidate_prior(
+             cand_types,
+             cand_sources,
+             cand_mask,
+@@ -346,6 +352,7 @@
+         )
+         prior = prior.to(device=cand_types.device, dtype=cand_scores.dtype if cand_scores is not None else self.type_bias.dtype)
+         combined = prior if cand_scores is None else cand_scores + prior.to(dtype=cand_scores.dtype)
++        telemetry["dsqg_w_candidate_prior_enabled"] = prior.new_tensor(1.0).detach()
+         telemetry["dsqg_w_evidence_prior_enabled"] = prior.new_tensor(1.0).detach()
+         return combined, telemetry
+
+--- a/scripts/run_dsqg_w_full_training.py
++++ b/scripts/run_dsqg_w_full_training.py
+@@ -134,6 +134,8 @@
+         "force_ebh_pair_gate": _env_float_or_none(env, "DWARF_DSQG_W_FORCE_EBH_PAIR_GATE"),
+         "query_type_bias": _env_bool(env, "DWARF_DSQG_W_QUERY_TYPE_BIAS"),
+         "evidence_prior": _env_bool(env, "DWARF_DSQG_W_EVIDENCE_PRIOR"),
++        "candidate_prior": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_PRIOR") or _env_bool(env, "DWARF_DSQG_W_EVIDENCE_PRIOR"),
++        "candidate_prior_implementation": "DSQGWEvidencePriorComposer",
+         "evidence_prior_clip": float(env["DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP"]),
+         "evidence_prior_init_scale": float(env["DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE"]),
+         "candidate_quotas": _env_bool(env, "DWARF_DSQG_W_CANDIDATE_QUOTAS"),
+@@ -202,6 +204,7 @@
+     ebh_triton_lane_accum: bool = False,
+     ebh_fused_lane_accum: bool = False,
+     evidence_prior: bool = False,
++    candidate_prior: bool = False,
+     evidence_prior_clip: float = 2.0,
+     evidence_prior_init_scale: float = 0.0,
+     candidate_quotas: bool = False,
+@@ -236,6 +239,7 @@
+     stderr_path = out / "trainer.stderr.log"
+     py = str(python or sys.executable)
+     sourcewise = bool(sourcewise or triton_sourcewise)
++    candidate_prior_enabled = bool(candidate_prior or evidence_prior)
+     env: dict[str, str] = {
+         "CUDA_VISIBLE_DEVICES": str(gpu),
+         "PYTHONPATH": ".",
+@@ -286,7 +290,8 @@
+         "DWARF_DSQG_W_EBH_SOURCEWISE_PACKET": "1" if ebh_sourcewise_packet else "0",
+         "DWARF_DSQG_W_EBH_TRITON_LANE_ACCUM": "1" if ebh_triton_lane_accum else "0",
+         "DWARF_DSQG_W_EBH_FUSED_LANE_ACCUM": "1" if ebh_fused_lane_accum else "0",
+-        "DWARF_DSQG_W_EVIDENCE_PRIOR": "1" if evidence_prior else "0",
++        "DWARF_DSQG_W_EVIDENCE_PRIOR": "1" if candidate_prior_enabled else "0",
++        "DWARF_DSQG_W_CANDIDATE_PRIOR": "1" if candidate_prior_enabled else "0",
+         "DWARF_DSQG_W_EVIDENCE_PRIOR_CLIP": str(float(evidence_prior_clip)),
+         "DWARF_DSQG_W_EVIDENCE_PRIOR_INIT_SCALE": str(float(evidence_prior_init_scale)),
+         "DWARF_DSQG_W_CANDIDATE_QUOTAS": "1" if candidate_quotas else "0",
+@@ -436,7 +441,12 @@
+     parser.add_argument("--ebh-sourcewise-packet", action="store_true", help="Use sourcewise EBH packet accumulation instead of materializing [B,T,J,D] candidate states.")
+     parser.add_argument("--ebh-triton-lane-accum", action="store_true", help="Use the Triton-backed EBH sourcewise packet lane-accumulation fast path.")
+     parser.add_argument("--ebh-fused-lane-accum", action="store_true", help="Use the fused Triton/autograd EBH sourcewise packet lane accumulator.")
+-    parser.add_argument("--evidence-prior", action="store_true", help="Enable the DSQG-W scalar evidence/source/type prior composer.")
++    parser.add_argument("--evidence-prior", action="store_true", help="Compatibility spelling for --candidate-prior.")
++    parser.add_argument(
++        "--candidate-prior",
++        action="store_true",
++        help="Enable the cheap scalar DSQG-W candidate prior (implemented by DSQGWEvidencePriorComposer).",
++    )
+     parser.add_argument("--evidence-prior-clip", type=float, default=2.0)
+     parser.add_argument("--evidence-prior-init-scale", type=float, default=0.0)
+     parser.add_argument("--candidate-quotas", action="store_true", help="Enable DSQG-W candidate quotas for HISA evidence slots.")
+@@ -523,6 +533,7 @@
+         ebh_triton_lane_accum=args.ebh_triton_lane_accum,
+         ebh_fused_lane_accum=args.ebh_fused_lane_accum,
+         evidence_prior=args.evidence_prior,
++        candidate_prior=args.candidate_prior,
+         evidence_prior_clip=args.evidence_prior_clip,
+         evidence_prior_init_scale=args.evidence_prior_init_scale,
+         candidate_quotas=args.candidate_quotas,
+--- a/tests/test_dsqg_w_candidate_provider_optimization.py
++++ b/tests/test_dsqg_w_candidate_provider_optimization.py
+@@ -4,6 +4,8 @@
+ import torch
+
+ from kernels.dsqg_w.dsqg_w_mvp import CandidateProvider, CandidateSource, CandidateType, DSQGWBlock, DSQGWConfig
++from kernels.dsqg_w.candidate_types import CandidateEvidenceBit
++from kernels.dsqg_w.evidence_prior import DSQGWCandidatePriorComposer, DSQGWEvidencePriorComposer
+
+
+ def _sourcewise_fixture():
+@@ -385,6 +387,123 @@
+     assert "dsqg_w_candidate_score_mean" in diagnostic_keys
+     assert "dsqg_w_candidate_fraction_question" in diagnostic_keys
+     assert "dsqg_w_candidate_multi_evidence_fraction" in diagnostic_keys
++
++
++def _candidate_prior_fixture():
++    cand_types = torch.tensor(
++        [
++            [
++                [int(CandidateType.QUESTION), int(CandidateType.HISA_EVIDENCE), int(CandidateType.L3_SKIP), int(CandidateType.NULL)],
++                [int(CandidateType.HISA_EVIDENCE_REP0), int(CandidateType.QUESTION), int(CandidateType.LOCAL), int(CandidateType.NULL)],
++            ]
++        ],
++        dtype=torch.long,
++    )
++    cand_sources = torch.tensor(
++        [
++            [
++                [int(CandidateSource.FINAL), int(CandidateSource.HISA), int(CandidateSource.L3), int(CandidateSource.NULL)],
++                [int(CandidateSource.HISA), int(CandidateSource.FINAL), int(CandidateSource.FINAL), int(CandidateSource.NULL)],
++            ]
++        ],
++        dtype=torch.long,
++    )
++    cand_mask = torch.tensor([[[True, True, True, False], [True, True, False, False]]])
++    cand_scores = torch.tensor([[[0.0, 1.5, -0.5, 7.0], [0.25, -0.75, 3.0, -9.0]]], dtype=torch.float32)
++    evidence_bits = torch.tensor(
++        [
++            [
++                [
++                    int(CandidateEvidenceBit.QUESTION),
++                    int(CandidateEvidenceBit.HISA) | int(CandidateEvidenceBit.QUESTION),
++                    int(CandidateEvidenceBit.L3_SKIP),
++                    0,
++                ],
++                [
++                    int(CandidateEvidenceBit.HISA),
++                    int(CandidateEvidenceBit.QUESTION),
++                    0,
++                    0,
++                ],
++            ]
++        ],
++        dtype=torch.long,
++    )
++    evidence_count = CandidateProvider._evidence_count_from_bits(evidence_bits).masked_fill(~cand_mask, 0)
++    candidate_distances = torch.tensor([[[0, 3, 5, 0], [1, 4, 0, 0]]], dtype=torch.long)
++    return cand_types, cand_sources, cand_mask, cand_scores, evidence_bits, evidence_count, candidate_distances
++
++
++def test_candidate_prior_alias_zero_init_is_score_noop_and_telemetry_is_gated() -> None:
++    assert DSQGWCandidatePriorComposer is DSQGWEvidencePriorComposer
++    cand_types, cand_sources, cand_mask, cand_scores, evidence_bits, evidence_count, candidate_distances = _candidate_prior_fixture()
++    disabled = DSQGWBlock.from_config(DSQGWConfig(d=16, n_heads=4, max_candidates=4))
++
++    disabled_scores, disabled_telemetry = disabled._compose_evidence_prior_scores(
++        cand_scores,
++        cand_types,
++        cand_sources,
++        cand_mask,
++        evidence_bits=evidence_bits,
++        evidence_count=evidence_count,
++        candidate_distances=candidate_distances,
++    )
++
++    assert disabled_scores is cand_scores
++    assert disabled_telemetry == {}
++
++    enabled = DSQGWBlock.from_config(
++        DSQGWConfig(d=16, n_heads=4, max_candidates=4, use_candidate_prior=True, evidence_prior_init_scale=0.0)
++    )
++    prior_scores, telemetry = enabled._compose_evidence_prior_scores(
++        cand_scores,
++        cand_types,
++        cand_sources,
++        cand_mask,
++        evidence_bits=evidence_bits,
++        evidence_count=evidence_count,
++        candidate_distances=candidate_distances,
++    )
++
++    assert prior_scores.shape == cand_scores.shape
++    assert torch.allclose(prior_scores, cand_scores, atol=0.0, rtol=0.0)
++    assert telemetry["dsqg_w_candidate_prior_enabled"].item() == 1.0
++    assert telemetry["dsqg_w_evidence_prior_enabled"].item() == 1.0
++    assert telemetry["dsqg_w_prior_abs_mean"].item() == 0.0
++
++
++def test_candidate_prior_nonzero_bias_changes_only_valid_candidate_scores() -> None:
++    cand_types, cand_sources, cand_mask, cand_scores, evidence_bits, evidence_count, candidate_distances = _candidate_prior_fixture()
++    block = DSQGWBlock.from_config(
++        DSQGWConfig(d=16, n_heads=4, max_candidates=4, use_candidate_prior=True, evidence_prior_clip=4.0)
++    )
++    assert block.candidate_prior is block.evidence_prior
++    with torch.no_grad():
++        block.candidate_prior.type_bias[int(CandidateType.QUESTION)] = 0.75
++        block.candidate_prior.type_bias[int(CandidateType.HISA_EVIDENCE)] = -0.25
++        block.candidate_prior.type_bias[int(CandidateType.HISA_EVIDENCE_REP0)] = 0.5
++        block.candidate_prior.source_bias[int(CandidateSource.HISA)] = 0.4
++        block.candidate_prior.source_bias[int(CandidateSource.L3)] = -0.3
++        block.candidate_prior.feature_scale.copy_(torch.tensor([0.2, -0.1, 0.35, 0.6, -0.15]))
++
++    prior_scores, telemetry = block._compose_evidence_prior_scores(
++        cand_scores,
++        cand_types,
++        cand_sources,
++        cand_mask,
++        evidence_bits=evidence_bits,
++        evidence_count=evidence_count,
++        candidate_distances=candidate_distances,
++    )
++    delta = prior_scores - cand_scores
++
++    assert prior_scores.shape == cand_scores.shape
++    assert delta.shape == cand_scores.shape
++    assert torch.allclose(delta.masked_select(~cand_mask), torch.zeros_like(delta.masked_select(~cand_mask)))
++    assert delta.masked_select(cand_mask).abs().sum().item() > 0.0
++    assert torch.isfinite(prior_scores).all()
++    assert telemetry["dsqg_w_candidate_prior_enabled"].item() == 1.0
++    assert telemetry["dsqg_w_prior_feature_scale_norm"].item() > 0.0
+
+
+ def test_grouped_slot_materialization_matches_general_source_group_path(monkeypatch) -> None:
