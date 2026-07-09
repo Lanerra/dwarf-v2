@@ -384,6 +384,44 @@ def test_candidate_workspace_builds_low_rank_sourcewise_bias() -> None:
     assert result.telemetry["dsqg_w_candidate_workspace_dim"].item() == float(config.candidate_workspace_dim)
 
 
+def test_candidate_workspace_score_bias_is_query_conditioned_without_changing_workspace() -> None:
+    from kernels.dsqg_w.dsqg_w_mvp import CandidateWorkspace
+
+    torch.manual_seed(20260712)
+    config = DSQGWConfig(
+        d=16,
+        n_heads=4,
+        max_candidates=4,
+        local_offsets=(),
+        long_offsets=(),
+        k_question=0,
+        k_hisa_evidence=0,
+        k_l3_skip=0,
+        k_chunk=0,
+        null_fallback=False,
+        use_candidate_workspace=True,
+        candidate_workspace_dim=6,
+        candidate_workspace_query_scores=True,
+    )
+    workspace = CandidateWorkspace.from_config(config)
+    x_a = torch.randn(1, 5, 16)
+    x_b = x_a.clone()
+    x_b[:, 2, :] = x_b[:, 2, :].roll(3, dims=-1) + 0.75
+    l3 = torch.randn(1, 5, 16)
+    token_idx = torch.tensor([[[0, 1], [0, 1], [1, 3], [2, 4], [3, 4]]], dtype=torch.long)
+    cand_types = torch.full_like(token_idx, int(CandidateType.HISA_EVIDENCE))
+    cand_sources = torch.full_like(token_idx, int(CandidateSource.L3))
+    cand_mask = torch.ones_like(token_idx, dtype=torch.bool)
+
+    out_a = workspace.forward_sourcewise(x_a, token_idx, cand_types, cand_sources, cand_mask, l3_states=l3)
+    out_b = workspace.forward_sourcewise(x_b, token_idx, cand_types, cand_sources, cand_mask, l3_states=l3)
+
+    assert torch.allclose(out_a.workspace, out_b.workspace, atol=0.0, rtol=0.0)
+    assert not torch.allclose(out_a.score_bias[:, 2, :], out_b.score_bias[:, 2, :])
+    assert out_a.telemetry["dsqg_w_candidate_workspace_query_conditioned"].item() == 1.0
+    assert out_a.telemetry["dsqg_w_candidate_workspace_query_score_norm"].item() > 0.0
+
+
 def test_sourcewise_path_uses_candidate_workspace_without_materializing_d_candidates(monkeypatch) -> None:
     torch.manual_seed(20260711)
     base_config, x, l3, question, hisa, hisa_scores, l3_skip = _sourcewise_fixture()
@@ -433,6 +471,7 @@ def test_sourcewise_path_uses_candidate_workspace_without_materializing_d_candid
     assert torch.isfinite(out).all()
     assert telemetry["dsqg_w_candidate_workspace_enabled"].item() == 1.0
     assert telemetry["dsqg_w_candidate_workspace_dim"].item() == 6.0
+    assert telemetry["dsqg_w_candidate_workspace_query_conditioned"].item() == 1.0
     assert telemetry["dsqg_w_candidate_workspace_materialized_d_candidates"].item() == 0.0
 
 

@@ -114,6 +114,7 @@ class DSQGWBlock(nn.Module):
         candidate_workspace_dim: int = 64,
         candidate_workspace_phase_bands: int = 4,
         candidate_workspace_score_features: bool = True,
+        candidate_workspace_query_scores: bool = True,
         candidate_workspace_pair_transfer: bool = False,
         candidate_workspace_pair_gate_init: float = -2.5,
         read_type_ids: tuple[int, ...] | None = None,
@@ -190,6 +191,7 @@ class DSQGWBlock(nn.Module):
                 workspace_dim=candidate_workspace_dim,
                 phase_bands=candidate_workspace_phase_bands,
                 use_score_features=candidate_workspace_score_features,
+                use_query_scores=candidate_workspace_query_scores,
                 use_pair_transfer=candidate_workspace_pair_transfer,
                 pair_gate_init=candidate_workspace_pair_gate_init,
             )
@@ -255,6 +257,7 @@ class DSQGWBlock(nn.Module):
             candidate_workspace_dim=config.candidate_workspace_dim,
             candidate_workspace_phase_bands=config.candidate_workspace_phase_bands,
             candidate_workspace_score_features=config.candidate_workspace_score_features,
+            candidate_workspace_query_scores=config.candidate_workspace_query_scores,
             candidate_workspace_pair_transfer=config.candidate_workspace_pair_transfer,
             candidate_workspace_pair_gate_init=config.candidate_workspace_pair_gate_init,
             read_type_ids=_read_type_ids_from_config(config),

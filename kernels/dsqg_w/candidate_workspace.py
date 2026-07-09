@@ -37,6 +37,7 @@ class CandidateWorkspace(nn.Module):
         phase_bands: int = 4,
         max_distance: int = 8192,
         use_score_features: bool = True,
+        use_query_scores: bool = True,
         use_pair_transfer: bool = False,
         pair_gate_init: float = -2.5,
     ) -> None:
@@ -56,6 +57,7 @@ class CandidateWorkspace(nn.Module):
         self.phase_bands = int(phase_bands)
         self.max_distance = int(max_distance)
         self.use_score_features = bool(use_score_features)
+        self.use_query_scores = bool(use_query_scores)
         self.use_pair_transfer = bool(use_pair_transfer)
         self.eps = 1e-6
 
@@ -67,6 +69,8 @@ class CandidateWorkspace(nn.Module):
         self.score_proj = nn.Linear(1, workspace_dim, bias=False)
         self.workspace_norm = nn.LayerNorm(workspace_dim)
         self.score_head = nn.Linear(workspace_dim, 1, bias=False)
+        self.query_proj = nn.Linear(d, workspace_dim, bias=False)
+        self.query_key = nn.Linear(workspace_dim, workspace_dim, bias=False)
         if self.use_pair_transfer:
             self.pair_q = nn.Linear(workspace_dim, workspace_dim, bias=False)
             self.pair_k = nn.Linear(workspace_dim, workspace_dim, bias=False)
@@ -87,6 +91,7 @@ class CandidateWorkspace(nn.Module):
             workspace_dim=config.candidate_workspace_dim,
             phase_bands=config.candidate_workspace_phase_bands,
             use_score_features=config.candidate_workspace_score_features,
+            use_query_scores=config.candidate_workspace_query_scores,
             use_pair_transfer=config.candidate_workspace_pair_transfer,
             pair_gate_init=config.candidate_workspace_pair_gate_init,
         )
@@ -262,17 +267,28 @@ class CandidateWorkspace(nn.Module):
         workspace = workspace.masked_fill(~valid[..., None], 0.0)
         workspace, pair_gate = self._apply_pair_transfer(workspace, valid)
         workspace = workspace.masked_fill(~valid[..., None], 0.0)
-        score_bias = self.score_head(self.workspace_norm(workspace)).squeeze(-1)
+        workspace_n = self.workspace_norm(workspace)
+        base_score_bias = self.score_head(workspace_n).squeeze(-1)
+        query_score = workspace.new_zeros((bsz, seq_len, j_count))
+        if self.use_query_scores:
+            query_w = self.query_proj(self.source_norm(x))
+            key_w = self.query_key(workspace_n)
+            query_score = (query_w[:, :, None, :] * key_w).sum(dim=-1) / math.sqrt(float(self.workspace_dim))
+            query_score = query_score.masked_fill(~valid, 0.0)
+        score_bias = base_score_bias + query_score
         score_bias = score_bias.masked_fill(~valid, 0.0)
         denom = valid.to(dtype).sum(dim=-1, keepdim=True).clamp_min(1.0)
         centered = score_bias - (score_bias.masked_fill(~valid, 0.0).sum(dim=-1, keepdim=True) / denom)
         score_bias = centered.masked_fill(~valid, 0.0)
         bias_norm = score_bias.masked_select(valid).norm() / valid.to(dtype).sum().clamp_min(1.0)
+        query_score_norm = query_score.masked_select(valid).norm() / valid.to(dtype).sum().clamp_min(1.0)
         workspace_norm = workspace.norm(dim=-1).masked_select(valid).mean() if valid.any() else x.new_tensor(0.0)
         telemetry = {
             "dsqg_w_candidate_workspace_enabled": x.new_tensor(1.0).detach(),
             "dsqg_w_candidate_workspace_dim": x.new_tensor(float(self.workspace_dim)).detach(),
             "dsqg_w_candidate_workspace_score_bias_norm": bias_norm.detach(),
+            "dsqg_w_candidate_workspace_query_conditioned": x.new_tensor(1.0 if self.use_query_scores else 0.0).detach(),
+            "dsqg_w_candidate_workspace_query_score_norm": query_score_norm.detach(),
             "dsqg_w_candidate_workspace_norm": workspace_norm.detach(),
             "dsqg_w_candidate_workspace_pair_transfer": x.new_tensor(1.0 if self.use_pair_transfer else 0.0).detach(),
             "dsqg_w_candidate_workspace_pair_gate": pair_gate.detach(),

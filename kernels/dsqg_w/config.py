@@ -51,6 +51,7 @@ class DSQGWConfig:
     candidate_workspace_dim: int = 64
     candidate_workspace_phase_bands: int = 4
     candidate_workspace_score_features: bool = True
+    candidate_workspace_query_scores: bool = True
     candidate_workspace_pair_transfer: bool = False
     candidate_workspace_pair_gate_init: float = -2.5
     use_candidate_quotas: bool = False
