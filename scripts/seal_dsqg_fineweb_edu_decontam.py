@@ -12,6 +12,7 @@ from typing import Any
 
 SOURCE_SCHEMA = "dsqg.fineweb_edu_dedup.v1"
 SEALED_SCHEMA = "dsqg.fineweb_edu_dedup.repaired.v1"
+SEALABLE_SOURCE_SCHEMAS = {SOURCE_SCHEMA, SEALED_SCHEMA}
 DECONTAM_SCHEMA = "dwarf.dataset_decontam.v2"
 
 
@@ -49,8 +50,11 @@ def seal_zero_match_audit(
         raise FileExistsError(f"refusing to overwrite immutable manifest: {output_manifest}")
 
     source_manifest = load_json(source_manifest_file, "source manifest")
-    if source_manifest.get("schema_version") != SOURCE_SCHEMA:
-        raise ValueError(f"source manifest must use {SOURCE_SCHEMA}")
+    if source_manifest.get("schema_version") not in SEALABLE_SOURCE_SCHEMAS:
+        raise ValueError(
+            "source manifest must use one of "
+            f"{sorted(SEALABLE_SOURCE_SCHEMAS)}"
+        )
     decontam = load_json(decontam_file, "decontamination report")
     if (
         decontam.get("schema_version") != DECONTAM_SCHEMA
