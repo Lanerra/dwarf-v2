@@ -30,6 +30,8 @@ def build_dry_run_config(
     batch_size: int = 8,
     grad_accum: int = 2,
     checkpoint_strategy: str = "none",
+    schedule_total_steps: int = 12_500,
+    schedule_step_offset: int = 0,
     verify_artifact_sha256: bool = False,
 ) -> dict[str, Any]:
     if train_seqs <= 0 or val_seqs <= 0 or batch_size <= 0 or grad_accum <= 0:
@@ -43,6 +45,16 @@ def build_dry_run_config(
     )
     out = Path(output_dir).resolve()
     max_acc_steps = int(math.ceil(train_seqs / (batch_size * grad_accum)))
+    if schedule_total_steps <= 0 or schedule_step_offset < 0:
+        raise ValueError("WSD schedule total steps must be positive and offset must be non-negative")
+    if schedule_step_offset + max_acc_steps > schedule_total_steps:
+        raise ValueError(
+            "requested run exceeds WSD schedule horizon: "
+            f"offset={schedule_step_offset} run_steps={max_acc_steps} total={schedule_total_steps}"
+        )
+    wsd_warmup_steps = int(math.ceil(schedule_total_steps * 0.05))
+    wsd_decay_steps = int(math.ceil(schedule_total_steps * 0.15))
+    wsd_stable_steps = schedule_total_steps - wsd_warmup_steps - wsd_decay_steps
     checkpoint_dir = out / "checkpoints"
     env = {
         "CUDA_VISIBLE_DEVICES": str(gpu),
@@ -62,6 +74,12 @@ def build_dry_run_config(
         "DWARF_LOG_INTERVAL": "10",
         "DWARF_PASSKEY_TRIALS": "10",
         "DWARF_CKPT": str(checkpoint_strategy),
+        "DWARF_LR_SCHEDULE": "wsd",
+        "DWARF_SCHEDULE_TOTAL_STEPS": str(schedule_total_steps),
+        "DWARF_WSD_WARMUP_STEPS": str(wsd_warmup_steps),
+        "DWARF_WSD_STABLE_STEPS": str(wsd_stable_steps),
+        "DWARF_WSD_DECAY_STEPS": str(wsd_decay_steps),
+        "DWARF_SCHEDULE_STEP_OFFSET": str(schedule_step_offset),
         "DWARF_PURE_DSQG": "0",
         "DWARF_DSQG_W": "0",
         "DWARF_Q6_G128": "0",
@@ -96,6 +114,14 @@ def build_dry_run_config(
             "q6_g128": False,
             "pre_hisa_ema": True,
         },
+        "schedule_contract": {
+            "kind": "wsd",
+            "total_steps": schedule_total_steps,
+            "warmup_steps": wsd_warmup_steps,
+            "stable_steps": wsd_stable_steps,
+            "decay_steps": wsd_decay_steps,
+            "step_offset": schedule_step_offset,
+        },
     }
 
 
@@ -119,6 +145,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=2)
     parser.add_argument("--checkpoint-strategy", choices=("none", "every_other", "all", "full_attn"), default="none")
+    parser.add_argument("--schedule-total-steps", type=int, default=12_500)
+    parser.add_argument("--schedule-step-offset", type=int, default=0)
     parser.add_argument("--verify-artifact-sha256", action="store_true")
     return parser.parse_args(argv)
 
@@ -137,6 +165,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         batch_size=args.batch_size,
         grad_accum=args.grad_accum,
         checkpoint_strategy=args.checkpoint_strategy,
+        schedule_total_steps=args.schedule_total_steps,
+        schedule_step_offset=args.schedule_step_offset,
         verify_artifact_sha256=args.verify_artifact_sha256,
     )
     contract_path = write_dry_run_config(config)

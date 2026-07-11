@@ -32,7 +32,9 @@ Layout:
 
 import contextlib, hashlib, json, math, os, random, subprocess, sys, time, types
 from collections import deque
+from dataclasses import dataclass
 from functools import partial
+from typing import Mapping
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as grad_ckpt
@@ -252,6 +254,87 @@ LR_WARMUP_STEPS = int(os.environ.get('DWARF_LR_WARMUP_STEPS', '0'))
 MIN_LR_RATIO = float(os.environ.get('DWARF_MIN_LR_RATIO', '0.1'))
 SCALE_EMBED_CONSTANT_LR = os.getenv('DWARF_SCALE_EMBED_CONSTANT_LR', '0') == '1'
 DROPOUT   = 0.1
+
+
+@dataclass(frozen=True)
+class LRScheduleConfig:
+    kind: str
+    total_steps: int
+    warmup_steps: int
+    stable_steps: int
+    decay_steps: int
+    step_offset: int
+
+
+def build_lr_schedule_config(*, run_steps: int, environ: Mapping[str, str] | None = None) -> LRScheduleConfig:
+    """Resolve a fail-closed local or continuation-aware LR schedule contract."""
+    if run_steps <= 0:
+        raise ValueError(f'run_steps must be positive, got {run_steps}')
+    env = os.environ if environ is None else environ
+    kind = env.get('DWARF_LR_SCHEDULE', 'cosine').strip().lower()
+    if kind not in {'cosine', 'wsd'}:
+        raise ValueError(f"DWARF_LR_SCHEDULE must be 'cosine' or 'wsd', got {kind!r}")
+    total_steps = int(env.get('DWARF_SCHEDULE_TOTAL_STEPS', str(run_steps)))
+    step_offset = int(env.get('DWARF_SCHEDULE_STEP_OFFSET', '0'))
+    if total_steps <= 0 or step_offset < 0:
+        raise ValueError(f'invalid schedule total_steps={total_steps} step_offset={step_offset}')
+    if step_offset + run_steps > total_steps:
+        raise ValueError(
+            f'run_steps={run_steps} with step_offset={step_offset} exceeds schedule horizon total_steps={total_steps}'
+        )
+
+    if kind == 'cosine':
+        warmup_steps = min(max(int(env.get('DWARF_LR_WARMUP_STEPS', '0')), 0), max(total_steps - 1, 0))
+        return LRScheduleConfig(
+            kind=kind,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            stable_steps=0,
+            decay_steps=max(total_steps - warmup_steps, 1),
+            step_offset=step_offset,
+        )
+
+    warmup_steps = int(env.get('DWARF_WSD_WARMUP_STEPS', str(math.ceil(total_steps * 0.05))))
+    decay_steps = int(env.get('DWARF_WSD_DECAY_STEPS', str(math.ceil(total_steps * 0.15))))
+    stable_steps = int(env.get('DWARF_WSD_STABLE_STEPS', str(total_steps - warmup_steps - decay_steps)))
+    if min(warmup_steps, stable_steps, decay_steps) < 0 or warmup_steps + stable_steps + decay_steps != total_steps:
+        raise ValueError(
+            'WSD phases must be non-negative and sum to DWARF_SCHEDULE_TOTAL_STEPS: '
+            f'warmup={warmup_steps} stable={stable_steps} decay={decay_steps} total={total_steps}'
+        )
+    if decay_steps == 0:
+        raise ValueError('WSD requires a positive decay phase')
+    return LRScheduleConfig(
+        kind=kind,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        stable_steps=stable_steps,
+        decay_steps=decay_steps,
+        step_offset=step_offset,
+    )
+
+
+def lr_schedule_multiplier(*, step: int, config: LRScheduleConfig, min_lr_ratio: float) -> float:
+    """Return the multiplier at a local scheduler step under a global schedule contract."""
+    logical_step = min(max(int(step) + config.step_offset, 0), max(config.total_steps - 1, 0))
+    if config.warmup_steps > 0 and logical_step < config.warmup_steps:
+        return max((logical_step + 1) / config.warmup_steps, 1e-8)
+    if config.kind == 'wsd' and logical_step < config.warmup_steps + config.stable_steps:
+        return 1.0
+    decay_start = config.warmup_steps + config.stable_steps
+    decay_progress = min(max((logical_step - decay_start + 1) / max(config.decay_steps, 1), 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+def validate_schedule_resume(*, config: LRScheduleConfig, resume_path: str, skip_scheduler_state: bool) -> None:
+    """Prevent a continuation offset and a restored local scheduler from double-counting progress."""
+    if resume_path and config.step_offset > 0 and not skip_scheduler_state:
+        raise ValueError(
+            'continued schedules with DWARF_SCHEDULE_STEP_OFFSET > 0 require DWARF_SKIP_SCHED=1 '
+            'so the explicit global offset is the sole source of scheduler progress'
+        )
+
 
 BATCH_SIZE     = int(os.environ.get('DWARF_BS', '20'))
 GRAD_ACCUM     = int(os.environ.get('DWARF_GA', '20'))
@@ -4712,20 +4795,19 @@ def train():
     steps_per_epoch_nominal = math.ceil(len(train_data) / BATCH_SIZE / GRAD_ACCUM)
     if MAX_ACC_STEPS:
         steps_per_epoch_nominal = min(steps_per_epoch_nominal, MAX_ACC_STEPS)
-    total_steps = SCREEN_EPOCHS * max(steps_per_epoch_nominal, 1)
-
-    warmup_steps = min(max(LR_WARMUP_STEPS, 0), max(total_steps - 1, 0))
+    run_total_steps = SCREEN_EPOCHS * max(steps_per_epoch_nominal, 1)
+    lr_schedule = build_lr_schedule_config(run_steps=run_total_steps)
+    print(
+        f'  LR schedule={lr_schedule.kind} total={lr_schedule.total_steps} '
+        f'warmup={lr_schedule.warmup_steps} stable={lr_schedule.stable_steps} '
+        f'decay={lr_schedule.decay_steps} offset={lr_schedule.step_offset}'
+    )
 
     def _lr_lambda(step, group_idx):
         group_name = optimizer.param_groups[group_idx].get('name', '')
         if SCALE_EMBED_CONSTANT_LR and group_name.endswith('scale_embed'):
             return 1.0
-        if warmup_steps > 0 and step < warmup_steps:
-            return max((step + 1) / warmup_steps, 1e-8)
-        decay_steps = max(total_steps - warmup_steps, 1)
-        progress = min(max((step - warmup_steps) / decay_steps, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return MIN_LR_RATIO + (1.0 - MIN_LR_RATIO) * cosine
+        return lr_schedule_multiplier(step=step, config=lr_schedule, min_lr_ratio=MIN_LR_RATIO)
 
     scheduler = _LambdaLRScheduler(
         optimizer,
@@ -4743,6 +4825,12 @@ def train():
 
     resume_path = os.getenv('DWARF_RESUME', '')
     start_epoch = int(os.getenv('DWARF_START_EPOCH', '1'))
+    skip_sched = os.getenv('DWARF_SKIP_SCHED', '0') == '1'
+    validate_schedule_resume(
+        config=lr_schedule,
+        resume_path=resume_path,
+        skip_scheduler_state=skip_sched,
+    )
     if resume_path and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         if 'model_state_dict' in ckpt:
@@ -4754,7 +4842,6 @@ def train():
                     flush=True,
                 )
             skip_opt = os.getenv('DWARF_SKIP_OPT', '0') == '1'
-            skip_sched = os.getenv('DWARF_SKIP_SCHED', '0') == '1'
             if not skip_opt:
                 try:
                     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -4783,6 +4870,14 @@ def train():
     checkpoint_config = _base_checkpoint_config(
         git_hash=git_hash, tok_path=tok_path, encoded_path=encoded_path, n_params=n_params
     )
+    checkpoint_config['training']['lr_schedule'] = {
+        'kind': lr_schedule.kind,
+        'total_steps': lr_schedule.total_steps,
+        'warmup_steps': lr_schedule.warmup_steps,
+        'stable_steps': lr_schedule.stable_steps,
+        'decay_steps': lr_schedule.decay_steps,
+        'step_offset': lr_schedule.step_offset,
+    }
     _attach_loss_mask_stats_to_checkpoint_config(checkpoint_config, loss_mask_stats)
 
     for epoch in range(start_epoch, SCREEN_EPOCHS + 1):
