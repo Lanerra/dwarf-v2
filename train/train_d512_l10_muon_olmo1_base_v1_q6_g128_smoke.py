@@ -94,9 +94,20 @@ except ImportError:
 import pathlib as _pl
 _script_dir = str(_pl.Path(__file__).resolve().parent)
 _project_root = str(_pl.Path(__file__).resolve().parent.parent)
-_kernel_dir = os.path.join(_project_root, 'kernels')
+_canonical_kernel_dir = _pl.Path(_project_root) / 'kernels'
+_kernel_dir_override = os.getenv('DWARF_DSQG_KERNEL_DIR', '').strip()
+if _kernel_dir_override:
+    _kernel_dir_path = _pl.Path(_kernel_dir_override).expanduser().resolve()
+    _kernel_module_path = _kernel_dir_path / 'dsqg_attention_v20_bf16_se.py'
+    if not _kernel_module_path.is_file():
+        raise FileNotFoundError(
+            f'DWARF_DSQG_KERNEL_DIR must contain dsqg_attention_v20_bf16_se.py, got {_kernel_dir_path}'
+        )
+else:
+    _kernel_dir_path = _canonical_kernel_dir
+_kernel_dir = str(_kernel_dir_path)
 _tools_dir = os.path.join(_project_root, 'tools')
-for _d in [_script_dir, _kernel_dir, _tools_dir, _project_root]:
+for _d in [_script_dir, str(_canonical_kernel_dir), _kernel_dir, _tools_dir, _project_root]:
     if _d and _d not in sys.path:
         sys.path.insert(0, _d)
 # Hermes also has a top-level `tools` package. Prefer DWARF/tools when it
@@ -120,9 +131,13 @@ from dsqg_attention_v20_bf16_se import (
     NPCI_THETA_MAX, NPCI_THETA_INIT,
     ALL_OFFSETS,
 )
+DSQG_KERNEL_MODULE_PATH = str(_pl.Path(sys.modules['dsqg_attention_v20_bf16_se'].__file__).resolve())
 assert R_PLANES == 4, f"Expected R_PLANES=4, got {R_PLANES}"
 _DSQG_TYPES = (DSQGAttentionV19,)
-print('  Kernel: V20-compatible DSQG (R=4 sequential Givens, grouped sparse, SE gates); optional q6_g128 smoke path')
+print(
+    '  Kernel: V20-compatible DSQG (R=4 sequential Givens, grouped sparse, SE gates); '
+    f'module={DSQG_KERNEL_MODULE_PATH}; optional q6_g128 smoke path'
+)
 from causal_ema_scan import causal_ema_scan as _causal_ema_scan
 
 try:
@@ -334,6 +349,38 @@ def validate_schedule_resume(*, config: LRScheduleConfig, resume_path: str, skip
             'continued schedules with DWARF_SCHEDULE_STEP_OFFSET > 0 require DWARF_SKIP_SCHED=1 '
             'so the explicit global offset is the sole source of scheduler progress'
         )
+
+
+def select_train_tranche(
+    *,
+    train_data: torch.Tensor,
+    train_loss_mask: torch.Tensor,
+    max_train_seqs: int,
+    offset_text: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | str]]:
+    """Select an explicit contiguous continuation tranche or preserve legacy randomized capping."""
+    if offset_text is not None and offset_text.strip() != '':
+        offset = int(offset_text)
+        if offset < 0:
+            raise ValueError(f'DWARF_TRAIN_SEQ_OFFSET must be non-negative, got {offset}')
+        count = int(max_train_seqs)
+        end = offset + count
+        if end > len(train_data):
+            raise ValueError(
+                f'DWARF_TRAIN_SEQ_OFFSET={offset} with DWARF_MAX_TRAIN_SEQS={count} '
+                f'exceeds dataset rows={len(train_data)}'
+            )
+        return train_data[offset:end], train_loss_mask[offset:end], {
+            'mode': 'contiguous', 'offset': offset, 'count': count, 'end': end,
+        }
+    if len(train_data) > max_train_seqs:
+        subset_idx = torch.randperm(len(train_data))[:max_train_seqs]
+        return train_data[subset_idx], train_loss_mask[subset_idx], {
+            'mode': 'random_cap', 'offset': 0, 'count': int(max_train_seqs), 'end': int(max_train_seqs),
+        }
+    return train_data, train_loss_mask, {
+        'mode': 'full', 'offset': 0, 'count': len(train_data), 'end': len(train_data),
+    }
 
 
 BATCH_SIZE     = int(os.environ.get('DWARF_BS', '20'))
@@ -4710,10 +4757,12 @@ def train():
         _cache, train_data, val_data, use_liger_ce=USE_LIGER_CE
     )
 
-    if len(train_data) > MAX_TRAIN_SEQS:
-        subset_idx = torch.randperm(len(train_data))[:MAX_TRAIN_SEQS]
-        train_data = train_data[subset_idx]
-        train_loss_mask = train_loss_mask[subset_idx]
+    train_data, train_loss_mask, train_tranche = select_train_tranche(
+        train_data=train_data,
+        train_loss_mask=train_loss_mask,
+        max_train_seqs=MAX_TRAIN_SEQS,
+        offset_text=os.getenv('DWARF_TRAIN_SEQ_OFFSET'),
+    )
     if len(val_data) > MAX_VAL_SEQS:
         val_data = val_data[:MAX_VAL_SEQS]
         val_loss_mask = val_loss_mask[:MAX_VAL_SEQS]
@@ -4732,7 +4781,8 @@ def train():
     print(
         f'  train: {len(train_data):,} seqs  val: {len(val_data):,} seqs  host_dtype={train_data.dtype} '
         f'train_real={train_real:,}/{train_slots:,} ({train_real/train_slots:.2%}) '
-        f'val_real={val_real:,}/{val_slots:,} ({val_real/val_slots:.2%})'
+        f'val_real={val_real:,}/{val_slots:,} ({val_real/val_slots:.2%}) '
+        f'train_tranche={train_tranche}'
     )
 
     model = TriadicJ96Dsr(
@@ -4878,6 +4928,7 @@ def train():
         'decay_steps': lr_schedule.decay_steps,
         'step_offset': lr_schedule.step_offset,
     }
+    checkpoint_config['training']['train_tranche'] = train_tranche
     _attach_loss_mask_stats_to_checkpoint_config(checkpoint_config, loss_mask_stats)
 
     for epoch in range(start_epoch, SCREEN_EPOCHS + 1):
