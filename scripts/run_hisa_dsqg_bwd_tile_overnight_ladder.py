@@ -93,6 +93,26 @@ def build_ladder_stages() -> tuple[Stage, ...]:
     )
 
 
+def continuation_stages() -> tuple[Stage, ...]:
+    return tuple(stage for stage in build_ladder_stages() if stage.requires_overlay_gate)
+
+
+def resolve_continuation_source(source_root: Path) -> Path:
+    source_root = source_root.resolve()
+    gate_path = source_root / "overlay_50k_gate.json"
+    result_path = source_root / "stages" / "bwd16_w4_50k" / "run_result.json"
+    if not gate_path.is_file() or not result_path.is_file():
+        raise ValueError(f"continuation source is missing the passed 50K gate/result under {source_root}")
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if not gate.get("pass") or not result.get("health", {}).get("pass"):
+        raise ValueError(f"continuation source has not passed the 50K overlay gate: {source_root}")
+    checkpoint = Path(result.get("checkpoint_path", ""))
+    if not checkpoint.is_file():
+        raise ValueError(f"continuation source checkpoint is missing: {checkpoint}")
+    return checkpoint.resolve()
+
+
 def next_stage_allowed(*, stage_id: str, gates: dict[str, bool]) -> bool:
     if stage_id in {"bwd16_w4_100k", "bwd16_w4_200k", "bwd16_w4_400k"}:
         return bool(gates.get("overlay_50k", False))
@@ -172,7 +192,13 @@ def validate_artifact_once(*, verify_sha256: bool) -> dict[str, Any]:
     }
 
 
-def build_stage_config(*, stage: Stage, out_root: Path, gpu: str) -> dict[str, Any]:
+def build_stage_config(
+    *,
+    stage: Stage,
+    out_root: Path,
+    gpu: str,
+    initial_resume_checkpoint: Path | None = None,
+) -> dict[str, Any]:
     run_dir = out_root / "stages" / stage.stage_id
     config = build_dry_run_config(
         output_dir=run_dir,
@@ -202,8 +228,18 @@ def build_stage_config(*, stage: Stage, out_root: Path, gpu: str) -> dict[str, A
         }
     )
     if stage.resume_from is not None:
-        previous_checkpoint = out_root / "stages" / stage.resume_from / "checkpoints" / f"{stage.resume_from}_ep1.pt"
-        env.update({"DWARF_RESUME": str(previous_checkpoint), "DWARF_SKIP_SCHED": "1"})
+        previous_checkpoint = (
+            initial_resume_checkpoint
+            if initial_resume_checkpoint is not None and stage.stage_id == continuation_stages()[0].stage_id
+            else out_root / "stages" / stage.resume_from / "checkpoints" / f"{stage.resume_from}_ep1.pt"
+        )
+        env.update(
+            {
+                "DWARF_RESUME": str(previous_checkpoint),
+                "DWARF_SKIP_SCHED": "1",
+                "DWARF_RESUME_RESET_PAGED_ADAM": "1",
+            }
+        )
     config["variant"] = _jsonable(variant)
     config["stage"] = asdict(stage)
     config["expected"] = {
@@ -367,38 +403,59 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-gpu", default=EXPECTED_GPU)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-artifact-sha256", action="store_true")
+    parser.add_argument(
+        "--continue-from-run-root",
+        type=Path,
+        help="Run only 100K→400K from a previously passed 50K overlay gate without overwriting that run's artifacts.",
+    )
     return parser.parse_args(argv)
 
 
 def run_ladder(args: argparse.Namespace) -> dict[str, Any]:
     out_root = args.out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    source_checkpoint = (
+        resolve_continuation_source(args.continue_from_run_root)
+        if args.continue_from_run_root is not None
+        else None
+    )
+    stages = continuation_stages() if source_checkpoint is not None else build_ladder_stages()
+    gates: dict[str, bool] = {"overlay_50k": True} if source_checkpoint is not None else {}
     plan = {
         "root": str(ROOT),
         "created_at": datetime.now().isoformat(),
         "gpu": verify_visible_gpu(gpu=args.gpu, expected_gpu=args.expected_gpu),
         "variants": VARIANTS,
         "wsd": {"total_steps": WSD_TOTAL_STEPS, **WSD_PHASES},
-        "stages": build_ladder_stages(),
+        "stages": stages,
         "dry_run": bool(args.dry_run),
+        "continuation_source": (
+            {"run_root": str(args.continue_from_run_root.resolve()), "checkpoint": str(source_checkpoint)}
+            if source_checkpoint is not None
+            else None
+        ),
     }
     plan["artifact"] = validate_artifact_once(verify_sha256=not args.skip_artifact_sha256)
     write_json(out_root / "overnight_plan.json", plan)
     results: dict[str, dict[str, Any]] = {}
-    gates: dict[str, bool] = {}
     parity: list[dict[str, Any]] = []
     status = "passed"
     failure: str | None = None
     try:
         if not args.dry_run:
             parity = run_parity(out_root=out_root, gpu=args.gpu, expected_gpu=args.expected_gpu)
-        for stage in build_ladder_stages():
+        for stage in stages:
             if not next_stage_allowed(stage_id=stage.stage_id, gates=gates):
                 status = "stopped_by_gate"
                 failure = f"stage {stage.stage_id} blocked by failed overlay_50k gate"
                 break
             verify_visible_gpu(gpu=args.gpu, expected_gpu=args.expected_gpu)
-            config = build_stage_config(stage=stage, out_root=out_root, gpu=args.gpu)
+            config = build_stage_config(
+                stage=stage,
+                out_root=out_root,
+                gpu=args.gpu,
+                initial_resume_checkpoint=source_checkpoint,
+            )
             result = run_stage(stage=stage, config=config, dry_run=args.dry_run)
             results[stage.stage_id] = result
             if not result["health"]["pass"]:
@@ -439,7 +496,7 @@ def run_ladder(args: argparse.Namespace) -> dict[str, Any]:
         "failure": failure,
         "required_parity_seeds": 3,
         "completed_stage_ids": list(results),
-        "expected_stage_ids": [stage.stage_id for stage in build_ladder_stages()],
+        "expected_stage_ids": [stage.stage_id for stage in stages],
         "all_completed_stages_healthy": all(result["health"]["pass"] for result in results.values()),
         "overlay_50k_gate": gates.get("overlay_50k"),
         "result_path": str(out_root / "ladder_results.json"),

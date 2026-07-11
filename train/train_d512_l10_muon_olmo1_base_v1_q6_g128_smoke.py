@@ -4208,14 +4208,21 @@ class _MultiOptimizer:
             ],
         }
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, skip_state_names=()):
         if state_dict.get('kind') != 'multi':
             raise ValueError('cannot load non-multi optimizer state into hybrid Muon optimizer')
         saved = {entry['name']: entry['state_dict'] for entry in state_dict['optimizers']}
+        skip_state_names = set(skip_state_names)
+        loaded, skipped = [], []
         for name, opt in self.named_optimizers:
             if name not in saved:
                 raise ValueError(f'missing optimizer state for {name}')
+            if name in skip_state_names:
+                skipped.append(name)
+                continue
             opt.load_state_dict(saved[name])
+            loaded.append(name)
+        return {'loaded': loaded, 'skipped': skipped}
 
 
 class _LambdaLRScheduler:
@@ -4876,6 +4883,8 @@ def train():
     resume_path = os.getenv('DWARF_RESUME', '')
     start_epoch = int(os.getenv('DWARF_START_EPOCH', '1'))
     skip_sched = os.getenv('DWARF_SKIP_SCHED', '0') == '1'
+    reset_paged_adam = os.getenv('DWARF_RESUME_RESET_PAGED_ADAM', '0') == '1'
+    resume_optimizer_state = {'mode': 'fresh', 'loaded': [], 'skipped': []}
     validate_schedule_resume(
         config=lr_schedule,
         resume_path=resume_path,
@@ -4894,11 +4903,31 @@ def train():
             skip_opt = os.getenv('DWARF_SKIP_OPT', '0') == '1'
             if not skip_opt:
                 try:
-                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                    if isinstance(optimizer, _MultiOptimizer):
+                        resume_optimizer_state = optimizer.load_state_dict(
+                            ckpt['optimizer_state_dict'],
+                            skip_state_names={'adamw'} if reset_paged_adam else (),
+                        )
+                    else:
+                        if reset_paged_adam:
+                            raise ValueError('DWARF_RESUME_RESET_PAGED_ADAM=1 requires the hybrid Muon optimizer')
+                        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                        resume_optimizer_state = {'loaded': ['optimizer'], 'skipped': []}
+                    resume_optimizer_state['mode'] = (
+                        'muon_preserved_paged_adam_reset' if reset_paged_adam else 'full_restore'
+                    )
+                    if reset_paged_adam:
+                        print(
+                            '  [resume] preserving Muon state and resetting unsupported PagedAdam8bit state '
+                            '(DWARF_RESUME_RESET_PAGED_ADAM=1)',
+                            flush=True,
+                        )
                 except (ValueError, RuntimeError) as _oe:
                     print(f'  [resume] optimizer state mismatch ({_oe}); starting fresh optimizer')
+                    resume_optimizer_state = {'mode': 'restore_failed_fresh', 'loaded': [], 'skipped': []}
             else:
                 print('  [resume] skipping optimizer state (DWARF_SKIP_OPT=1)')
+                resume_optimizer_state = {'mode': 'all_optimizer_state_skipped', 'loaded': [], 'skipped': ['muon', 'adamw']}
             if skip_sched:
                 print('  [resume] skipping scheduler state (DWARF_SKIP_SCHED=1)')
             elif 'scheduler_state_dict' in ckpt:
@@ -4929,6 +4958,7 @@ def train():
         'step_offset': lr_schedule.step_offset,
     }
     checkpoint_config['training']['train_tranche'] = train_tranche
+    checkpoint_config['training']['resume_optimizer_state'] = resume_optimizer_state
     _attach_loss_mask_stats_to_checkpoint_config(checkpoint_config, loss_mask_stats)
 
     for epoch in range(start_epoch, SCREEN_EPOCHS + 1):

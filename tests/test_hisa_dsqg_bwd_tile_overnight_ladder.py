@@ -87,3 +87,33 @@ def test_dry_run_completes_all_conditional_stage_contracts(tmp_path: Path) -> No
 
     assert payload["status"] == "passed"
     assert set(payload["stages"]) == {stage.stage_id for stage in runner.build_ladder_stages()}
+
+
+def test_continuation_stage_declares_the_paged_adam_reset_contract(tmp_path: Path) -> None:
+    runner = load_runner()
+    stage = next(stage for stage in runner.build_ladder_stages() if stage.stage_id == "bwd16_w4_100k")
+
+    config = runner.build_stage_config(stage=stage, out_root=tmp_path, gpu="0")
+
+    assert config["env"]["DWARF_RESUME_RESET_PAGED_ADAM"] == "1"
+
+
+def test_verified_continuation_source_reuses_only_the_passed_50k_overlay_checkpoint(tmp_path: Path) -> None:
+    runner = load_runner()
+    source = tmp_path / "source"
+    checkpoint = source / "stages" / "bwd16_w4_50k" / "checkpoints" / "bwd16_w4_50k_ep1.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    (source / "overlay_50k_gate.json").write_text('{"pass": true}\n')
+    (checkpoint.parent.parent / "run_result.json").write_text(
+        '{"health": {"pass": true}, "checkpoint_path": "' + str(checkpoint) + '"}\n'
+    )
+
+    resolved = runner.resolve_continuation_source(source)
+    stages = runner.continuation_stages()
+    first_config = runner.build_stage_config(
+        stage=stages[0], out_root=tmp_path / "retry", gpu="0", initial_resume_checkpoint=resolved
+    )
+
+    assert [stage.stage_id for stage in stages] == ["bwd16_w4_100k", "bwd16_w4_200k", "bwd16_w4_400k"]
+    assert first_config["env"]["DWARF_RESUME"] == str(checkpoint)
