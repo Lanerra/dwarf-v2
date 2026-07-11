@@ -77,6 +77,7 @@ def test_build_dry_run_contract_targets_v2_hisa_hybrid_and_forbids_dsqg_w(tmp_pa
     assert env["DWARF_PURE_DSQG"] == "0"
     assert env["DWARF_Q6_G128"] == "0"
     assert env["DWARF_PRE_HISA_EMA"] == "1"
+    assert env["DWARF_CKPT"] == "none"
     assert env["DWARF_MAX_ACC_STEPS"] == "3125"
     assert config["mode"] == "dry_run_only"
     assert config["command"][-1] == "train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py"

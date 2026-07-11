@@ -29,7 +29,7 @@ def build_dry_run_config(
     val_seqs: int = 512,
     batch_size: int = 8,
     grad_accum: int = 2,
-    checkpoint_strategy: str = "every_other",
+    checkpoint_strategy: str = "none",
     verify_artifact_sha256: bool = False,
 ) -> dict[str, Any]:
     if train_seqs <= 0 or val_seqs <= 0 or batch_size <= 0 or grad_accum <= 0:
@@ -118,7 +118,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-seqs", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=2)
-    parser.add_argument("--checkpoint-strategy", choices=("none", "every_other", "all", "full_attn"), default="every_other")
+    parser.add_argument("--checkpoint-strategy", choices=("none", "every_other", "all", "full_attn"), default="none")
     parser.add_argument("--verify-artifact-sha256", action="store_true")
     return parser.parse_args(argv)
 
