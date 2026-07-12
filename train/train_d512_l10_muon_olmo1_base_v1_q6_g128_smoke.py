@@ -119,9 +119,14 @@ if os.path.isdir(_tools_dir):
     sys.modules['tools'] = _tools_pkg
 
 try:
-    from tools.passkey_eval import PasskeyConfig, format_passkey_results, passkey_prefix_consistency_audit
+    from tools.passkey_eval import (
+        PasskeyConfig,
+        format_passkey_results,
+        passkey_prefix_consistency_audit,
+        resolve_tokenizer_pad_id,
+    )
 except Exception:
-    from passkey_eval import PasskeyConfig, format_passkey_results, passkey_prefix_consistency_audit
+    from passkey_eval import PasskeyConfig, format_passkey_results, passkey_prefix_consistency_audit, resolve_tokenizer_pad_id
 
 
 from dsqg_attention_v20_bf16_se import (
@@ -4545,7 +4550,7 @@ def evaluate(model, data, device, loss_mask=None):
     return total_loss / max(total_tokens, 1)
 
 
-def _passkey_config():
+def _passkey_config(tokenizer):
     return PasskeyConfig(
         max_seq_len=MAX_SEQ_LEN,
         distances=list(PASSKEY_DISTANCES),
@@ -4555,13 +4560,21 @@ def _passkey_config():
         filler_sentence=_FILLER_SENTENCE,
         intro_template=_INTRO_TEMPLATE,
         retrieval_cue=_RETRIEVAL_CUE,
-        pad_id=0,
+        pad_id=resolve_tokenizer_pad_id(tokenizer),
     )
 
 
 @torch.inference_mode()
 def passkey_accuracy(model, tokenizer, device):
-    audit = passkey_prefix_consistency_audit(model, tokenizer, device, _passkey_config())
+    audit = passkey_prefix_consistency_audit(
+        model,
+        tokenizer,
+        device,
+        _passkey_config(tokenizer),
+        eval_mode='fixed_length_causal_control',
+        fixed_length=MAX_SEQ_LEN,
+        batch_mode='singleton',
+    )
     print(
         f"  [passkey audit] clean={audit['prefix_consistent']} "
         f"max_pad_delta={audit['max_pad_logit_delta']:.3e} "

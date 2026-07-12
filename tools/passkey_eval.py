@@ -467,11 +467,12 @@ def passkey_prefix_consistency_audit(
         for examples in examples_by_distance.values():
             for example in examples:
                 total_examples += 1
-                prefix_pad_to_length = None
-                if kernel_compatible:
-                    prefix_pad_to_length = _kernel_compatible_prefix_length(
-                        model, len(example.full_seq), config.max_seq_len
-                    )
+                # Compare at the fixed training geometry.  A short standalone
+                # prefix changes the physical HISA chunk size (N/C), so it is
+                # not a valid prefix-invariance control for a fixed-N model.
+                # Every variant below exposes the true prefix length to HISA
+                # metadata while retaining the same physical N.
+                prefix_pad_to_length = config.max_seq_len
                 prefix_logits = _logits_at_position(
                     model,
                     example.full_seq,
@@ -479,10 +480,19 @@ def passkey_prefix_consistency_audit(
                     device,
                     pad_to_length=prefix_pad_to_length,
                     pad_id=config.pad_id,
+                    causal_control_valid_length=len(example.full_seq),
                 )
 
                 padded = example.full_seq + [config.pad_id] * (config.max_seq_len - len(example.full_seq))
-                padded_logits = _logits_at_position(model, padded, example.cue_position, device)
+                padded_logits = _logits_at_position(
+                    model,
+                    padded,
+                    example.cue_position,
+                    device,
+                    pad_to_length=config.max_seq_len,
+                    pad_id=config.pad_id,
+                    causal_control_valid_length=len(example.full_seq),
+                )
                 max_pad_logit_delta = max(
                     max_pad_logit_delta,
                     float((prefix_logits - padded_logits).abs().max().item()),
@@ -494,7 +504,15 @@ def passkey_prefix_consistency_audit(
                     while len(suffix) < spare:
                         suffix.extend(filler_ids)
                     suffix_seq = example.full_seq + suffix[:spare]
-                    suffix_logits = _logits_at_position(model, suffix_seq, example.cue_position, device)
+                    suffix_logits = _logits_at_position(
+                        model,
+                        suffix_seq,
+                        example.cue_position,
+                        device,
+                        pad_to_length=config.max_seq_len,
+                        pad_id=config.pad_id,
+                        causal_control_valid_length=len(example.full_seq),
+                    )
                     max_suffix_logit_delta = max(
                         max_suffix_logit_delta,
                         float((prefix_logits - suffix_logits).abs().max().item()),
