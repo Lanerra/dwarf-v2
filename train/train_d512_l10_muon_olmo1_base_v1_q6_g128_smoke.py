@@ -4747,7 +4747,7 @@ def train():
             f"local_window={os.getenv('DWARF_HISA_V16_LOCAL_WINDOW', '64')} "
             f"block_q={os.getenv('DWARF_HISA_V16_BLOCK_Q', '16')} "
             f"backward={os.getenv('DWARF_HISA_V16_BWD', 'atomic_masked')} "
-            f"metadata={os.getenv('DWARF_HISA_V16_METADATA_BUILDER', 'blocked')}"
+            f"metadata={os.getenv('DWARF_HISA_V16_METADATA_BUILDER', 'eager')}"
             f"/{os.getenv('DWARF_HISA_V16_METADATA_TILE_BLOCK', '8')} "
             f"rep={os.getenv('DWARF_HISA_V16_REP_MODE', 'max_l2')}"
             f"/{os.getenv('DWARF_HISA_V16_REP_BLEND_ALPHA', '0.25')}"

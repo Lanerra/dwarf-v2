@@ -968,7 +968,7 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.backward_impl = os.getenv("DWARF_HISA_V16_BWD", "atomic_masked").strip().lower()
         if self.backward_impl not in {"atomic", "atomic_masked"}:
             raise ValueError("DWARF_HISA_V16_BWD must be atomic or atomic_masked")
-        self.metadata_builder = os.getenv("DWARF_HISA_V16_METADATA_BUILDER", "blocked").strip().lower()
+        self.metadata_builder = os.getenv("DWARF_HISA_V16_METADATA_BUILDER", "eager").strip().lower()
         if self.metadata_builder not in {"blocked", "eager"}:
             raise ValueError("DWARF_HISA_V16_METADATA_BUILDER must be blocked or eager")
         self.metadata_tile_block_size = int(os.getenv("DWARF_HISA_V16_METADATA_TILE_BLOCK", "8"))

@@ -70,16 +70,16 @@ def test_blocked_metadata_never_exports_future_or_invalid_tokens():
         assert torch.all(token_ids[valid] < lengths[valid])
 
 
-def test_v16_metadata_builder_defaults_to_blocked_and_keeps_eager_fallback(monkeypatch):
+def test_v16_metadata_builder_defaults_to_eager_and_keeps_blocked_opt_in(monkeypatch):
     default = HierarchicalSparseAttentionV16HISACausal(D=16, H=2, hd=8, num_chunks=2)
-    assert default.metadata_builder == "blocked"
+    assert default.metadata_builder == "eager"
     assert default.metadata_tile_block_size == 8
 
-    monkeypatch.setenv("DWARF_HISA_V16_METADATA_BUILDER", "eager")
+    monkeypatch.setenv("DWARF_HISA_V16_METADATA_BUILDER", "blocked")
     monkeypatch.setenv("DWARF_HISA_V16_METADATA_TILE_BLOCK", "1")
-    eager = HierarchicalSparseAttentionV16HISACausal(D=16, H=2, hd=8, num_chunks=2)
-    assert eager.metadata_builder == "eager"
-    assert eager.metadata_tile_block_size == 1
+    blocked = HierarchicalSparseAttentionV16HISACausal(D=16, H=2, hd=8, num_chunks=2)
+    assert blocked.metadata_builder == "blocked"
+    assert blocked.metadata_tile_block_size == 1
 
 
 def test_blocked_builder_matches_eager_module_output_and_input_gradient():
