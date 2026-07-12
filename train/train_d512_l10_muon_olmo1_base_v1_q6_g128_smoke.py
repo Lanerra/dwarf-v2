@@ -178,7 +178,7 @@ except Exception as _q6_fused_exc:
 # DSR IMPORT
 # =============================================================================
 
-HISA_IMPL = os.getenv('DWARF_HISA_IMPL', 'v15').strip().lower()
+HISA_IMPL = os.getenv('DWARF_HISA_IMPL', 'v16').strip().lower()
 if HISA_IMPL == 'v16':
     try:
         from hierarchical_sparse_attn_v16_hisa_causal import HierarchicalSparseAttentionV16HISACausal as HISA_IMPL_CLS
@@ -4729,7 +4729,12 @@ def train():
         print('  HISA Stage-2 selector: disabled (pure DSQG-D v1 control)')
     elif HISA_IMPL == 'v16':
         print('  DSR:  V16 strict-causal HISA')
-        print(f"  HISA V16 selector: tile={os.getenv('DWARF_HISA_V16_SELECTOR_TILE', '16')} local_window={os.getenv('DWARF_HISA_V16_LOCAL_WINDOW', '64')}")
+        print(
+            f"  HISA V16: tile={os.getenv('DWARF_HISA_V16_SELECTOR_TILE', '16')} "
+            f"local_window={os.getenv('DWARF_HISA_V16_LOCAL_WINDOW', '64')} "
+            f"block_q={os.getenv('DWARF_HISA_V16_BLOCK_Q', '16')} "
+            f"backward={os.getenv('DWARF_HISA_V16_BWD', 'atomic_masked')}"
+        )
     else:
         print('  DSR:  V15HISA')
         print(f"  HISA Stage-2 selector: rep_r={os.getenv('HISA_STAGE2_REP_R', os.getenv('DWARF_HISA_STAGE2_REP_R', '0'))} (0=rowmax baseline)")

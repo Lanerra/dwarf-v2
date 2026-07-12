@@ -517,7 +517,7 @@ if _TRITON_AVAILABLE:
         N, H: tl.constexpr, HD: tl.constexpr, K_VAL: tl.constexpr,
         M_VAL: tl.constexpr, M_PAD: tl.constexpr, SELECTOR_TILE: tl.constexpr,
         LOCAL_W: tl.constexpr, ROUTE_SCALE: tl.constexpr,
-        BLOCK_Q: tl.constexpr, BLOCK_LOCAL: tl.constexpr,
+        BLOCK_Q: tl.constexpr, BLOCK_LOCAL: tl.constexpr, MASK_ATOMICS: tl.constexpr,
     ):
         # The launch topology mirrors forward: a program uniquely owns its
         # query rows, but many programs can contribute to a source K/V row.
@@ -595,15 +595,18 @@ if _TRITON_AVAILABLE:
         dq += tl.dot(local_ds, local_k.to(tl.float32), input_precision="ieee") * scale
         local_dk = tl.dot(tl.trans(local_ds), q.to(tl.float32), input_precision="ieee") * scale
         local_dv = tl.dot(tl.trans(local_p), do, input_precision="ieee")
+        local_write_mask = local_mask
+        if MASK_ATOMICS:
+            local_write_mask = local_mask & (tl.sum(local_selected.to(tl.int32), axis=0) > 0)
         tl.atomic_add(
             dk_base + safe_local_ids[:, None] * stride_dkn + dims[None, :] * stride_dkd,
             local_dk,
-            mask=local_mask[:, None], sem="relaxed",
+            mask=local_write_mask[:, None], sem="relaxed",
         )
         tl.atomic_add(
             dv_base + safe_local_ids[:, None] * stride_dvn + dims[None, :] * stride_dvd,
             local_dv,
-            mask=local_mask[:, None], sem="relaxed",
+            mask=local_write_mask[:, None], sem="relaxed",
         )
 
         top_base = TOP_CHUNK + batch * stride_cb + head * stride_ch + tile * stride_ct
@@ -654,15 +657,18 @@ if _TRITON_AVAILABLE:
             dq += tl.dot(global_ds, global_k.to(tl.float32), input_precision="ieee") * scale
             global_dk = tl.dot(tl.trans(global_ds), q.to(tl.float32), input_precision="ieee") * scale
             global_dv = tl.dot(tl.trans(global_p), do, input_precision="ieee")
+            global_write_mask = id_mask
+            if MASK_ATOMICS:
+                global_write_mask = id_mask & (tl.sum(global_selected.to(tl.int32), axis=0) > 0)
             tl.atomic_add(
                 dk_base + safe_ids[:, None] * stride_dkn + dims[None, :] * stride_dkd,
                 global_dk,
-                mask=id_mask[:, None], sem="relaxed",
+                mask=global_write_mask[:, None], sem="relaxed",
             )
             tl.atomic_add(
                 dv_base + safe_ids[:, None] * stride_dvn + dims[None, :] * stride_dvd,
                 global_dv,
-                mask=id_mask[:, None], sem="relaxed",
+                mask=global_write_mask[:, None], sem="relaxed",
             )
             # Tile metadata comes from topk, so valid chunk IDs are unique for a
             # tile.  This program owns each query row, making a direct store safe.
@@ -695,6 +701,8 @@ class _V16HISATritonFn(torch.autograd.Function):
         selector_tile_size: int,
         local_window: int,
         route_prior_scale: float,
+        requested_block_q: int,
+        mask_atomics: bool,
     ) -> torch.Tensor:
         if not query.is_cuda or not _TRITON_AVAILABLE:
             metadata = HISAMetadata(
@@ -714,7 +722,9 @@ class _V16HISATritonFn(torch.autograd.Function):
         k_val = top_chunk_idx.shape[-1]
         m_val = token_idx.shape[-1]
         m_pad = max(16, _next_pow2(m_val))
-        block_q = 16 if head_dim > 64 else 32
+        block_q = int(requested_block_q) if requested_block_q > 0 else 16
+        if block_q < 16 or (block_q & (block_q - 1)):
+            raise ValueError("V16 BLOCK_Q must be a power of two >= 16")
         block_local = _next_pow2(local_window + block_q)
         if block_local > 256:
             raise ValueError("V16 local_window + BLOCK_Q must not exceed 256 for the fused forward")
@@ -750,6 +760,8 @@ class _V16HISATritonFn(torch.autograd.Function):
         ctx.selector_tile_size = selector_tile_size
         ctx.local_window = local_window
         ctx.route_prior_scale = route_prior_scale
+        ctx.block_q = block_q
+        ctx.mask_atomics = bool(mask_atomics)
         return out
 
     @staticmethod
@@ -759,7 +771,7 @@ class _V16HISATritonFn(torch.autograd.Function):
         k_val = top_chunk_idx.shape[-1]
         m_val = token_idx.shape[-1]
         m_pad = max(16, _next_pow2(m_val))
-        block_q = 16 if head_dim > 64 else 32
+        block_q = ctx.block_q
         block_local = _next_pow2(ctx.local_window + block_q)
         grad_output = grad_output.contiguous()
 
@@ -794,6 +806,7 @@ class _V16HISATritonFn(torch.autograd.Function):
             N=seq_len, H=heads, HD=head_dim, K_VAL=k_val, M_VAL=m_val, M_PAD=m_pad,
             SELECTOR_TILE=ctx.selector_tile_size, LOCAL_W=ctx.local_window,
             ROUTE_SCALE=float(ctx.route_prior_scale), BLOCK_Q=block_q, BLOCK_LOCAL=block_local,
+            MASK_ATOMICS=ctx.mask_atomics,
             num_warps=4, num_stages=2,
         )
         return (
@@ -801,7 +814,7 @@ class _V16HISATritonFn(torch.autograd.Function):
             dkey.to(key.dtype),
             dvalue.to(value.dtype),
             droute.to(route_logits.dtype),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None,
         )
 
 
@@ -847,6 +860,10 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.backend = (backend or os.getenv("DWARF_HISA_V16_BACKEND", "triton")).lower()
         if self.backend not in {"triton", "eager", "auto"}:
             raise ValueError("backend must be one of triton, eager, auto")
+        self.triton_block_q = int(os.getenv("DWARF_HISA_V16_BLOCK_Q", "16"))
+        self.backward_impl = os.getenv("DWARF_HISA_V16_BWD", "atomic_masked").strip().lower()
+        if self.backward_impl not in {"atomic", "atomic_masked"}:
+            raise ValueError("DWARF_HISA_V16_BWD must be atomic or atomic_masked")
         self.W_q = nn.Linear(D, H * hd, bias=False)
         self.W_k = nn.Linear(D, H * hd, bias=False)
         self.W_v = nn.Linear(D, H * hd, bias=False)
@@ -909,6 +926,8 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
                 self.selector_tile_size,
                 self.local_window,
                 self.route_prior_scale,
+                self.triton_block_q,
+                self.backward_impl == "atomic_masked",
             )
         else:
             attended = _eager_v16_attention(
