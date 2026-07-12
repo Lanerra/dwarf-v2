@@ -178,11 +178,23 @@ except Exception as _q6_fused_exc:
 # DSR IMPORT
 # =============================================================================
 
-try:
-    from hierarchical_sparse_attn_v15_hisa import HierarchicalSparseAttentionV15HISA, _pack_hisa_selected_tokens_for_dsqg_w
-except Exception:
-    from hierarchical_sparse_attn_v15_hisa_triton import HierarchicalSparseAttentionV15HISA
+HISA_IMPL = os.getenv('DWARF_HISA_IMPL', 'v15').strip().lower()
+if HISA_IMPL == 'v16':
+    try:
+        from hierarchical_sparse_attn_v16_hisa_causal import HierarchicalSparseAttentionV16HISACausal as HISA_IMPL_CLS
+    except Exception:
+        from kernels.hierarchical_sparse_attn_v16_hisa_causal import HierarchicalSparseAttentionV16HISACausal as HISA_IMPL_CLS
     _pack_hisa_selected_tokens_for_dsqg_w = None
+    HISA_IMPL_LABEL = "V16 strict-causal local+completed-chunk Triton forward/backward"
+elif HISA_IMPL == 'v15':
+    try:
+        from hierarchical_sparse_attn_v15_hisa import HierarchicalSparseAttentionV15HISA as HISA_IMPL_CLS, _pack_hisa_selected_tokens_for_dsqg_w
+    except Exception:
+        from hierarchical_sparse_attn_v15_hisa_triton import HierarchicalSparseAttentionV15HISA as HISA_IMPL_CLS
+        _pack_hisa_selected_tokens_for_dsqg_w = None
+    HISA_IMPL_LABEL = 'V15 legacy chunk-shared HISA'
+else:
+    raise ValueError(f"DWARF_HISA_IMPL must be 'v15' or 'v16', got {HISA_IMPL!r}")
 
 try:
     from kernels.dsqg_w.dsqg_w_mvp import DSQGWBlock, DSQGWConfig, CandidateProvider
@@ -3198,13 +3210,13 @@ class DSQGBlockTriadic(nn.Module):
 
 
 class DSRBlock(nn.Module):
-    """DSR block: HierarchicalSparseAttentionV15HISA + FFN + output gate."""
+    """DSR block: selected HISA implementation + FFN + output gate."""
     def __init__(self, embedding_dim, num_heads, ffn_dim, head_dim,
                  num_chunks, top_k_chunks, dropout=0.1, hisa_top_m_tokens=32):
         super().__init__()
         self.norm1 = _LayerNorm(embedding_dim)
         self.norm2 = _LayerNorm(embedding_dim)
-        self.attn = HierarchicalSparseAttentionV15HISA(
+        self.attn = HISA_IMPL_CLS(
             D=embedding_dim, H=num_heads, hd=head_dim,
             num_chunks=num_chunks, top_k_chunks=top_k_chunks,
             hisa_top_m_tokens=hisa_top_m_tokens,
@@ -3871,7 +3883,7 @@ class TriadicJ96Dsr(nn.Module):
                 q6 = ',q6_g128' if isinstance(block.attn, DSQGAttentionV19Q6G128Smoke) else ''
                 parts.append(f'L{i}:DSQG-{label}(J={j},shift={shift}{q6}){iflag}')
             elif isinstance(block, DSRBlock):
-                parts.append(f'L{i}:DSR-V15HISA(C={block.attn.num_chunks},k={block.attn.top_k_chunks},HISA_m={block.attn.hisa_top_m_tokens})')
+                parts.append(f'L{i}:DSR-{HISA_IMPL.upper()}HISA(C={block.attn.num_chunks},k={block.attn.top_k_chunks},HISA_m={block.attn.hisa_top_m_tokens})')
         if self.dsqg_w_enabled and self.dsqg_w_config is not None:
             path = _dsqg_w_candidate_path_label().lower().replace('_', '+')
             site_text = ','.join(self.dsqg_w_site_keys)
@@ -4644,8 +4656,8 @@ def train():
         print('  DWARF D512-L10 OLMo1Tok BaseV1 — PURE DSQG-D v1 control + R_PLANES=4, TIED LM_HEAD')
         print(f'  DSR/HISA: disabled; L{DSR_LAYER} uses DSQG-A control slot')
     else:
-        print(f'  DWARF D512-L10 OLMo1Tok BaseV1 — V15 HISA@L{DSR_LAYER} + R_PLANES=4, TIED LM_HEAD')
-        print(f'  DSR@L{DSR_LAYER}: HierarchicalSparseAttentionV15HISA(C={NUM_CHUNKS}, top_k={TOP_K_CHUNKS}, HISA_m={HISA_TOP_M_TOKENS})')
+        print(f'  DWARF D512-L10 OLMo1Tok BaseV1 — {HISA_IMPL.upper()} HISA@L{DSR_LAYER} + R_PLANES=4, TIED LM_HEAD')
+        print(f'  DSR@L{DSR_LAYER}: {HISA_IMPL_LABEL}(C={NUM_CHUNKS}, top_k={TOP_K_CHUNKS}, HISA_m={HISA_TOP_M_TOKENS})')
     print('  SCRATCH PRETRAINING: base_v1 OLMo-1 tokenizer 35 Mix6T / 20 Cosmo / 15 Code / 15 FinePDFs / 5 Wiki / 5 LongABC / 5 FW-Edu buffer.')
     print('=' * 70)
     if torch.cuda.is_available():
@@ -4715,6 +4727,9 @@ def train():
     if PURE_DSQG_BASELINE:
         print('  DSR:  disabled (pure DSQG-D v1 control)')
         print('  HISA Stage-2 selector: disabled (pure DSQG-D v1 control)')
+    elif HISA_IMPL == 'v16':
+        print('  DSR:  V16 strict-causal HISA')
+        print(f"  HISA V16 selector: tile={os.getenv('DWARF_HISA_V16_SELECTOR_TILE', '16')} local_window={os.getenv('DWARF_HISA_V16_LOCAL_WINDOW', '64')}")
     else:
         print('  DSR:  V15HISA')
         print(f"  HISA Stage-2 selector: rep_r={os.getenv('HISA_STAGE2_REP_R', os.getenv('DWARF_HISA_STAGE2_REP_R', '0'))} (0=rowmax baseline)")
