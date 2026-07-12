@@ -94,6 +94,8 @@ def _completed_chunk_representatives(
     num_chunks: int,
     chunk_size: int,
     valid_lengths: torch.Tensor,
+    representative_mode: str = "max_l2",
+    top2_blend_alpha: float = 0.25,
 ) -> torch.Tensor:
     """Return a salience representative for each physical chunk.
 
@@ -115,12 +117,24 @@ def _completed_chunk_representatives(
         dim=3,
         index=best.unsqueeze(-1).expand(-1, -1, -1, 1, head_dim),
     ).squeeze(3)
+    if representative_mode == "top2_blend" and top2_blend_alpha != 0.0 and chunk_size >= 2:
+        if not 0.0 <= top2_blend_alpha <= 1.0:
+            raise ValueError("top2_blend_alpha must be in [0, 1]")
+        top2 = energy.topk(2, dim=-1).indices
+        salient = torch.gather(
+            chunks,
+            dim=3,
+            index=top2.unsqueeze(-1).expand(-1, -1, -1, 2, head_dim),
+        )
+        reps = (1.0 - top2_blend_alpha) * salient[..., 0, :] + top2_blend_alpha * salient[..., 1, :]
+    elif representative_mode != "max_l2" and representative_mode != "top2_blend":
+        raise ValueError("representative_mode must be max_l2 or top2_blend")
     chunk_start = torch.arange(num_chunks, device=key.device) * chunk_size
     chunk_valid = chunk_start.reshape(1, num_chunks) < valid_lengths.reshape(batch_size, 1)
     return reps.masked_fill(~chunk_valid[:, None, :, None], 0.0)
 
 
-def _build_causal_tile_metadata(
+def _build_causal_tile_metadata_eager(
     query: torch.Tensor,
     key: torch.Tensor,
     route_logits: torch.Tensor,
@@ -202,6 +216,96 @@ def _build_causal_tile_metadata(
                 torch.full_like(top_values.float(), float("-inf")),
             )
 
+    return HISAMetadata(
+        top_chunk_idx=top_chunks,
+        token_idx=token_idx,
+        token_scores=token_scores,
+        tile_starts=tile_starts,
+        valid_lengths=valid_lengths.detach(),
+        chunk_size=int(chunk_size),
+        selector_tile_size=int(selector_tile_size),
+    )
+
+
+def _build_causal_tile_metadata_blocked(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    route_logits: torch.Tensor,
+    *,
+    num_chunks: int,
+    chunk_size: int,
+    top_k_chunks: int,
+    top_m_tokens: int,
+    selector_tile_size: int,
+    valid_lengths: torch.Tensor,
+    tile_block_size: int,
+) -> HISAMetadata:
+    """Build exact V16 tile metadata in independent vectorized tile blocks."""
+    if tile_block_size < 1:
+        raise ValueError("tile_block_size must be positive")
+    batch_size, heads, seq_len, head_dim = query.shape
+    device = query.device
+    n_tiles = math.ceil(seq_len / selector_tile_size)
+    k_slots = max(1, int(top_k_chunks))
+    m_slots = min(max(1, int(top_m_tokens)), chunk_size)
+    top_chunks = torch.full((batch_size, heads, n_tiles, k_slots), -1, dtype=torch.long, device=device)
+    token_idx = torch.full(
+        (batch_size, heads, n_tiles, k_slots, m_slots), -1, dtype=torch.long, device=device
+    )
+    token_scores = torch.full(
+        (batch_size, heads, n_tiles, k_slots, m_slots), float("-inf"), dtype=torch.float32, device=device
+    )
+    tile_starts = torch.arange(n_tiles, device=device, dtype=torch.long) * selector_tile_size
+    chunk_starts = torch.arange(num_chunks, device=device, dtype=torch.long) * chunk_size
+    chunk_ends = chunk_starts + chunk_size
+    padded_len = num_chunks * chunk_size
+    key_pad = F.pad(key, (0, 0, 0, padded_len - seq_len)) if padded_len > seq_len else key
+    key_chunks = key_pad.reshape(batch_size, heads, num_chunks, chunk_size, head_dim)
+    b_index = torch.arange(batch_size, device=device).reshape(batch_size, 1, 1, 1)
+    h_index = torch.arange(heads, device=device).reshape(1, heads, 1, 1)
+    within_chunk = torch.arange(chunk_size, device=device).reshape(1, 1, 1, 1, chunk_size)
+    chunk_has_token = chunk_starts.reshape(1, num_chunks) < valid_lengths.reshape(batch_size, 1)
+    k_eff = min(k_slots, num_chunks)
+
+    # Discrete selections remain detached. Blocking changes only eager launch
+    # scheduling; each semantic tile still uses exactly its first query row.
+    with torch.no_grad():
+        for tile_begin in range(0, n_tiles, tile_block_size):
+            starts = tile_starts[tile_begin : tile_begin + tile_block_size]
+            block_tiles = starts.numel()
+            tile_has_query = starts.reshape(1, block_tiles) < valid_lengths.reshape(batch_size, 1)
+            completed = chunk_ends.reshape(1, num_chunks) < (starts.reshape(block_tiles, 1) + 1)
+            eligible = (
+                completed.reshape(1, 1, block_tiles, num_chunks)
+                & chunk_has_token.reshape(batch_size, 1, 1, num_chunks)
+                & tile_has_query.reshape(batch_size, 1, block_tiles, 1)
+            )
+            routing_at_start = route_logits[:, :, starts, :].detach().masked_fill(~eligible, float("-inf"))
+            values, indices = routing_at_start.topk(k_eff, dim=-1)
+            valid_selected = torch.isfinite(values)
+            indices = torch.where(valid_selected, indices, torch.full_like(indices, -1))
+            top_chunks[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = indices
+
+            safe_indices = indices.clamp_min(0)
+            selected_keys = key_chunks[b_index, h_index, safe_indices]
+            selected_abs = safe_indices[..., None] * chunk_size + within_chunk
+            selected_valid = (
+                valid_selected[..., None]
+                & (selected_abs < valid_lengths.reshape(batch_size, 1, 1, 1, 1))
+                & (selected_abs < starts.reshape(1, 1, block_tiles, 1, 1))
+            )
+            q0 = query[:, :, starts, :].detach().unsqueeze(3).unsqueeze(4)
+            scores = (q0 * selected_keys.detach()).sum(dim=-1) / math.sqrt(head_dim)
+            scores = scores.masked_fill(~selected_valid, float("-inf"))
+            top_values, local_indices = scores.topk(m_slots, dim=-1)
+            absolute = safe_indices[..., None] * chunk_size + local_indices
+            finite = torch.isfinite(top_values) & valid_selected[..., None]
+            token_idx[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = torch.where(
+                finite, absolute, torch.full_like(absolute, -1)
+            )
+            token_scores[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = torch.where(
+                finite, top_values.float(), torch.full_like(top_values.float(), float("-inf"))
+            )
     return HISAMetadata(
         top_chunk_idx=top_chunks,
         token_idx=token_idx,
@@ -864,6 +968,18 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.backward_impl = os.getenv("DWARF_HISA_V16_BWD", "atomic_masked").strip().lower()
         if self.backward_impl not in {"atomic", "atomic_masked"}:
             raise ValueError("DWARF_HISA_V16_BWD must be atomic or atomic_masked")
+        self.metadata_builder = os.getenv("DWARF_HISA_V16_METADATA_BUILDER", "blocked").strip().lower()
+        if self.metadata_builder not in {"blocked", "eager"}:
+            raise ValueError("DWARF_HISA_V16_METADATA_BUILDER must be blocked or eager")
+        self.metadata_tile_block_size = int(os.getenv("DWARF_HISA_V16_METADATA_TILE_BLOCK", "8"))
+        if self.metadata_tile_block_size < 1:
+            raise ValueError("DWARF_HISA_V16_METADATA_TILE_BLOCK must be positive")
+        self.representative_mode = os.getenv("DWARF_HISA_V16_REP_MODE", "max_l2").strip().lower()
+        if self.representative_mode not in {"max_l2", "top2_blend"}:
+            raise ValueError("DWARF_HISA_V16_REP_MODE must be max_l2 or top2_blend")
+        self.top2_blend_alpha = float(os.getenv("DWARF_HISA_V16_REP_BLEND_ALPHA", "0.25"))
+        if not 0.0 <= self.top2_blend_alpha <= 1.0:
+            raise ValueError("DWARF_HISA_V16_REP_BLEND_ALPHA must be in [0, 1]")
         self.W_q = nn.Linear(D, H * hd, bias=False)
         self.W_k = nn.Linear(D, H * hd, bias=False)
         self.W_v = nn.Linear(D, H * hd, bias=False)
@@ -895,12 +1011,11 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             num_chunks=self.num_chunks,
             chunk_size=chunk_size,
             valid_lengths=valid_lengths,
+            representative_mode=self.representative_mode,
+            top2_blend_alpha=self.top2_blend_alpha,
         )
         route_logits = torch.matmul(query, reps.transpose(-2, -1)) / (math.sqrt(self.hd) * self.temperature)
-        metadata = _build_causal_tile_metadata(
-            query,
-            key,
-            route_logits,
+        metadata_kwargs = dict(
             num_chunks=self.num_chunks,
             chunk_size=chunk_size,
             top_k_chunks=self.top_k_chunks,
@@ -908,6 +1023,12 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             selector_tile_size=self.selector_tile_size,
             valid_lengths=valid_lengths,
         )
+        if self.metadata_builder == "blocked":
+            metadata = _build_causal_tile_metadata_blocked(
+                query, key, route_logits, tile_block_size=self.metadata_tile_block_size, **metadata_kwargs
+            )
+        else:
+            metadata = _build_causal_tile_metadata_eager(query, key, route_logits, **metadata_kwargs)
         with torch.no_grad():
             tile_scores = route_logits[:, :, metadata.tile_starts.clamp_max(seq_len - 1), :]
             self._routing_entropy = torch.softmax(tile_scores.float(), dim=-1).mul(
