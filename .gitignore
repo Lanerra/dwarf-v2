@@ -49,10 +49,10 @@ checkpoints/*.pth
 # Public/source-only repository hygiene.
 # Keep README.md for GitHub rendering; keep tokenizer asset JSONs; keep docs,
 # measurement reports, plans, run manifests, and eval outputs local.
-audits/
-autoresearch/
-kernel_overlays/
-tests/
+/audits/
+/autoresearch/
+/kernel_overlays/
+/tests/
 docs/
 .hermes/
 *.md
