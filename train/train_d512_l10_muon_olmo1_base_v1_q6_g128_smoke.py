@@ -371,10 +371,10 @@ def validate_schedule_resume(*, config: LRScheduleConfig, resume_path: str, skip
 def select_train_tranche(
     *,
     train_data: torch.Tensor,
-    train_loss_mask: torch.Tensor,
+    train_loss_mask: torch.Tensor | None,
     max_train_seqs: int,
     offset_text: str | None,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, int | str]]:
+) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, int | str]]:
     """Select an explicit contiguous continuation tranche or preserve legacy randomized capping."""
     if offset_text is not None and offset_text.strip() != '':
         offset = int(offset_text)
@@ -387,12 +387,12 @@ def select_train_tranche(
                 f'DWARF_TRAIN_SEQ_OFFSET={offset} with DWARF_MAX_TRAIN_SEQS={count} '
                 f'exceeds dataset rows={len(train_data)}'
             )
-        return train_data[offset:end], train_loss_mask[offset:end], {
+        return train_data[offset:end], None if train_loss_mask is None else train_loss_mask[offset:end], {
             'mode': 'contiguous', 'offset': offset, 'count': count, 'end': end,
         }
     if len(train_data) > max_train_seqs:
         subset_idx = torch.randperm(len(train_data))[:max_train_seqs]
-        return train_data[subset_idx], train_loss_mask[subset_idx], {
+        return train_data[subset_idx], None if train_loss_mask is None else train_loss_mask[subset_idx], {
             'mode': 'random_cap', 'offset': 0, 'count': int(max_train_seqs), 'end': int(max_train_seqs),
         }
     return train_data, train_loss_mask, {
@@ -696,6 +696,15 @@ LAYER_LAYOUT = [
     (label, offsets, js, jl, has_if and PRE_HISA_EMA_ENABLED)
     for label, offsets, js, jl, has_if in _BASE_LAYER_LAYOUT
 ]
+
+CONV_REPLACE_L7 = os.getenv('DWARF_CONV_REPLACE_L7', '0') == '1'
+CONV_REPLACE_KERNEL = int(os.environ.get('DWARF_CONV_REPLACE_KERNEL', '3'))
+if CONV_REPLACE_KERNEL < 1:
+    raise ValueError(f'DWARF_CONV_REPLACE_KERNEL must be >= 1, got {CONV_REPLACE_KERNEL}')
+if CONV_REPLACE_L7:
+    if PURE_DSQG_BASELINE:
+        raise ValueError('DWARF_CONV_REPLACE_L7 requires the DSQG-D/HISA hybrid, not PURE_DSQG_BASELINE')
+    LAYER_LAYOUT[7] = ('CONV', None, 0, 0, False)
 
 assert len(LAYER_LAYOUT) == NUM_LAYERS
 if not PRE_HISA_EMA_ENABLED:
@@ -3167,6 +3176,35 @@ class FFN(nn.Module):
         return self.fc2(self.drop(F.gelu(self.fc1(x))))
 
 
+class GatedCausalConvBlock(nn.Module):
+    """Causal local mixer that can replace one whole DSQG block in a hybrid layout."""
+    def __init__(self, embedding_dim, ffn_dim, kernel_size=3, dropout=0.1):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.norm1 = _LayerNorm(embedding_dim)
+        self.norm2 = _LayerNorm(embedding_dim)
+        self.in_proj = nn.Linear(embedding_dim, 2 * embedding_dim, bias=False)
+        self.depthwise = nn.Conv1d(
+            embedding_dim,
+            embedding_dim,
+            kernel_size=self.kernel_size,
+            groups=embedding_dim,
+            bias=False,
+        )
+        self.out_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        self.ffn = FFN(embedding_dim, ffn_dim, dropout)
+        self.drop = nn.Dropout(dropout)
+        nn.init.normal_(self.depthwise.weight, mean=0.0, std=0.02)
+
+    def forward(self, x):
+        gate, values = self.in_proj(self.norm1(x)).chunk(2, dim=-1)
+        mixed = F.pad(values.transpose(1, 2), (self.kernel_size - 1, 0))
+        mixed = self.depthwise(mixed).transpose(1, 2)
+        x = x + self.drop(self.out_proj(torch.sigmoid(gate) * mixed))
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
 class DSQGBlockTriadic(nn.Module):
     def __init__(self, embedding_dim, num_heads, ffn_dim, seq_len,
                  offsets, j_small, j_large, group_label,
@@ -3260,6 +3298,13 @@ class TriadicJ96Dsr(nn.Module):
                     embedding_dim, num_heads, ffn_dim,
                     self.head_dim, num_chunks, top_k_chunks, dropout,
                     hisa_top_m_tokens=HISA_TOP_M_TOKENS))
+            elif label == 'CONV':
+                blocks.append(GatedCausalConvBlock(
+                    embedding_dim, ffn_dim,
+                    kernel_size=CONV_REPLACE_KERNEL,
+                    dropout=dropout))
+                # Retain the original DSQG ordinal for later MOVT plane shifts.
+                dsqg_idx += 1
             else:
                 plane_shift = (_movt_plane_shift_for_dsqg_index(dsqg_idx, self.head_dim, R_PLANES)
                                if STAGGER_MOVT_PLANES else 0)
@@ -3889,6 +3934,8 @@ class TriadicJ96Dsr(nn.Module):
                 parts.append(f'L{i}:DSQG-{label}(J={j},shift={shift}{q6}){iflag}')
             elif isinstance(block, DSRBlock):
                 parts.append(f'L{i}:DSR-{HISA_IMPL.upper()}HISA(C={block.attn.num_chunks},k={block.attn.top_k_chunks},HISA_m={block.attn.hisa_top_m_tokens})')
+            elif isinstance(block, GatedCausalConvBlock):
+                parts.append(f'L{i}:Conv1D(k={block.kernel_size})')
         if self.dsqg_w_enabled and self.dsqg_w_config is not None:
             path = _dsqg_w_candidate_path_label().lower().replace('_', '+')
             site_text = ','.join(self.dsqg_w_site_keys)
@@ -4380,10 +4427,29 @@ def _coerce_dataset_loss_mask(name: str, mask: torch.Tensor, data: torch.Tensor)
     return mask.to(dtype=torch.bool).contiguous()
 
 
-def _dataset_loss_mask_stats(train_loss_mask: torch.Tensor,
-                             val_loss_mask: torch.Tensor,
+def _dataset_loss_mask_stats(train_loss_mask: torch.Tensor | None,
+                             val_loss_mask: torch.Tensor | None,
                              *,
-                             source: str) -> dict:
+                             source: str,
+                             train_data: torch.Tensor | None = None,
+                             val_data: torch.Tensor | None = None) -> dict:
+    if train_loss_mask is None or val_loss_mask is None:
+        if train_loss_mask is not None or val_loss_mask is not None or train_data is None or val_data is None:
+            raise ValueError('implicit all-token CE requires both masks absent and train/val tensors present')
+        train_slots = int(train_data[:, 1:].numel())
+        val_slots = int(val_data[:, 1:].numel())
+        return {
+            'source': source,
+            'has_train_loss_mask': False,
+            'has_val_loss_mask': False,
+            'uses_sparse_loss_mask': False,
+            'train_real_tokens': train_slots,
+            'train_target_slots': train_slots,
+            'train_real_fraction': 1.0,
+            'val_real_tokens': val_slots,
+            'val_target_slots': val_slots,
+            'val_real_fraction': 1.0,
+        }
     train_targets = train_loss_mask[:, 1:]
     val_targets = val_loss_mask[:, 1:]
     train_real = int(train_targets.sum().item())
@@ -4411,7 +4477,7 @@ def _prepare_dataset_loss_masks(cache: dict,
                                 train_data: torch.Tensor,
                                 val_data: torch.Tensor,
                                 *,
-                                use_liger_ce: bool) -> tuple[torch.Tensor, torch.Tensor, dict]:
+                                use_liger_ce: bool) -> tuple[torch.Tensor | None, torch.Tensor | None, dict]:
     """Validate optional DWARF-v2-shaped loss masks and compute shifted-row stats.
 
     Masks are stored token-aligned with the dataset. The trainer predicts
@@ -4430,11 +4496,9 @@ def _prepare_dataset_loss_masks(cache: dict,
         raise ValueError('dataset must provide both train_loss_mask and val_loss_mask, or neither')
 
     if not has_train_mask:
-        print('  [dataset] no loss masks found; using all-token CE')
-        train_loss_mask = torch.ones_like(train_data, dtype=torch.bool)
-        val_loss_mask = torch.ones_like(val_data, dtype=torch.bool)
-        return train_loss_mask, val_loss_mask, _dataset_loss_mask_stats(
-            train_loss_mask, val_loss_mask, source='all_token'
+        print('  [dataset] no loss masks found; using implicit all-token CE')
+        return None, None, _dataset_loss_mask_stats(
+            None, None, source='all_token_implicit', train_data=train_data, val_data=val_data
         )
 
     train_loss_mask = _coerce_dataset_loss_mask('train_loss_mask', cache['train_loss_mask'], train_data)
@@ -4696,6 +4760,8 @@ def train():
     print(f'  Batch: BS={BATCH_SIZE} x GA={GRAD_ACCUM} = eff_batch={BATCH_SIZE*GRAD_ACCUM}')
     print(f'  checkpoint_strategy={CHECKPOINT_STRATEGY}')
     print('  DSQG: V20-compatible (R=4 sequential Givens, grouped sparse, SE gates)')
+    if CONV_REPLACE_L7:
+        print(f'  Conv replacement: L7 causal gated depthwise Conv1D (kernel={CONV_REPLACE_KERNEL})')
     if Q6_G128_ENABLED:
         if Q6_G128_FUSED_CONSUME:
             _banner_tile = _q6_g128_effective_stage_c_tile(MAX_SEQ_LEN, Q6_G128_STAGE_C_TILE)
@@ -4809,15 +4875,16 @@ def train():
     )
     if len(val_data) > MAX_VAL_SEQS:
         val_data = val_data[:MAX_VAL_SEQS]
-        val_loss_mask = val_loss_mask[:MAX_VAL_SEQS]
+        val_loss_mask = None if val_loss_mask is None else val_loss_mask[:MAX_VAL_SEQS]
     loss_mask_stats = _dataset_loss_mask_stats(
-        train_loss_mask, val_loss_mask, source=loss_mask_stats['source']
+        train_loss_mask, val_loss_mask, source=loss_mask_stats['source'], train_data=train_data, val_data=val_data
     )
     if PIN_DATASET:
         train_data = train_data.pin_memory()
         val_data = val_data.pin_memory()
-        train_loss_mask = train_loss_mask.pin_memory()
-        val_loss_mask = val_loss_mask.pin_memory()
+        if train_loss_mask is not None:
+            train_loss_mask = train_loss_mask.pin_memory()
+            val_loss_mask = val_loss_mask.pin_memory()
     train_real = loss_mask_stats['train_real_tokens']
     val_real = loss_mask_stats['val_real_tokens']
     train_slots = max(loss_mask_stats['train_target_slots'], 1)
@@ -5027,18 +5094,21 @@ def train():
                 mb = min(BATCH_SIZE, len(train_data) - idx_start)
                 if mb > 0:
                     batch_indices = indices[idx_start:idx_start + BATCH_SIZE]
-                    total_rows_this_accum += int(train_loss_mask[batch_indices, 1:].sum().item())
+                    if train_loss_mask is None:
+                        total_rows_this_accum += mb * (train_data.size(1) - 1)
+                    else:
+                        total_rows_this_accum += int(train_loss_mask[batch_indices, 1:].sum().item())
             total_rows_this_accum = max(total_rows_this_accum, 1)
 
             for idx_start in micro_starts:
                 batch_indices = indices[idx_start:idx_start + BATCH_SIZE]
                 batch = train_data[batch_indices]
-                batch_mask = train_loss_mask[batch_indices]
+                batch_mask = None if train_loss_mask is None else train_loss_mask[batch_indices]
                 x = batch[:, :-1].to(device, non_blocking=True)
                 if x.dtype not in (torch.int32, torch.int64):
                     x = x.long()
                 y = batch[:, 1:].to(device, non_blocking=True).long()
-                target_mask = batch_mask[:, 1:].to(device, non_blocking=True)
+                target_mask = None if batch_mask is None else batch_mask[:, 1:].to(device, non_blocking=True)
                 dsqg_w_question_indices, dsqg_w_hisa_evidence_indices, dsqg_w_l3_skip_indices = _dsqg_w_training_candidate_indices(x)
 
                 if USE_LIGER_CE:
