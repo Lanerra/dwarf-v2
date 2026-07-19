@@ -1,65 +1,55 @@
-# Python
+# Python environments and caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.venv
 .venv/
 venv/
 
-# Runtime outputs
-logs/
-checkpoints/
-results/
-runs/
-wandb/
-.codegraph/
-.hermes/
+# Runtime and profiling output
+/logs/
+/checkpoints/
+/results/
+/runs/
+/wandb/
 *.log
 *.ncu-rep
 *.qdstrm
 
-# Keep git focused on implementation source. Research notes, plans,
-# measurement dumps, and ad-hoc JSON outputs stay local unless explicitly
-# whitelisted as required runtime assets.
-docs/
-*.md
-*.json
-!README.md
-!tokenizers/*_tokenizer.json
-
-# Large local artifacts: keep present for local trainer runs, but do not commit.
-datasets
-datasets/
-datasets/*.pt
-datasets/*.pth
-datasets/*.npy
-datasets/*.npz
-datasets/dsqg_v2_semantic_curriculum_*/
-datasets/dsqg_v2_pretrain_shard_*/
-checkpoints/*.pt
-checkpoints/*.pth
-
-# OS/editor
-.DS_Store
-.vscode/
-.idea/
-
-# Public/source-only repository hygiene.
-# Keep README.md for GitHub rendering; keep tokenizer asset JSONs; keep docs,
-# measurement reports, plans, run manifests, and eval outputs local.
+# Local research, release, and evaluation artifacts. Keep the public Git tree
+# limited to the trainer, its runtime kernels, tokenizer, and repository metadata.
+/release/
+/releases/
 /audits/
 /autoresearch/
 /kernel_overlays/
-/tests/
-docs/
-.hermes/
+/scripts/
+/tools/
+/docs/
+/.hermes/
+/.codegraph/
+/dwarf-logo.png
+
+# Local datasets and checkpoint payloads
+/datasets
+/datasets/
+*.pt
+*.pth
+*.npy
+*.npz
+
+# Documentation and generated metadata remain local, except for the GitHub README
 *.md
 !README.md
 *.json
 !tokenizers/
 !tokenizers/*_tokenizer.json
 
-# Build products for the CPU-first Rust oracle live beside its source.
+# Rust build products for local analytical tooling
 tools/**/target/
+
+# OS/editor state
+.DS_Store
+.vscode/
+.idea/
