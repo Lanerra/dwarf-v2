@@ -1,88 +1,71 @@
 # DWARF-v2
 
-DWARF-v2 is a research prototype for experimenting with sparse language-model training paths, centered on HISA/DSQG-D routing and optional DSQG-W evidence recomposition. It is a compact, source-focused workspace extracted from a larger research tree so the trainer, kernels, tests, and reusable run scripts are easier to inspect and run.
+DWARF-v2 is a compact research implementation of a causal language-model architecture built from Dynamic Sparse Query-Gather (DSQG) blocks and one L3 global mixer.  It is for reproducing and extending DWARF training runs, not production deployment.
 
-This is not production-ready software. Expect rough edges, fast-changing experiment flags, hardware assumptions, and incomplete ergonomics. Treat it as a prototype for reproducing and extending research runs, not as a supported training framework.
+The public tree intentionally contains only the runtime source needed to construct and train the active architecture.  Datasets, checkpoints, launch scripts, evaluation outputs, Hugging Face staging files, diagnostics, and retired experiments remain local and are not part of this repository.
 
-## What is included
+## Included topology
+
+- Nine triadic DSQG sparse-attention blocks using the canonical 96-offset lattice.
+- A causal-EMA interference injection in the final pre-L3 DSQG block.
+- One L3 global mixer, selectable as either:
+  - **strict-causal V16 HISA** (`--global-mixer hisa`, the default); or
+  - **full causal SDPA** (`--global-mixer fa`), the FA@L3 topology used by DWARF-55M-Base.
+
+## Repository layout
 
 ```text
-train/                         main D512/L10 trainer entrypoint
-kernels/                       sparse attention, scan, q6/HKV, and DSQG-W code
-scripts/                       reusable launchers, profilers, and diagnostics
-tests/                         focused regression and smoke tests
-tools/passkey_eval.py          passkey guardrail evaluator
-tokenizers/                    tracked tokenizer assets
-datasets/                      local training data location; gitignored
-checkpoints/, runs/, logs/     local run outputs; gitignored
+train/train_dwarf.py                         reference training entrypoint
+kernels/dsqg_attention_v20_bf16_se.py       triadic DSQG CUDA/Triton kernel
+kernels/causal_ema_scan.py                   causal EMA scan used by L2 interference
+kernels/hierarchical_sparse_attn_v16_hisa_causal.py  strict-causal HISA L3 mixer
+tokenizers/olmo1_gpt_neox_dolma_v1_5_tokenizer.json  DWARF-55M tokenizer asset
 ```
 
-Research notes, measurement dumps, raw eval JSON, checkpoints, and datasets are intentionally not tracked.
+## Requirements
 
-## Setup
-
-Use a Python environment with CUDA-capable PyTorch available. One typical setup is:
+DWARF training requires an NVIDIA GPU, a CUDA-enabled PyTorch installation, and Triton.  Create an environment and install the matching PyTorch wheel using the [official selector](https://pytorch.org/get-started/locally/), then install the remaining runtime dependency:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The default tokenizer is committed at:
+## Dataset contract
+
+The trainer accepts a local `torch.save` artifact containing an integer tensor with shape `[rows, sequence_length]`.  A dictionary containing that tensor under `input_ids`, `tokens`, or `data` is also accepted.  Dataset construction is intentionally out of scope for this source-only repository.
+
+Use the tokenizer tracked at:
 
 ```text
 tokenizers/olmo1_gpt_neox_dolma_v1_5_tokenizer.json
 ```
 
-Training data is not committed. Compatible tokenized datasets can be passed via `--dataset` / `DWARF_DATASET`.
+## Run a DWARF training smoke
 
-## Run a small training smoke
-
-A bounded launcher is provided for quick checks before longer experiments:
+The standard model is D=512, H=8, L=10, FFN=1536, sequence length 2048, and vocabulary size 50,282.  Start with a small row count and a disposable output directory:
 
 ```bash
-PYTHONPATH=. .venv/bin/python scripts/run_dsqg_w_full_training.py \
-  --output-dir runs/dsqg_w_smoke \
-  --dataset datasets/dwarf_base_v1_olmo1tok_2048_2b.pt \
-  --gpu 0 \
-  --max-acc-steps 25 \
-  --train-seqs 256 \
-  --val-seqs 128 \
+python train/train_dwarf.py \
+  --dataset /absolute/path/to/packed_tokens.pt \
+  --output-dir runs/dwarf-smoke \
+  --device cuda \
   --batch-size 1 \
-  --grad-accum 1 \
-  --epochs 1 \
-  --execute
+  --max-steps 25 \
+  --save-every 25
 ```
 
-For a configuration-only dry run, replace `--execute` with `--dry-run`; this writes `run_config.json` without launching the trainer.
-
-## Direct trainer entrypoint
-
-The underlying trainer can also be run directly through environment variables:
+For the FA@L3 topology used by DWARF-55M-Base, add:
 
 ```bash
-DWARF_DATASET=datasets/dwarf_base_v1_olmo1tok_2048_2b.pt \
-DWARF_TOKENIZER=tokenizers/olmo1_gpt_neox_dolma_v1_5_tokenizer.json \
-DWARF_MAX_ACC_STEPS=25 \
-DWARF_EPOCHS=1 \
-DWARF_LIGER=0 \
-PYTHONPATH=. .venv/bin/python train/train_d512_l10_muon_olmo1_base_v1_q6_g128_smoke.py
+--global-mixer fa
 ```
 
-Most architecture switches are environment variables beginning with `DWARF_`. See the trainer and launcher source for the current set of experiment flags.
+The trainer writes model-only checkpoints containing `model_state_dict`, the resolved architecture configuration, and the completed step.  It does not package datasets, optimizer state, evaluation labels, or external-run artifacts.
 
-## Tests
+## Scope and limitations
 
-Run focused tests with:
-
-```bash
-PYTHONPATH=. .venv/bin/python -m pytest tests -q
-```
-
-Some tests and training paths require CUDA and the optional packages listed in `requirements.txt`.
+This is an architecture/reference-training implementation.  It does not claim a turnkey reproduction of any particular data mixture, compute budget, optimizer schedule, or benchmark result.  Those choices materially affect model quality and must be specified by a downstream experiment.
 
 ## License
 
-Apache-2.0. See `LICENSE`.
+[Apache-2.0](LICENSE)
