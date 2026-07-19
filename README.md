@@ -9,8 +9,8 @@ The public tree intentionally contains only the runtime source needed to constru
 - Nine triadic DSQG sparse-attention blocks using the canonical 96-offset lattice.
 - A causal-EMA interference injection in the final pre-L3 DSQG block.
 - One L3 global mixer, selectable as either:
-  - **strict-causal V16 HISA** (`--global-mixer hisa`, the default); or
-  - **full causal SDPA** (`--global-mixer fa`), the FA@L3 topology used by DWARF-55M-Base.
+  - **strict-causal V16 HISA** (`--global-mixer hisa`); or
+  - **full causal SDPA** (`--global-mixer fa`, the default), the FA@L3 topology used by DWARF-55M-Base.
 
 ## Repository layout
 
