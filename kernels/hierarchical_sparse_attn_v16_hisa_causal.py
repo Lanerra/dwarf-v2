@@ -57,6 +57,19 @@ class HISAMetadata:
     selector_tile_size: int
 
 
+@dataclass(frozen=True)
+class HISASelectionCapture:
+    """Ephemeral train-only route-logit loss surface for the evidence sidecar.
+
+    The metadata is already detached by the selector. ``route_logits`` remains
+    differentiable, so an auxiliary can supervise the pre-top-k distribution
+    without changing either the discrete routing choice or normal outputs.
+    """
+
+    route_logits: torch.Tensor
+    metadata: HISAMetadata
+
+
 _DEFAULT_LOCAL_WINDOW: Final[int] = 64
 _DEFAULT_SELECTOR_TILE: Final[int] = 16
 
@@ -985,6 +998,9 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.W_v = nn.Linear(D, H * hd, bias=False)
         self.W_o = nn.Linear(H * hd, D, bias=False)
         self._routing_entropy: torch.Tensor | float = float("nan")
+        # Intentionally not a buffer/state-dict entry: this is a one-forward
+        # training side channel and must never surface in ordinary inference.
+        self.hisa_evidence_capture: HISASelectionCapture | None = None
 
     def forward(
         self,
@@ -995,6 +1011,9 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         return_metadata: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, HISAMetadata]:
         del kv_inject
+        # Clear before doing any work so a failed/new forward cannot leak a
+        # stale differentiable graph to the trainer.
+        self.hisa_evidence_capture = None
         batch_size, seq_len, _ = x.shape
         valid_lengths = _as_valid_lengths(
             valid_lengths if valid_lengths is not None else getattr(self, "_causal_control_valid_lengths", None),
@@ -1029,6 +1048,11 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             )
         else:
             metadata = _build_causal_tile_metadata_eager(query, key, route_logits, **metadata_kwargs)
+        if self.training and os.getenv("DWARF_HISA_EVIDENCE_AUX", "0") == "1":
+            self.hisa_evidence_capture = HISASelectionCapture(
+                route_logits=route_logits,
+                metadata=metadata,
+            )
         with torch.no_grad():
             tile_scores = route_logits[:, :, metadata.tile_starts.clamp_max(seq_len - 1), :]
             self._routing_entropy = torch.softmax(tile_scores.float(), dim=-1).mul(
