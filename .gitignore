@@ -51,6 +51,7 @@ venv/
 # Documentation and generated metadata remain local, except for the GitHub README
 *.md
 !README.md
+!dwarf-logo.png
 *.json
 !tokenizers/
 !tokenizers/*_tokenizer.json

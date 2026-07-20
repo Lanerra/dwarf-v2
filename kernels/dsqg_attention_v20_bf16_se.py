@@ -170,6 +170,32 @@ def _rms_normalize_last(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
 
 
+def calibrated_movt_phase_gain_std(
+    *,
+    head_dim: int,
+    target_dynamic_rms: float,
+    gate_logit: float = 0.0,
+) -> float:
+    """Return a phase-gain std targeting the initial content-angle RMS.
+
+    RMS-normalized Q/K projected onto unit probes and scaled by 1/sqrt(HD)
+    produce RMS(y*z) approximately 1/HD. Thus target ≈ gate*gain_std/HD.
+    """
+    head_dim = int(head_dim)
+    target = float(target_dynamic_rms)
+    gate_logit = float(gate_logit)
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive, got {head_dim}")
+    if not math.isfinite(target) or target <= 0.0:
+        raise ValueError(
+            f"target_dynamic_rms must be finite and positive, got {target_dynamic_rms}"
+        )
+    if not math.isfinite(gate_logit):
+        raise ValueError(f"gate_logit must be finite, got {gate_logit}")
+    gate = 1.0 / (1.0 + math.exp(-gate_logit))
+    return target * head_dim / gate
+
+
 def npci_rotate(x: torch.Tensor, x_delta: torch.Tensor,
                 theta_h: torch.Tensor) -> torch.Tensor:
     """NPCI rotation: project x_delta onto perpendicular of x, rotate by theta.
@@ -2165,7 +2191,8 @@ class DSQGAttentionV19(nn.Module):
                  # RTX 4090 D512/L10 J=32 triads in prior measurements).
                  grouped_mode='baseline', verify_mode=False,
                  max_group_size=None, max_group_spread=None,
-                 plane_shift=0, pos_bias_scale=None):
+                 plane_shift=0, pos_bias_scale=None,
+                 movt_dynamic_rms_target=None):
         super().__init__()
         D = embedding_dim
         H = num_heads
@@ -2177,6 +2204,18 @@ class DSQGAttentionV19(nn.Module):
         if HD < 16:
             raise ValueError(f"head_dim={HD} is too small for Triton tl.dot paths; require head_dim >= 16")
         self.seq_len = seq_len
+        self.movt_dynamic_rms_target = (
+            None if movt_dynamic_rms_target is None else float(movt_dynamic_rms_target)
+        )
+        self.movt_phase_gain_init_std = (
+            0.001
+            if self.movt_dynamic_rms_target is None
+            else calibrated_movt_phase_gain_std(
+                head_dim=HD,
+                target_dynamic_rms=self.movt_dynamic_rms_target,
+                gate_logit=0.0,
+            )
+        )
         self.grouped_mode = grouped_mode
         self.grouped_mode_id = _resolve_grouped_mode(grouped_mode)
         self.verify_mode = bool(verify_mode)
@@ -2278,7 +2317,7 @@ class DSQGAttentionV19(nn.Module):
         self.phase_base = nn.Parameter(
             torch.randn(max(j_large, 1), H, R_PLANES) * 0.1)
         self.phase_gain = nn.Parameter(
-            torch.randn(max(j_large, 1), H, R_PLANES) * 0.001)
+            torch.randn(max(j_large, 1), H, R_PLANES) * self.movt_phase_gain_init_std)
         self.phase_gate = nn.Parameter(torch.zeros(max(j_large, 1)))
 
         query_probes, key_probes = _orthogonal_phase_probes(R_PLANES, HD, plane_shift=self.plane_shift)

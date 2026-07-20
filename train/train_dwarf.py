@@ -32,8 +32,30 @@ if str(KERNEL_DIR) not in sys.path:
     sys.path.insert(0, str(KERNEL_DIR))
 
 from causal_ema_scan import causal_ema_scan
-from dsqg_attention_v20_bf16_se import ALL_OFFSETS, DSQGAttentionV19, R_PLANES
+from dsqg_attention_v20_bf16_se import (
+    ALL_OFFSETS,
+    DSQGAttentionV19,
+    R_PLANES,
+    calibrated_movt_phase_gain_std,
+)
 from hierarchical_sparse_attn_v16_hisa_causal import HierarchicalSparseAttentionV16HISACausal
+
+
+def _parse_movt_dynamic_rms_target(value: str) -> float | None:
+    raw = str(value).strip().lower()
+    if raw in {"0", "legacy", "none", "off"}:
+        return None
+    try:
+        target = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "MOVT dynamic RMS target must be a positive float or legacy/off/none/0"
+        ) from exc
+    if not math.isfinite(target) or target <= 0.0:
+        raise argparse.ArgumentTypeError(
+            "MOVT dynamic RMS target must be finite and positive or legacy/off/none/0"
+        )
+    return target
 
 
 @dataclass(frozen=True)
@@ -50,6 +72,8 @@ class DwarfConfig:
     hisa_top_m_tokens: int = 64
     dropout: float = 0.1
     scale_embed_init: float = 0.15
+    movt_dynamic_rms_target: float | None = 0.01
+    movt_phase_gain_init_std: float | None = None
 
     def __post_init__(self) -> None:
         if self.embedding_dim <= 0 or self.num_heads <= 0:
@@ -60,6 +84,31 @@ class DwarfConfig:
             raise ValueError("the public DWARF-v2 topology has exactly 10 layers")
         if self.global_mixer not in {"hisa", "fa"}:
             raise ValueError("global_mixer must be 'hisa' or 'fa'")
+        if self.movt_dynamic_rms_target is not None and (
+            not math.isfinite(self.movt_dynamic_rms_target)
+            or self.movt_dynamic_rms_target <= 0.0
+        ):
+            raise ValueError("movt_dynamic_rms_target must be finite and positive, or None")
+        expected_gain_std = (
+            0.001
+            if self.movt_dynamic_rms_target is None
+            else calibrated_movt_phase_gain_std(
+                head_dim=self.embedding_dim // self.num_heads,
+                target_dynamic_rms=self.movt_dynamic_rms_target,
+                gate_logit=0.0,
+            )
+        )
+        if self.movt_phase_gain_init_std is None:
+            object.__setattr__(self, "movt_phase_gain_init_std", expected_gain_std)
+        elif not math.isclose(self.movt_phase_gain_init_std, expected_gain_std, rel_tol=1e-12):
+            raise ValueError(
+                "movt_phase_gain_init_std must match the value derived from "
+                "movt_dynamic_rms_target and head dimension"
+            )
+
+
+def _config_metadata(config: DwarfConfig) -> dict[str, object]:
+    return asdict(config)
 
 
 def _offset_groups() -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -125,6 +174,7 @@ class DSQGBlock(nn.Module):
             seq_len=config.seq_len,
             dropout=config.dropout,
             plane_shift=plane_shift,
+            movt_dynamic_rms_target=config.movt_dynamic_rms_target,
         )
         self.ffn = FFN(config.embedding_dim, config.ffn_dim, config.dropout)
         if self.interference:
@@ -258,7 +308,11 @@ class DwarfForCausalLM(nn.Module):
             if isinstance(module, DSQGAttentionV19):
                 nn.init.normal_(module.phase_base, mean=0.0, std=0.01)
                 module.reset_phase_probes_()
-                nn.init.normal_(module.phase_gain, mean=0.0, std=0.001)
+                nn.init.normal_(
+                    module.phase_gain,
+                    mean=0.0,
+                    std=module.movt_phase_gain_init_std,
+                )
                 nn.init.zeros_(module.phase_gate)
                 nn.init.constant_(module.scale_embed, self.config.scale_embed_init)
 
@@ -314,6 +368,7 @@ def train_reference(args: argparse.Namespace) -> None:
         top_k_chunks=args.top_k_chunks,
         hisa_top_m_tokens=args.hisa_top_m_tokens,
         dropout=args.dropout,
+        movt_dynamic_rms_target=args.movt_dynamic_rms_target,
     )
     dataset = load_packed_dataset(args.dataset, seq_len=config.seq_len)
     if len(dataset) < args.batch_size:
@@ -322,7 +377,16 @@ def train_reference(args: argparse.Namespace) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(json.dumps({"config": asdict(config), "dataset_rows": len(dataset), "device": str(device)}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "config": _config_metadata(config),
+                "dataset_rows": len(dataset),
+                "device": str(device),
+            },
+            sort_keys=True,
+        )
+    )
 
     model.train()
     for step in range(1, args.max_steps + 1):
@@ -345,7 +409,11 @@ def train_reference(args: argparse.Namespace) -> None:
         )
         if step % args.save_every == 0 or step == args.max_steps:
             torch.save(
-                {"model_state_dict": model.state_dict(), "config": asdict(config), "step": step},
+                {
+                    "model_state_dict": model.state_dict(),
+                    "config": _config_metadata(config),
+                    "step": step,
+                },
                 output_dir / f"dwarf_step_{step}.pt",
             )
 
@@ -365,6 +433,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k-chunks", type=int, default=4)
     parser.add_argument("--hisa-top-m-tokens", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--movt-dynamic-rms-target",
+        type=_parse_movt_dynamic_rms_target,
+        default=0.01,
+        help="pre-prior MOVT content-angle RMS target, or legacy/off/none/0 for std=0.001",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--save-every", type=int, default=100)
