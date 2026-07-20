@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="dwarf-logo.png" alt="DWARF logo: a dwarf holding two axes" width="360">
+</p>
+
 # DWARF-v2
 
 DWARF-v2 is a compact research implementation of a causal language-model architecture built from Dynamic Sparse Query-Gather (DSQG) blocks and one L3 global mixer.  It is for reproducing and extending DWARF training runs, not production deployment.
