@@ -12,14 +12,34 @@ The public tree intentionally contains only the runtime source needed to constru
   - **strict-causal V16 HISA** (`--global-mixer hisa`); or
   - **full causal SDPA** (`--global-mixer fa`, the default), the FA@L3 topology used by DWARF-55M-Base.
 
-## Repository layout
+## Trainer options
 
 ```text
-train/train_dwarf.py                         reference training entrypoint
-kernels/dsqg_attention_v20_bf16_se.py       triadic DSQG CUDA/Triton kernel
-kernels/causal_ema_scan.py                   causal EMA scan used by L2 interference
-kernels/hierarchical_sparse_attn_v16_hisa_causal.py  strict-causal HISA L3 mixer
-tokenizers/olmo1_gpt_neox_dolma_v1_5_tokenizer.json  DWARF-55M tokenizer asset
+     Required I/O
+       --dataset PATH — Required local PyTorch .pt packed-token dataset. It must be an int32/int64 tensor shaped [rows, seq_len], or a dict containing one under input_ids, tokens, or data.
+       --output-dir PATH — Required directory for model-only checkpoints, named dwarf_step_<step>.pt.
+     
+     Runtime/topology
+       --device DEVICE — PyTorch device string; default cuda. The trainer rejects a CUDA device if CUDA is unavailable; its comment reserves CPU for small FA smoke tests.                              
+       --global-mixer {hisa,fa} — Default hisa. Chooses the one L3 global block: strict-causal V16 HISA (hisa) or dense full-causal SDPA (fa, the published DWARF-55M-Base topology).                   
+       --vocab-size INT — Default 50282; embedding/output vocabulary size.
+       --embedding-dim INT — Default 512; hidden width. Must divide evenly by --num-heads.
+       --num-heads INT — Default 8; attention heads.
+       --ffn-dim INT — Default 1536; hidden width of each two-layer GELU FFN.
+       --seq-len INT — Default 2048; required packed-row length. Training shifts each row by one, so the model predicts seq_len - 1 targets per row.
+       --num-chunks INT — Default 32; HISA’s sequence chunk count. Relevant only when --global-mixer hisa.
+       --top-k-chunks INT — Default 4; number of causal HISA chunks selected per query. Relevant only with HISA.
+       --hisa-top-m-tokens INT — Default 64; token candidates retained within HISA’s selected chunks. Relevant only with HISA.
+       --dropout FLOAT — Default 0.1; dropout in embeddings, attention-output path, and FFNs.
+
+     Training/optimization
+       --batch-size INT — Default 1; randomly sampled packed rows per update. The dataset must contain at least this many rows.
+       --max-steps INT — Default 1000; number of optimizer updates.
+       --save-every INT — Default 100; checkpoint interval; the final step is always saved even if it is not on the interval.
+       --learning-rate FLOAT — Default 3e-4; AdamW learning rate.
+       --weight-decay FLOAT — Default 0.1; AdamW weight decay.
+       --grad-clip-norm FLOAT — Default 1.0; maximum global gradient norm passed to clip_grad_norm_.
+       --seed INT — Default 42; seed supplied to torch.manual_seed, governing initialization and random row sampling.
 ```
 
 ## Requirements
