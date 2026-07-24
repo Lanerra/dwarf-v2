@@ -44,8 +44,10 @@ except Exception:  # pragma: no cover - exercised by CPU-only installations
 class HISAMetadata:
     """Detached, tile-scoped discrete routing data for V16.
 
-    ``top_chunk_idx`` has ``[B,H,T,K]`` and ``token_idx`` / ``token_scores``
-    have ``[B,H,T,K,M]``.  Invalid entries are ``-1`` / ``-inf``.
+    ``top_chunk_idx`` has ``[B,H,T,K]`` and ``token_idx`` has ``[B,H,T,K,M]``.
+    Canonical externally requested metadata also has score-sorted
+    ``token_scores[B,H,T,K,M]`` with invalid entries ``-inf``. The unobservable
+    ordinary all-token fast path leaves ``token_scores`` empty.
     """
 
     top_chunk_idx: torch.Tensor
@@ -87,13 +89,22 @@ def _as_valid_lengths(
 ) -> torch.Tensor:
     if valid_lengths is None:
         return torch.full((batch_size,), seq_len, dtype=torch.long, device=device)
-    valid_lengths = valid_lengths.to(device=device, dtype=torch.long).reshape(-1)
+    valid_lengths = valid_lengths.to(dtype=torch.long).reshape(-1)
     if valid_lengths.numel() != batch_size:
         raise ValueError(
             f"valid_lengths must have {batch_size} entries, got {valid_lengths.numel()}"
         )
-    if bool((valid_lengths < 0).any()) or bool((valid_lengths > seq_len).any()):
-        raise ValueError(f"valid_lengths must be in [0, {seq_len}]")
+    range_valid = ((valid_lengths >= 0) & (valid_lengths <= seq_len)).all()
+    if valid_lengths.device.type == "cpu":
+        if not bool(range_valid):
+            raise ValueError(f"valid_lengths must be in [0, {seq_len}]")
+        valid_lengths = valid_lengths.to(device=device)
+    else:
+        valid_lengths = valid_lengths.to(device=device)
+        if valid_lengths.device.type == "cuda":
+            torch._assert_async(range_valid.to(device=device), f"valid_lengths must be in [0, {seq_len}]")
+        elif not bool(range_valid.to(device=device)):
+            raise ValueError(f"valid_lengths must be in [0, {seq_len}]")
     return valid_lengths
 
 
@@ -140,11 +151,38 @@ def _completed_chunk_representatives(
             index=top2.unsqueeze(-1).expand(-1, -1, -1, 2, head_dim),
         )
         reps = (1.0 - top2_blend_alpha) * salient[..., 0, :] + top2_blend_alpha * salient[..., 1, :]
-    elif representative_mode != "max_l2" and representative_mode != "top2_blend":
+    if representative_mode not in {"max_l2", "top2_blend"}:
         raise ValueError("representative_mode must be max_l2 or top2_blend")
     chunk_start = torch.arange(num_chunks, device=key.device) * chunk_size
     chunk_valid = chunk_start.reshape(1, num_chunks) < valid_lengths.reshape(batch_size, 1)
     return reps.masked_fill(~chunk_valid[:, None, :, None], 0.0)
+
+
+def _bounded_metadata_tile_block_size(
+    *,
+    batch_size: int,
+    heads: int,
+    seq_len: int,
+    head_dim: int,
+    key_element_size: int,
+    chunk_size: int,
+    top_k_chunks: int,
+    selector_tile_size: int,
+    max_tile_block_size: int,
+    temporary_budget_bytes: int,
+    canonical_token_order: bool,
+) -> int:
+    """Choose the largest exact tile block inside a temporary-memory budget."""
+
+    n_tiles = math.ceil(seq_len / selector_tile_size)
+    block = min(max_tile_block_size, n_tiles)
+    if canonical_token_order:
+        # selected_keys and the eager pointwise q*k product dominate. Keep
+        # conservative room for absolute IDs, validity, scores, and top-k data.
+        candidates_per_tile = batch_size * heads * max(1, top_k_chunks) * chunk_size
+        bytes_per_tile = candidates_per_tile * (2 * head_dim * key_element_size + 16)
+        block = min(block, max(1, temporary_budget_bytes // max(1, bytes_per_tile)))
+    return max(1, block)
 
 
 def _build_causal_tile_metadata_eager(
@@ -158,47 +196,58 @@ def _build_causal_tile_metadata_eager(
     top_m_tokens: int,
     selector_tile_size: int,
     valid_lengths: torch.Tensor,
+    canonical_token_order: bool = True,
 ) -> HISAMetadata:
-    """Build detached V16 metadata without future query/key dependence."""
+    """Build detached V16 metadata without future query/key dependence.
+
+    When every token slot in a selected chunk is retained, ordinary attention
+    only needs the candidate set, not the query-score ordering. Setting
+    ``canonical_token_order=False`` enumerates those token IDs directly and
+    returns an empty ``token_scores`` tensor. External metadata callers retain
+    the full score-sorted canonical path.
+    """
 
     batch_size, heads, seq_len, head_dim = query.shape
     device = query.device
     n_tiles = math.ceil(seq_len / selector_tile_size)
     k_slots = max(1, int(top_k_chunks))
     m_slots = min(max(1, int(top_m_tokens)), chunk_size)
+    enumerate_all = not canonical_token_order and top_m_tokens >= chunk_size
     top_chunks = torch.full((batch_size, heads, n_tiles, k_slots), -1, dtype=torch.long, device=device)
     token_idx = torch.full(
-        (batch_size, heads, n_tiles, k_slots, m_slots),
-        -1,
-        dtype=torch.long,
-        device=device,
+        (batch_size, heads, n_tiles, k_slots, m_slots), -1, dtype=torch.long, device=device
     )
-    token_scores = torch.full(
-        (batch_size, heads, n_tiles, k_slots, m_slots),
-        float("-inf"),
-        dtype=torch.float32,
-        device=device,
+    token_scores = (
+        torch.empty(0, dtype=torch.float32, device=device)
+        if enumerate_all
+        else torch.full(
+            (batch_size, heads, n_tiles, k_slots, m_slots),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
     )
     tile_starts = torch.arange(n_tiles, device=device, dtype=torch.long) * selector_tile_size
     chunk_starts = torch.arange(num_chunks, device=device, dtype=torch.long) * chunk_size
     chunk_ends = chunk_starts + chunk_size
-
     padded_len = num_chunks * chunk_size
-    key_pad = F.pad(key, (0, 0, 0, padded_len - seq_len)) if padded_len > seq_len else key
-    key_chunks = key_pad.reshape(batch_size, heads, num_chunks, chunk_size, head_dim)
+    key_chunks = None
+    if not enumerate_all:
+        key_pad = F.pad(key, (0, 0, 0, padded_len - seq_len)) if padded_len > seq_len else key
+        key_chunks = key_pad.reshape(batch_size, heads, num_chunks, chunk_size, head_dim)
     b_index = torch.arange(batch_size, device=device).reshape(batch_size, 1, 1)
     h_index = torch.arange(heads, device=device).reshape(1, heads, 1)
     within_chunk = torch.arange(chunk_size, device=device).reshape(1, 1, 1, chunk_size)
 
-    # The discrete route/top-M controls are intentionally detached.  The route
-    # scores themselves are gathered later from the differentiable logits.
+    # The discrete route/top-M controls are intentionally detached. The route
+    # scores themselves are gathered later from differentiable logits.
     with torch.no_grad():
         for tile, tile_start_tensor in enumerate(tile_starts):
             tile_start = int(tile_start_tensor.item())
             if tile_start >= seq_len:
                 break
             tile_has_query = tile_start < valid_lengths
-            completed = chunk_ends < (tile_start + 1)  # exclusive end <= tile_start
+            completed = chunk_ends < (tile_start + 1)
             chunk_has_token = chunk_starts.reshape(1, num_chunks) < valid_lengths.reshape(batch_size, 1)
             eligible = completed.reshape(1, 1, num_chunks) & chunk_has_token[:, None, :] & tile_has_query[:, None, None]
             routing_at_start = route_logits[:, :, tile_start, :].detach().masked_fill(~eligible, float("-inf"))
@@ -209,25 +258,28 @@ def _build_causal_tile_metadata_eager(
             top_chunks[:, :, tile, :k_eff] = indices
 
             safe_indices = indices.clamp_min(0)
-            selected_keys = key_chunks[b_index, h_index, safe_indices]
             selected_abs = safe_indices[..., None] * chunk_size + within_chunk
             selected_valid = (
                 valid_selected[..., None]
                 & (selected_abs < valid_lengths.reshape(batch_size, 1, 1, 1))
                 & (selected_abs < tile_start)
             )
-            q0 = query[:, :, tile_start, :].detach().unsqueeze(2).unsqueeze(3)
-            scores = (q0 * selected_keys.detach()).sum(dim=-1) / math.sqrt(head_dim)
-            scores = scores.masked_fill(~selected_valid, float("-inf"))
-            top_values, local_indices = scores.topk(m_slots, dim=-1)
-            absolute = safe_indices[..., None] * chunk_size + local_indices
-            finite = torch.isfinite(top_values) & valid_selected[..., None]
-            token_idx[:, :, tile, :k_eff] = torch.where(finite, absolute, torch.full_like(absolute, -1))
-            token_scores[:, :, tile, :k_eff] = torch.where(
-                finite,
-                top_values.float(),
-                torch.full_like(top_values.float(), float("-inf")),
-            )
+            if enumerate_all:
+                token_idx[:, :, tile, :k_eff] = torch.where(
+                    selected_valid, selected_abs, torch.full_like(selected_abs, -1)
+                )
+            else:
+                selected_keys = key_chunks[b_index, h_index, safe_indices]
+                q0 = query[:, :, tile_start, :].detach().unsqueeze(2).unsqueeze(3)
+                scores = (q0 * selected_keys.detach()).sum(dim=-1) / math.sqrt(head_dim)
+                scores = scores.masked_fill(~selected_valid, float("-inf"))
+                top_values, local_indices = scores.topk(m_slots, dim=-1)
+                absolute = safe_indices[..., None] * chunk_size + local_indices
+                finite = torch.isfinite(top_values) & valid_selected[..., None]
+                token_idx[:, :, tile, :k_eff] = torch.where(finite, absolute, torch.full_like(absolute, -1))
+                token_scores[:, :, tile, :k_eff] = torch.where(
+                    finite, top_values.float(), torch.full_like(top_values.float(), float("-inf"))
+                )
 
     return HISAMetadata(
         top_chunk_idx=top_chunks,
@@ -252,8 +304,14 @@ def _build_causal_tile_metadata_blocked(
     selector_tile_size: int,
     valid_lengths: torch.Tensor,
     tile_block_size: int,
+    canonical_token_order: bool = True,
 ) -> HISAMetadata:
-    """Build exact V16 tile metadata in independent vectorized tile blocks."""
+    """Build exact V16 tile metadata in independent vectorized tile blocks.
+
+    ``canonical_token_order=False`` activates the exact candidate-set fast path
+    when ``top_m_tokens >= chunk_size``. It avoids key gathers, query-to-token
+    scoring, score storage, and sorting while retaining every valid token once.
+    """
     if tile_block_size < 1:
         raise ValueError("tile_block_size must be positive")
     batch_size, heads, seq_len, head_dim = query.shape
@@ -261,19 +319,29 @@ def _build_causal_tile_metadata_blocked(
     n_tiles = math.ceil(seq_len / selector_tile_size)
     k_slots = max(1, int(top_k_chunks))
     m_slots = min(max(1, int(top_m_tokens)), chunk_size)
+    enumerate_all = not canonical_token_order and top_m_tokens >= chunk_size
     top_chunks = torch.full((batch_size, heads, n_tiles, k_slots), -1, dtype=torch.long, device=device)
     token_idx = torch.full(
         (batch_size, heads, n_tiles, k_slots, m_slots), -1, dtype=torch.long, device=device
     )
-    token_scores = torch.full(
-        (batch_size, heads, n_tiles, k_slots, m_slots), float("-inf"), dtype=torch.float32, device=device
+    token_scores = (
+        torch.empty(0, dtype=torch.float32, device=device)
+        if enumerate_all
+        else torch.full(
+            (batch_size, heads, n_tiles, k_slots, m_slots),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
     )
     tile_starts = torch.arange(n_tiles, device=device, dtype=torch.long) * selector_tile_size
     chunk_starts = torch.arange(num_chunks, device=device, dtype=torch.long) * chunk_size
     chunk_ends = chunk_starts + chunk_size
     padded_len = num_chunks * chunk_size
-    key_pad = F.pad(key, (0, 0, 0, padded_len - seq_len)) if padded_len > seq_len else key
-    key_chunks = key_pad.reshape(batch_size, heads, num_chunks, chunk_size, head_dim)
+    key_chunks = None
+    if not enumerate_all:
+        key_pad = F.pad(key, (0, 0, 0, padded_len - seq_len)) if padded_len > seq_len else key
+        key_chunks = key_pad.reshape(batch_size, heads, num_chunks, chunk_size, head_dim)
     b_index = torch.arange(batch_size, device=device).reshape(batch_size, 1, 1, 1)
     h_index = torch.arange(heads, device=device).reshape(1, heads, 1, 1)
     within_chunk = torch.arange(chunk_size, device=device).reshape(1, 1, 1, 1, chunk_size)
@@ -300,25 +368,30 @@ def _build_causal_tile_metadata_blocked(
             top_chunks[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = indices
 
             safe_indices = indices.clamp_min(0)
-            selected_keys = key_chunks[b_index, h_index, safe_indices]
             selected_abs = safe_indices[..., None] * chunk_size + within_chunk
             selected_valid = (
                 valid_selected[..., None]
                 & (selected_abs < valid_lengths.reshape(batch_size, 1, 1, 1, 1))
                 & (selected_abs < starts.reshape(1, 1, block_tiles, 1, 1))
             )
-            q0 = query[:, :, starts, :].detach().unsqueeze(3).unsqueeze(4)
-            scores = (q0 * selected_keys.detach()).sum(dim=-1) / math.sqrt(head_dim)
-            scores = scores.masked_fill(~selected_valid, float("-inf"))
-            top_values, local_indices = scores.topk(m_slots, dim=-1)
-            absolute = safe_indices[..., None] * chunk_size + local_indices
-            finite = torch.isfinite(top_values) & valid_selected[..., None]
-            token_idx[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = torch.where(
-                finite, absolute, torch.full_like(absolute, -1)
-            )
-            token_scores[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = torch.where(
-                finite, top_values.float(), torch.full_like(top_values.float(), float("-inf"))
-            )
+            if enumerate_all:
+                token_idx[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = torch.where(
+                    selected_valid, selected_abs, torch.full_like(selected_abs, -1)
+                )
+            else:
+                selected_keys = key_chunks[b_index, h_index, safe_indices]
+                q0 = query[:, :, starts, :].detach().unsqueeze(3).unsqueeze(4)
+                scores = (q0 * selected_keys.detach()).sum(dim=-1) / math.sqrt(head_dim)
+                scores = scores.masked_fill(~selected_valid, float("-inf"))
+                top_values, local_indices = scores.topk(m_slots, dim=-1)
+                absolute = safe_indices[..., None] * chunk_size + local_indices
+                finite = torch.isfinite(top_values) & valid_selected[..., None]
+                token_idx[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = torch.where(
+                    finite, absolute, torch.full_like(absolute, -1)
+                )
+                token_scores[:, :, tile_begin : tile_begin + block_tiles, :k_eff] = torch.where(
+                    finite, top_values.float(), torch.full_like(top_values.float(), float("-inf"))
+                )
     return HISAMetadata(
         top_chunk_idx=top_chunks,
         token_idx=token_idx,
@@ -328,6 +401,195 @@ def _build_causal_tile_metadata_blocked(
         chunk_size=int(chunk_size),
         selector_tile_size=int(selector_tile_size),
     )
+
+
+@torch.no_grad()
+def _routing_quality_diagnostics(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    route_logits: torch.Tensor,
+    metadata: HISAMetadata,
+    *,
+    top_k_chunks: int,
+    local_window: int,
+    route_prior_scale: float,
+    max_queries_per_batch: int,
+) -> dict[str, torch.Tensor]:
+    """Return exact-on-sampled-row routing metrics without an ``N x N`` tensor."""
+
+    device = query.device
+    batch_size, heads, seq_len, head_dim = query.shape
+    chunk_size = metadata.chunk_size
+    selector_tile = metadata.selector_tile_size
+    num_chunks = route_logits.shape[-1]
+    m_slots = metadata.token_idx.shape[-1]
+    scale = 1.0 / math.sqrt(head_dim)
+    distance_edges = torch.tensor(
+        [local_window, 4 * local_window, 16 * local_window, 64 * local_window],
+        device=device,
+        dtype=torch.long,
+    )
+
+    zeros = lambda: torch.zeros((), device=device, dtype=torch.float32)
+    anchor_chunk_hits, anchor_chunk_targets = zeros(), zeros()
+    row_chunk_hits, row_chunk_targets = zeros(), zeros()
+    candidate_hits, candidate_targets = zeros(), zeros()
+    entropy_sum, normalized_entropy_sum, entropy_count, normalized_entropy_count = (
+        zeros(), zeros(), zeros(), zeros()
+    )
+    representative_misses, representative_comparisons, representative_regret = zeros(), zeros(), zeros()
+    changed_sets, variation_comparisons, variation_overlap_hits, variation_targets = (
+        zeros(), zeros(), zeros(), zeros()
+    )
+    overlap_removed, overlap_total = zeros(), zeros()
+    postfilter_count, postfilter_budget = zeros(), zeros()
+    fully_removed_slots, selected_slots = zeros(), zeros()
+    distance_eligible = torch.zeros(5, device=device, dtype=torch.float32)
+    distance_selected = torch.zeros(5, device=device, dtype=torch.float32)
+    sampled_queries = 0
+
+    def stable_top_ids(scores: torch.Tensor, count: int) -> torch.Tensor:
+        return torch.argsort(scores, dim=-1, descending=True, stable=True)[..., :count]
+
+    def chunk_details(batch: int, q_pos: int, eligible_count: int):
+        chunk_ids = torch.arange(eligible_count, device=device)
+        ids = chunk_ids[:, None] * chunk_size + torch.arange(chunk_size, device=device)[None, :]
+        valid = ids < metadata.valid_lengths[batch]
+        safe_ids = ids.clamp_max(seq_len - 1)
+        selected_keys = key[batch, :, safe_ids, :]
+        token_scores = torch.einsum("hd,hckd->hck", query[batch, :, q_pos], selected_keys) * scale
+        token_scores = token_scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+        return token_scores, ids, valid
+
+    for batch in range(batch_size):
+        valid_len = int(metadata.valid_lengths[batch].item())
+        last_tile = (valid_len - 1) // selector_tile if valid_len > 0 else -1
+        eligible_tiles = [
+            tile for tile in range(last_tile + 1)
+            if min(num_chunks, (tile * selector_tile) // chunk_size) > 0
+        ]
+        if not eligible_tiles:
+            continue
+        tile_budget = min(len(eligible_tiles), max(1, math.ceil(max_queries_per_batch / 2)))
+        tile_indices = (
+            torch.linspace(0, len(eligible_tiles) - 1, steps=tile_budget).round().long().tolist()
+        )
+        sampled_positions: list[tuple[int, int, int]] = []
+        for tile_index in tile_indices:
+            tile = eligible_tiles[tile_index]
+            tile_start = tile * selector_tile
+            tile_end = min(valid_len - 1, tile_start + selector_tile - 1)
+            sampled_positions.append((tile, tile_start, tile_start))
+            if tile_end != tile_start and len(sampled_positions) < max_queries_per_batch:
+                sampled_positions.append((tile, tile_start, tile_end))
+            if len(sampled_positions) >= max_queries_per_batch:
+                break
+
+        anchor_ideals: dict[int, torch.Tensor] = {}
+        for tile, tile_start, q_pos in sampled_positions[:max_queries_per_batch]:
+            eligible_count = min(num_chunks, tile_start // chunk_size)
+            k_eff = min(max(1, int(top_k_chunks)), eligible_count)
+            token_scores, eligible_ids, eligible_valid = chunk_details(batch, q_pos, eligible_count)
+            chunk_scores = token_scores.max(dim=-1).values
+            ideal_chunks = stable_top_ids(chunk_scores, k_eff)
+            selected_chunks = metadata.top_chunk_idx[batch, :, tile]
+            selected_match = (ideal_chunks.unsqueeze(-1) == selected_chunks.unsqueeze(-2)).any(dim=-1)
+            row_chunk_hits += selected_match.sum()
+            row_chunk_targets += heads * k_eff
+            sampled_queries += 1
+
+            if tile not in anchor_ideals:
+                anchor_scores, _, _ = chunk_details(batch, tile_start, eligible_count)
+                anchor_ideal = stable_top_ids(anchor_scores.max(dim=-1).values, k_eff)
+                anchor_ideals[tile] = anchor_ideal
+                anchor_match = (
+                    anchor_ideal.unsqueeze(-1) == selected_chunks.unsqueeze(-2)
+                ).any(dim=-1)
+                anchor_chunk_hits += anchor_match.sum()
+                anchor_chunk_targets += heads * k_eff
+
+                logits = route_logits[batch, :, tile_start, :eligible_count].float()
+                probabilities = torch.softmax(logits, dim=-1)
+                entropy = -(probabilities * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
+                entropy_sum += entropy.sum()
+                if eligible_count > 1:
+                    normalized_entropy_sum += (entropy / math.log(eligible_count)).sum()
+                    normalized_entropy_count += heads
+                entropy_count += heads
+
+            anchor_ideal = anchor_ideals[tile]
+            overlap = (ideal_chunks.unsqueeze(-1) == anchor_ideal.unsqueeze(-2)).any(dim=-1).sum(dim=-1)
+            changed_sets += (overlap < k_eff).sum()
+            variation_overlap_hits += overlap.sum()
+            variation_targets += heads * k_eff
+            variation_comparisons += heads
+
+            key_energy = key[batch, :, eligible_ids.clamp_max(seq_len - 1)].float().square().sum(dim=-1)
+            key_energy = key_energy.masked_fill(~eligible_valid.unsqueeze(0), float("-inf"))
+            representative_token = key_energy.argmax(dim=-1)
+            exact_token = token_scores.argmax(dim=-1)
+            representative_score = token_scores.gather(-1, representative_token.unsqueeze(-1)).squeeze(-1)
+            exact_score = token_scores.gather(-1, exact_token.unsqueeze(-1)).squeeze(-1)
+            representative_misses += (representative_token != exact_token).sum()
+            representative_regret += (exact_score - representative_score).sum()
+            representative_comparisons += heads * eligible_count
+
+            candidate_ids = metadata.token_idx[batch, :, tile].reshape(heads, -1)
+            prefilter_valid = (candidate_ids >= 0) & (candidate_ids < q_pos)
+            removed = prefilter_valid & (candidate_ids >= q_pos - local_window)
+            kept = prefilter_valid & ~removed
+            overlap_removed += removed.sum()
+            overlap_total += prefilter_valid.sum()
+            postfilter_count += kept.sum()
+
+            slot_ids = metadata.token_idx[batch, :, tile]
+            slot_valid = (slot_ids >= 0) & (slot_ids < q_pos)
+            slot_removed = slot_valid & (slot_ids >= q_pos - local_window)
+            has_slot_tokens = slot_valid.any(dim=-1)
+            fully_removed_slots += (has_slot_tokens & (slot_removed == slot_valid).all(dim=-1)).sum()
+            selected_slots += has_slot_tokens.sum()
+
+            flat_ids = eligible_ids[eligible_valid]
+            global_eligible = flat_ids[flat_ids < q_pos - local_window]
+            j_eff = min(k_eff * m_slots, global_eligible.numel())
+            postfilter_budget += heads * j_eff
+            if j_eff > 0:
+                token_chunks = torch.div(global_eligible, chunk_size, rounding_mode="floor")
+                content_scores = torch.einsum(
+                    "hd,hnd->hn", query[batch, :, q_pos], key[batch, :, global_eligible]
+                ) * scale
+                prior = route_logits[batch, :, q_pos, token_chunks].float() * route_prior_scale
+                oracle_ids = global_eligible[stable_top_ids(content_scores.float() + prior, j_eff)]
+                candidate_hits += (
+                    (oracle_ids.unsqueeze(-1) == candidate_ids.unsqueeze(-2))
+                    & kept.unsqueeze(-2)
+                ).any(dim=-1).sum()
+                candidate_targets += heads * j_eff
+
+                eligible_distances = q_pos - global_eligible
+                eligible_bins = torch.bucketize(eligible_distances, distance_edges)
+                distance_eligible += heads * torch.bincount(eligible_bins, minlength=5).float()
+                selected_distances = q_pos - candidate_ids[kept]
+                if selected_distances.numel() > 0:
+                    selected_bins = torch.bucketize(selected_distances, distance_edges)
+                    distance_selected += torch.bincount(selected_bins, minlength=5).float()
+
+    return {
+        "sampled_queries": torch.tensor(sampled_queries, device=device),
+        "anchor_selected_chunk_recall": anchor_chunk_hits / anchor_chunk_targets.clamp_min(1),
+        "row_selected_chunk_recall": row_chunk_hits / row_chunk_targets.clamp_min(1),
+        "final_candidate_recall": candidate_hits / candidate_targets.clamp_min(1),
+        "candidate_distance_coverage": distance_selected / distance_eligible.clamp_min(1),
+        "routing_entropy": entropy_sum / entropy_count.clamp_min(1),
+        "normalized_routing_entropy": normalized_entropy_sum / normalized_entropy_count.clamp_min(1),
+        "max_l2_representative_miss_rate": representative_misses / representative_comparisons.clamp_min(1),
+        "mean_representative_regret": representative_regret / representative_comparisons.clamp_min(1),
+        "tile_ideal_chunk_change_rate": changed_sets / variation_comparisons.clamp_min(1),
+        "tile_ideal_chunk_distance": 1.0 - variation_overlap_hits / variation_targets.clamp_min(1),
+        "local_overlap_removal_rate": overlap_removed / overlap_total.clamp_min(1),
+        "postfilter_budget_rate": postfilter_count / postfilter_budget.clamp_min(1),
+        "fully_removed_chunk_slot_rate": fully_removed_slots / selected_slots.clamp_min(1),
+    }
 
 
 def _eager_v16_attention_scalar(
@@ -952,6 +1214,9 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         temperature: float = 1.0,
         route_prior_scale: float = 1.0,
         backend: str | None = None,
+        token_selection_mode: str | None = None,
+        collect_routing_diagnostics: bool | None = None,
+        diagnostic_max_queries: int | None = None,
     ) -> None:
         super().__init__()
         if D != H * hd:
@@ -981,12 +1246,38 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.backward_impl = os.getenv("DWARF_HISA_V16_BWD", "atomic_masked").strip().lower()
         if self.backward_impl not in {"atomic", "atomic_masked"}:
             raise ValueError("DWARF_HISA_V16_BWD must be atomic or atomic_masked")
-        self.metadata_builder = os.getenv("DWARF_HISA_V16_METADATA_BUILDER", "eager").strip().lower()
+        self.metadata_builder = os.getenv("DWARF_HISA_V16_METADATA_BUILDER", "blocked").strip().lower()
         if self.metadata_builder not in {"blocked", "eager"}:
             raise ValueError("DWARF_HISA_V16_METADATA_BUILDER must be blocked or eager")
-        self.metadata_tile_block_size = int(os.getenv("DWARF_HISA_V16_METADATA_TILE_BLOCK", "8"))
+        # Fully vectorizes every tested N<=8192 case while bounding the tile
+        # dimension of canonical token-search intermediates at longer lengths.
+        # The exact eager builder remains available as the correctness oracle.
+        self.metadata_tile_block_size = int(os.getenv("DWARF_HISA_V16_METADATA_TILE_BLOCK", "512"))
         if self.metadata_tile_block_size < 1:
             raise ValueError("DWARF_HISA_V16_METADATA_TILE_BLOCK must be positive")
+        self.metadata_temporary_budget_bytes = int(
+            float(os.getenv("DWARF_HISA_V16_METADATA_TEMP_MIB", "256")) * (2**20)
+        )
+        if self.metadata_temporary_budget_bytes < 1:
+            raise ValueError("DWARF_HISA_V16_METADATA_TEMP_MIB must be positive")
+        self.token_selection_mode = (
+            token_selection_mode or os.getenv("DWARF_HISA_V16_TOKEN_SELECTION", "auto")
+        ).strip().lower()
+        if self.token_selection_mode not in {"auto", "canonical"}:
+            raise ValueError("token_selection_mode must be auto or canonical")
+        # Resolve opt-in feature flags once. Ordinary forwards do not parse the
+        # environment or accidentally switch metadata semantics mid-run.
+        self.evidence_aux_enabled = os.getenv("DWARF_HISA_EVIDENCE_AUX", "0") == "1"
+        if collect_routing_diagnostics is None:
+            collect_routing_diagnostics = os.getenv("DWARF_HISA_V16_ROUTING_DIAGNOSTICS", "0") == "1"
+        self.collect_routing_diagnostics = bool(collect_routing_diagnostics)
+        self.diagnostic_max_queries = int(
+            diagnostic_max_queries
+            if diagnostic_max_queries is not None
+            else os.getenv("DWARF_HISA_V16_DIAGNOSTIC_MAX_QUERIES", "8")
+        )
+        if self.diagnostic_max_queries < 1:
+            raise ValueError("diagnostic_max_queries must be positive")
         self.representative_mode = os.getenv("DWARF_HISA_V16_REP_MODE", "max_l2").strip().lower()
         if self.representative_mode not in {"max_l2", "top2_blend"}:
             raise ValueError("DWARF_HISA_V16_REP_MODE must be max_l2 or top2_blend")
@@ -998,6 +1289,10 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.W_v = nn.Linear(D, H * hd, bias=False)
         self.W_o = nn.Linear(H * hd, D, bias=False)
         self._routing_entropy: torch.Tensor | float = float("nan")
+        self._routing_diagnostics: dict[str, torch.Tensor] = {}
+        self._last_metadata_builder = ""
+        self._last_metadata_tile_block_size = 0
+        self._last_token_selection_path = ""
         # Intentionally not a buffer/state-dict entry: this is a one-forward
         # training side channel and must never surface in ordinary inference.
         self.hisa_evidence_capture: HISASelectionCapture | None = None
@@ -1042,22 +1337,68 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             selector_tile_size=self.selector_tile_size,
             valid_lengths=valid_lengths,
         )
+        # Attention does not consume token scores or token ordering. Preserve
+        # canonical score-sorted metadata only at observable interfaces (or for
+        # the evidence auxiliary); ordinary all-token forwards enumerate IDs.
+        canonical_token_order = (
+            self.token_selection_mode == "canonical"
+            or return_metadata
+            or self.evidence_aux_enabled
+        )
+        metadata_kwargs["canonical_token_order"] = canonical_token_order
         if self.metadata_builder == "blocked":
-            metadata = _build_causal_tile_metadata_blocked(
-                query, key, route_logits, tile_block_size=self.metadata_tile_block_size, **metadata_kwargs
+            tile_block_size = _bounded_metadata_tile_block_size(
+                batch_size=batch_size,
+                heads=self.H,
+                seq_len=seq_len,
+                head_dim=self.hd,
+                key_element_size=key.element_size(),
+                chunk_size=chunk_size,
+                top_k_chunks=self.top_k_chunks,
+                selector_tile_size=self.selector_tile_size,
+                max_tile_block_size=self.metadata_tile_block_size,
+                temporary_budget_bytes=self.metadata_temporary_budget_bytes,
+                canonical_token_order=(
+                    canonical_token_order or self.hisa_top_m_tokens < chunk_size
+                ),
             )
+            metadata = _build_causal_tile_metadata_blocked(
+                query, key, route_logits, tile_block_size=tile_block_size, **metadata_kwargs
+            )
+            self._last_metadata_tile_block_size = tile_block_size
         else:
             metadata = _build_causal_tile_metadata_eager(query, key, route_logits, **metadata_kwargs)
-        if self.training and os.getenv("DWARF_HISA_EVIDENCE_AUX", "0") == "1":
+            self._last_metadata_tile_block_size = 1
+        self._last_metadata_builder = self.metadata_builder
+        self._last_token_selection_path = (
+            "enumerate_all"
+            if not canonical_token_order and self.hisa_top_m_tokens >= chunk_size
+            else "canonical_topk"
+        )
+        if self.training and self.evidence_aux_enabled:
             self.hisa_evidence_capture = HISASelectionCapture(
                 route_logits=route_logits,
                 metadata=metadata,
             )
         with torch.no_grad():
             tile_scores = route_logits[:, :, metadata.tile_starts.clamp_max(seq_len - 1), :]
-            self._routing_entropy = torch.softmax(tile_scores.float(), dim=-1).mul(
-                torch.log_softmax(tile_scores.float(), dim=-1)
-            ).sum(dim=-1).neg().mean().detach()
+            route_prob = torch.softmax(tile_scores.float(), dim=-1)
+            self._routing_entropy = -(
+                route_prob * route_prob.clamp_min(1e-9).log()
+            ).sum(dim=-1).mean().detach()
+        if self.collect_routing_diagnostics:
+            self._routing_diagnostics = _routing_quality_diagnostics(
+                query,
+                key,
+                route_logits,
+                metadata,
+                top_k_chunks=self.top_k_chunks,
+                local_window=self.local_window,
+                route_prior_scale=self.route_prior_scale,
+                max_queries_per_batch=self.diagnostic_max_queries,
+            )
+        else:
+            self._routing_diagnostics = {}
         use_triton = self.backend == "triton" or (self.backend == "auto" and x.is_cuda)
         if use_triton and x.is_cuda and _TRITON_AVAILABLE:
             attended = _V16HISATritonFn.apply(
