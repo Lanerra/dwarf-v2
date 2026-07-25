@@ -54,7 +54,7 @@ venv/
 !dwarf-logo.png
 *.json
 !tokenizers/
-!tokenizers/*_tokenizer.json
+!tokenizers/dwarf_bpe_v32768_tokenizer.json
 
 # Rust build products for local analytical tooling
 tools/**/target/
