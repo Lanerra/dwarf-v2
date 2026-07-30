@@ -1469,6 +1469,15 @@ def _bwd_dq_v18_grouped(
                     dse_i, mask=dm, sem="relaxed",
                 )
 
+    # Store the direct softmax-score gradient into Q.  Without this store the
+    # caller's zero-initialized dQ buffer is returned unchanged on baseline.
+    tl.store(
+        DQ + b * stride_dqb + h * stride_dqh
+        + ns[:, None] * stride_dqn + ds[None, :] * stride_dqd,
+        dq.to(tl.bfloat16),
+        mask=nm[:, None] & dm[None, :],
+    )
+
     # Store dy_pre
     dyb = DY_PRE + b * stride_dyb + h * stride_dyh
     tl.store(dyb + ns * stride_dyn + 0, tl.where(nm, dy_pre_0, 0.0), mask=nm)

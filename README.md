@@ -45,7 +45,7 @@ Use the tokenizer tracked at:
 tokenizers/dwarf_bpe_v32768_tokenizer.json
 ```
 
-The tokenizer has 32,768 contiguous token IDs. Dataset construction remains separate so users can choose their own corpus and packing policy.
+The tokenizer has 32,768 contiguous token IDs and reserves 57 atomic control markers at IDs 0-56, including BOS/EOS/PAD/UNK/EOD, ChatML roles, reasoning sections, tool calls, FIM/repository boundaries, and optional image/video markers. Dataset construction remains separate so users can choose their own corpus and packing policy.
 
 ## Train
 
@@ -54,6 +54,7 @@ The standard model is D=512, H=8, L=10, FFN=1536, sequence length 2048, and voca
 ```bash
 python train/train_dwarf.py \
   --dataset /absolute/path/to/packed_tokens.pt \
+  --tokenizer tokenizers/dwarf_bpe_v32768_tokenizer.json \
   --output-dir runs/dwarf-smoke \
   --stop-after 1
 ```
@@ -63,11 +64,26 @@ Run the full default recipe by omitting `--stop-after`. Select the 400M recipe e
 ```bash
 python train/train_dwarf.py \
   --dataset /absolute/path/to/packed_tokens.pt \
+  --tokenizer tokenizers/dwarf_bpe_v32768_tokenizer.json \
   --output-dir runs/dwarf-eb210 \
   --resume runs/dwarf-eb210/dwarf_step_0000582.pt
 ```
 
 EB210 saves at 25%, 50%, 75%, and final; EB84 saves the final checkpoint. `--save-every N` adds an interval, and bounded runs always save their stopping step. Checkpoints are atomically replaced and contain model, optimizer, recipe/configuration, RNG, and dataset-identity state required for resume.
+
+For a full 2,048-token clean-anchor phase using BS=20 and GA=24, select
+`--recipe eb480-anchor4b`. This recipe runs 4,070 optimizer updates
+(4,000,972,800 input positions), uses the conservative `3.0e-4` learning rate
+with a 5%/80%/15% WSD schedule, and saves resumable 25%/50%/75%/final
+milestones. It requires at least 1,953,600 packed rows.
+
+For a replay-aware 2,048-token capability continuation with the same geometry,
+select `--recipe eb480-capability4b` and provide the sealed parent with
+`--init-checkpoint`. Model-only initialization strict-loads the architecture and
+weights while deliberately resetting optimizer, RNG, data order, and step state.
+The continuation recipe uses a `1.0e-4` peak learning rate, a 2.5% warmup, and
+the same 4,070-update horizon and resumable milestones. Use `--resume` instead
+only to continue an interrupted run on the exact same recipe and dataset.
 
 ## Scope and limitations
 

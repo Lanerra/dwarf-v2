@@ -198,6 +198,23 @@ def source_manifest() -> dict[str, str]:
     return {name: _sha256(path) for name, path in locations.items()}
 
 
+def assert_public_kernel_contracts() -> None:
+    source = (KERNEL_DIR / "dsqg_attention_v22.py").read_text()
+    start = source.index("def _bwd_dq_v18_grouped(")
+    end = source.index("def _bwd_dq_v18_overlap_slab(", start)
+    active_baseline = source[start:end]
+    query_store = active_baseline.find(
+        "tl.store(\n"
+        "        DQ + b * stride_dqb + h * stride_dqh\n"
+        "        + ns[:, None] * stride_dqn + ds[None, :] * stride_dqd,"
+    )
+    phase_store = active_baseline.index("# Store dy_pre")
+    if not 0 <= query_store < phase_store:
+        raise AssertionError(
+            "active grouped-baseline DSQG backward must store its accumulated dQ"
+        )
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dimension: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -1193,12 +1210,20 @@ def train(args: argparse.Namespace) -> None:
 
 
 def self_test() -> None:
+    assert_public_kernel_contracts()
     model = DwarfForCausalLM()
     metadata = model_metadata(model)
     assert metadata["parameters"] == EXPECTED_PARAMETERS
     assert metadata["trainable_parameters"] == EXPECTED_TRAINABLE_PARAMETERS
     assert len(model.blocks) == 10
     assert isinstance(model.blocks[3], GlobalMixerBlock)
+    global_mixer = model.blocks[3]
+    assert not global_mixer.attn.collect_routing_diagnostics
+    assert global_mixer.attn.route_aux_weight == 0.01
+    assert global_mixer.attn.exploration_probability == 0.05
+    assert global_mixer.attn.global_adapter_rank == 16
+    assert global_mixer.attn.global_k_down is not None
+    assert isinstance(global_mixer.packet, InterferencePacket)
     assert sum(isinstance(block, DSQGBlock) for block in model.blocks) == 9
     print(json.dumps({"status": "PASS", **metadata}, sort_keys=True))
 
