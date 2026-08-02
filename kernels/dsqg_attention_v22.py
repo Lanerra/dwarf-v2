@@ -760,12 +760,12 @@ def _fwd_v22_online(
         virtual = tl.load(
             SE + logical_index * stride_sei + dims * stride_sed,
             mask=dmask, other=0.0,
-        ).to(tl.bfloat16).to(tl.float32)
+        ).to(tl.float32)
         score = tl.sum(query * (key + virtual[None, :]), axis=1) * scale
         score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
         score = tl.where(valid, score, float('-inf'))
         merged_max = tl.maximum(running_max, score)
-        has_old = running_sum > 0.0
+        has_old = running_max > float('-inf')
         has_new = valid
         safe_max = tl.where(has_old | has_new, merged_max, 0.0)
         old_scale = tl.where(has_old, tl.exp2((running_max - safe_max) * _LOG2E), 0.0)
@@ -793,12 +793,12 @@ def _fwd_v22_online(
                 virtual = tl.load(
                     SE + logical_index * stride_sei + dims * stride_sed,
                     mask=dmask, other=0.0,
-                ).to(tl.bfloat16).to(tl.float32)
+                ).to(tl.float32)
                 score = tl.sum(query * (key + virtual[None, :]), axis=1) * scale
                 score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
                 score = tl.where(valid, score, float('-inf'))
                 merged_max = tl.maximum(running_max, score)
-                has_old = running_sum > 0.0
+                has_old = running_max > float('-inf')
                 has_new = valid
                 safe_max = tl.where(has_old | has_new, merged_max, 0.0)
                 old_scale = tl.where(has_old, tl.exp2((running_max - safe_max) * _LOG2E), 0.0)
@@ -852,7 +852,7 @@ def _fwd_v22_online(
     tl.store(
         OUT + batch * stride_ob + head * stride_oh
         + positions[:, None] * stride_on + dims[None, :] * stride_od,
-        output.to(tl.bfloat16), mask=qmask[:, None] & dmask[None, :],
+        output, mask=qmask[:, None] & dmask[None, :],
     )
     tl.store(
         LSE + batch * stride_lb + head * stride_lh + positions * stride_ln,
@@ -1370,7 +1370,7 @@ def _bwd_dq_v18_grouped(
                      mask=val[:, None] & dm[None, :], other=0.0).to(tl.float32)
 
         se_i_vec = tl.load(SE + i * stride_sei + ds * stride_sed,
-                           mask=dm, other=0.0).to(tl.bfloat16).to(tl.float32)
+                           mask=dm, other=0.0).to(tl.float32)
         if FOLD_SE:
             s = tl.sum(q * (kt + se_i_vec[None, :]), axis=1) * sc
         else:
@@ -1411,7 +1411,7 @@ def _bwd_dq_v18_grouped(
                 se_i_vec = tl.load(
                     SE + i * stride_sei + ds * stride_sed,
                     mask=dm, other=0.0,
-                ).to(tl.bfloat16).to(tl.float32)
+                ).to(tl.float32)
                 if FOLD_SE:
                     s = tl.sum(q * (kt + se_i_vec[None, :]), axis=1) * sc
                 else:
@@ -1815,7 +1815,7 @@ def _bwd_dkdv_v18_grouped(
                      mask=val, other=0.0).to(tl.float32)
 
         se_i = tl.load(SE + i * stride_sei + ds * stride_sed,
-                       mask=dm, other=0.0).to(tl.bfloat16).to(tl.float32)
+                       mask=dm, other=0.0).to(tl.float32)
         if FOLD_SE:
             s = tl.sum(qn * (kt + se_i[None, :]), axis=1) * sc
         else:
@@ -1851,7 +1851,7 @@ def _bwd_dkdv_v18_grouped(
                              mask=val, other=0.0).to(tl.float32)
 
                 se_i = tl.load(SE + i * stride_sei + ds * stride_sed,
-                                mask=dm, other=0.0).to(tl.bfloat16).to(tl.float32)
+                                mask=dm, other=0.0).to(tl.float32)
                 if FOLD_SE:
                     s = tl.sum(qn * (kt + se_i[None, :]), axis=1) * sc
                 else:
@@ -2273,7 +2273,9 @@ class _DSQGV18GroupedFn(torch.autograd.Function):
 
         # Rows before the minimum offset have no legal source. Keep them exact
         # zero and avoid launching query-owned kernels over that prefix.
-        out = torch.zeros_like(q)
+        # Keep the pre-publication FP32 output so backward can form the exact
+        # softmax delta from O before the public BF16 cast.
+        out = torch.zeros((B, H, N, HD), device=q.device, dtype=torch.float32)
         lse = torch.full((B, H, N), float("-inf"), device=q.device, dtype=torch.float32)
         query_grid = (B * H, triton.cdiv(max(0, N - query_start), BLOCK_N))
 
@@ -2681,9 +2683,9 @@ def _eager_dsqg_attention(
                 query_phase=y_pre.float(),
                 key_phase=selected_z.float(),
                 plane_shift=plane_shift,
-            ).to(selected_value.dtype)
+            )
         score_columns.append(score)
-        value_columns.append(selected_value)
+        value_columns.append(selected_value.float())
         valid_columns.append(valid)
 
     scores = torch.stack(score_columns, dim=-1)
@@ -2694,7 +2696,7 @@ def _eager_dsqg_attention(
     probabilities = torch.softmax(safe_scores, dim=-1)
     probabilities = torch.where(valid_mask, probabilities, torch.zeros_like(probabilities))
     probabilities = probabilities / probabilities.sum(-1, keepdim=True).clamp_min(1.0)
-    return (probabilities.to(values.dtype).unsqueeze(-1) * values).sum(-2).to(q.dtype)
+    return (probabilities.unsqueeze(-1) * values).sum(-2).to(q.dtype)
 
 
 def dsqg_attention_v18_grouped(
@@ -2783,7 +2785,7 @@ def dsqg_attention_v18_grouped(
         int(query_start),
         bool(online_softmax),
     )
-    return output if original_dtype == torch.bfloat16 else output.to(original_dtype)
+    return output.to(original_dtype)
 
 
 # ===========================================================================
