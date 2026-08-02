@@ -2600,6 +2600,11 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
     ):
         self.hisa_evidence_capture = None
         self._routing_auxiliary_loss = None
+        if self.backend == "triton" and not x.is_cuda:
+            raise RuntimeError(
+                "HISA backend='triton' requires CUDA; use backend='eager' "
+                "explicitly for the CPU reference path"
+            )
         batch_size, seq_len, _ = x.shape
         lengths = _as_valid_lengths(
             valid_lengths
