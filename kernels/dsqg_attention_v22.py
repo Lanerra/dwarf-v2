@@ -1478,14 +1478,15 @@ def _bwd_dq_v18_grouped(
         mask=nm[:, None] & dm[None, :],
     )
 
-    # Store dy_pre
-    dyb = DY_PRE + b * stride_dyb + h * stride_dyh
-    tl.store(dyb + ns * stride_dyn + 0, tl.where(nm, dy_pre_0, 0.0), mask=nm)
-    tl.store(dyb + ns * stride_dyn + 1, tl.where(nm, dy_pre_1, 0.0), mask=nm)
-    if R_PLANES_VAL >= 3:
-        tl.store(dyb + ns * stride_dyn + 2, tl.where(nm, dy_pre_2, 0.0), mask=nm)
-    if R_PLANES_VAL >= 4:
-        tl.store(dyb + ns * stride_dyn + 3, tl.where(nm, dy_pre_3, 0.0), mask=nm)
+    if J_LARGE_VAL > 0:
+        # No-MOVT uses scalar dummy phase buffers; never address them by token.
+        dyb = DY_PRE + b * stride_dyb + h * stride_dyh
+        tl.store(dyb + ns * stride_dyn + 0, tl.where(nm, dy_pre_0, 0.0), mask=nm)
+        tl.store(dyb + ns * stride_dyn + 1, tl.where(nm, dy_pre_1, 0.0), mask=nm)
+        if R_PLANES_VAL >= 3:
+            tl.store(dyb + ns * stride_dyn + 2, tl.where(nm, dy_pre_2, 0.0), mask=nm)
+        if R_PLANES_VAL >= 4:
+            tl.store(dyb + ns * stride_dyn + 3, tl.where(nm, dy_pre_3, 0.0), mask=nm)
 
 
 @triton.jit
@@ -1717,14 +1718,15 @@ def _bwd_dq_v18_overlap_slab(
     tl.atomic_add(DSE + js[:, None] * stride_sei + ds[None, :] * stride_sed,
                   dse_all, mask=(js[:, None] < J_VAL) & dm[None, :], sem="relaxed")
 
-    # Store dy_pre
-    dyb = DY_PRE + b * stride_dyb + h * stride_dyh
-    tl.store(dyb + ns * stride_dyn + 0, tl.where(nm, dy_pre_0, 0.0), mask=nm)
-    tl.store(dyb + ns * stride_dyn + 1, tl.where(nm, dy_pre_1, 0.0), mask=nm)
-    if R_PLANES_VAL >= 3:
-        tl.store(dyb + ns * stride_dyn + 2, tl.where(nm, dy_pre_2, 0.0), mask=nm)
-    if R_PLANES_VAL >= 4:
-        tl.store(dyb + ns * stride_dyn + 3, tl.where(nm, dy_pre_3, 0.0), mask=nm)
+    if NUM_GROUPS > 0:
+        # No-MOVT uses scalar dummy phase buffers; never address them by token.
+        dyb = DY_PRE + b * stride_dyb + h * stride_dyh
+        tl.store(dyb + ns * stride_dyn + 0, tl.where(nm, dy_pre_0, 0.0), mask=nm)
+        tl.store(dyb + ns * stride_dyn + 1, tl.where(nm, dy_pre_1, 0.0), mask=nm)
+        if R_PLANES_VAL >= 3:
+            tl.store(dyb + ns * stride_dyn + 2, tl.where(nm, dy_pre_2, 0.0), mask=nm)
+        if R_PLANES_VAL >= 4:
+            tl.store(dyb + ns * stride_dyn + 3, tl.where(nm, dy_pre_3, 0.0), mask=nm)
 
 
 # ===========================================================================
@@ -1930,13 +1932,15 @@ def _bwd_dkdv_v18_grouped(
                       + ms[:, None] * stride_dvn + ds[None, :] * stride_dvd,
                       dv, mask=mm[:, None] & dm[None, :], sem="relaxed")
 
-        dzb = DZ_PRE + b * stride_dzb + h_kv * stride_dzh
-        tl.atomic_add(dzb + ms * stride_dzn + 0, tl.where(mm, dz_pre_0, 0.0), mask=mm, sem="relaxed")
-        tl.atomic_add(dzb + ms * stride_dzn + 1, tl.where(mm, dz_pre_1, 0.0), mask=mm, sem="relaxed")
-        if R_PLANES_VAL >= 3:
-            tl.atomic_add(dzb + ms * stride_dzn + 2, tl.where(mm, dz_pre_2, 0.0), mask=mm, sem="relaxed")
-        if R_PLANES_VAL >= 4:
-            tl.atomic_add(dzb + ms * stride_dzn + 3, tl.where(mm, dz_pre_3, 0.0), mask=mm, sem="relaxed")
+        if J_LARGE_VAL > 0:
+            # No-MOVT uses scalar dummy phase buffers; never address them by token.
+            dzb = DZ_PRE + b * stride_dzb + h_kv * stride_dzh
+            tl.atomic_add(dzb + ms * stride_dzn + 0, tl.where(mm, dz_pre_0, 0.0), mask=mm, sem="relaxed")
+            tl.atomic_add(dzb + ms * stride_dzn + 1, tl.where(mm, dz_pre_1, 0.0), mask=mm, sem="relaxed")
+            if R_PLANES_VAL >= 3:
+                tl.atomic_add(dzb + ms * stride_dzn + 2, tl.where(mm, dz_pre_2, 0.0), mask=mm, sem="relaxed")
+            if R_PLANES_VAL >= 4:
+                tl.atomic_add(dzb + ms * stride_dzn + 3, tl.where(mm, dz_pre_3, 0.0), mask=mm, sem="relaxed")
     else:
         tl.store(DK + b * stride_dkb + h * stride_dkh
                  + ms[:, None] * stride_dkn + ds[None, :] * stride_dkd,
@@ -1945,13 +1949,15 @@ def _bwd_dkdv_v18_grouped(
                  + ms[:, None] * stride_dvn + ds[None, :] * stride_dvd,
                  dv.to(tl.bfloat16), mask=mm[:, None] & dm[None, :])
 
-        dzb = DZ_PRE + b * stride_dzb + h * stride_dzh
-        tl.store(dzb + ms * stride_dzn + 0, tl.where(mm, dz_pre_0, 0.0), mask=mm)
-        tl.store(dzb + ms * stride_dzn + 1, tl.where(mm, dz_pre_1, 0.0), mask=mm)
-        if R_PLANES_VAL >= 3:
-            tl.store(dzb + ms * stride_dzn + 2, tl.where(mm, dz_pre_2, 0.0), mask=mm)
-        if R_PLANES_VAL >= 4:
-            tl.store(dzb + ms * stride_dzn + 3, tl.where(mm, dz_pre_3, 0.0), mask=mm)
+        if J_LARGE_VAL > 0:
+            # No-MOVT uses scalar dummy phase buffers; never address them by token.
+            dzb = DZ_PRE + b * stride_dzb + h * stride_dzh
+            tl.store(dzb + ms * stride_dzn + 0, tl.where(mm, dz_pre_0, 0.0), mask=mm)
+            tl.store(dzb + ms * stride_dzn + 1, tl.where(mm, dz_pre_1, 0.0), mask=mm)
+            if R_PLANES_VAL >= 3:
+                tl.store(dzb + ms * stride_dzn + 2, tl.where(mm, dz_pre_2, 0.0), mask=mm)
+            if R_PLANES_VAL >= 4:
+                tl.store(dzb + ms * stride_dzn + 3, tl.where(mm, dz_pre_3, 0.0), mask=mm)
 
 
 @triton.jit
@@ -2178,13 +2184,15 @@ def _bwd_dkdv_v18_overlap_slab(
              + ms[:, None] * stride_dvn + ds[None, :] * stride_dvd,
              dv.to(tl.bfloat16), mask=mm[:, None] & dm[None, :])
 
-    dzb = DZ_PRE + b * stride_dzb + h * stride_dzh
-    tl.store(dzb + ms * stride_dzn + 0, tl.where(mm, dz_pre_0, 0.0), mask=mm)
-    tl.store(dzb + ms * stride_dzn + 1, tl.where(mm, dz_pre_1, 0.0), mask=mm)
-    if R_PLANES_VAL >= 3:
-        tl.store(dzb + ms * stride_dzn + 2, tl.where(mm, dz_pre_2, 0.0), mask=mm)
-    if R_PLANES_VAL >= 4:
-        tl.store(dzb + ms * stride_dzn + 3, tl.where(mm, dz_pre_3, 0.0), mask=mm)
+    if NUM_GROUPS > 0:
+        # No-MOVT uses scalar dummy phase buffers; never address them by token.
+        dzb = DZ_PRE + b * stride_dzb + h * stride_dzh
+        tl.store(dzb + ms * stride_dzn + 0, tl.where(mm, dz_pre_0, 0.0), mask=mm)
+        tl.store(dzb + ms * stride_dzn + 1, tl.where(mm, dz_pre_1, 0.0), mask=mm)
+        if R_PLANES_VAL >= 3:
+            tl.store(dzb + ms * stride_dzn + 2, tl.where(mm, dz_pre_2, 0.0), mask=mm)
+        if R_PLANES_VAL >= 4:
+            tl.store(dzb + ms * stride_dzn + 3, tl.where(mm, dz_pre_3, 0.0), mask=mm)
 
 
 # ===========================================================================
@@ -2219,10 +2227,11 @@ class _DSQGV18GroupedFn(torch.autograd.Function):
             GROUPED_MODE_IDS['overlap_slab_bwd'],
         ):
             raise NotImplementedError("native GQA is currently implemented for grouped_mode='baseline' only")
-        if y_pre.shape[:3] != (B, H, N):
-            raise ValueError(f"y_pre must have shape [B,Hq,N,R]; got {tuple(y_pre.shape)} for q={tuple(q.shape)}")
-        if z_pre.shape[:3] != (B, H_KV, N):
-            raise ValueError(f"z_pre must have shape [B,Hkv,N,R]; got {tuple(z_pre.shape)} for k={tuple(k.shape)}")
+        if j_large:
+            if y_pre.shape[:3] != (B, H, N):
+                raise ValueError(f"y_pre must have shape [B,Hq,N,R]; got {tuple(y_pre.shape)} for q={tuple(q.shape)}")
+            if z_pre.shape[:3] != (B, H_KV, N):
+                raise ValueError(f"z_pre must have shape [B,Hkv,N,R]; got {tuple(z_pre.shape)} for k={tuple(k.shape)}")
         assert q.dtype == torch.bfloat16
         if not q.is_cuda:
             raise RuntimeError("DSQG V22 requires CUDA/Triton tensors")
@@ -2804,6 +2813,7 @@ class DSQGAttentionV19(nn.Module):
         movt_dynamic_rms_target=None,
         *,
         backend: str = "auto",
+        movt_enabled: bool = False,
         train_phase_probes: bool = False,
         scale_embed_init_std: float = 0.01,
         npci_strength_tau: float = 0.25,
@@ -2832,6 +2842,7 @@ class DSQGAttentionV19(nn.Module):
             raise ValueError("support_crop_min_offset must be a non-negative integer")
         self.scale_embed_init_std = float(scale_embed_init_std)
         self.npci_strength_tau = float(npci_strength_tau)
+        self.movt_enabled = bool(movt_enabled)
         self.train_phase_probes = bool(train_phase_probes)
         self.support_crop_projections = bool(support_crop_projections)
         self.support_crop_min_offset = int(support_crop_min_offset)
@@ -2872,6 +2883,10 @@ class DSQGAttentionV19(nn.Module):
             j_small,
             j_large,
         )
+        self.movt_reference_j_large = int(j_large)
+        if not self.movt_enabled:
+            j_small = len(canonical_offsets)
+            j_large = 0
         self.offsets = tuple(canonical_offsets)
         self.j_val = len(canonical_offsets)
         self.j_small = int(j_small)
@@ -2951,27 +2966,48 @@ class DSQGAttentionV19(nn.Module):
         with torch.no_grad():
             self.scale_embed.sub_(self.scale_embed.mean(0, keepdim=True))
         self.if_gain = nn.Parameter(torch.ones(heads))
-        self.phase_base = nn.Parameter(
-            torch.randn(max(self.j_large, 1), heads, R_PLANES) * 0.01
-        )
-        self.phase_gain = nn.Parameter(
-            torch.randn(max(self.j_large, 1), heads, R_PLANES)
-            * self.movt_phase_gain_init_std
-        )
-        self.phase_gate = nn.Parameter(torch.zeros(max(self.j_large, 1)))
-        query_probes, key_probes = _orthogonal_phase_probes(
-            R_PLANES,
-            self.head_dim,
-            self.plane_shift,
-        )
-        self.query_probes = nn.Parameter(
-            query_probes,
-            requires_grad=self.train_phase_probes,
-        )
-        self.key_probes = nn.Parameter(
-            key_probes,
-            requires_grad=self.train_phase_probes,
-        )
+        if self.movt_enabled:
+            self.phase_base = nn.Parameter(
+                torch.randn(max(self.j_large, 1), heads, R_PLANES) * 0.01
+            )
+            self.phase_gain = nn.Parameter(
+                torch.randn(max(self.j_large, 1), heads, R_PLANES)
+                * self.movt_phase_gain_init_std
+            )
+            self.phase_gate = nn.Parameter(torch.zeros(max(self.j_large, 1)))
+            query_probes, key_probes = _orthogonal_phase_probes(
+                R_PLANES,
+                self.head_dim,
+                self.plane_shift,
+            )
+            self.query_probes = nn.Parameter(
+                query_probes,
+                requires_grad=self.train_phase_probes,
+            )
+            self.key_probes = nn.Parameter(
+                key_probes,
+                requires_grad=self.train_phase_probes,
+            )
+        else:
+            # Preserve construction RNG parity with the legacy MOVT reference
+            # so later modules receive identical initialization under one seed.
+            torch.randn(max(self.movt_reference_j_large, 1), heads, R_PLANES)
+            torch.randn(max(self.movt_reference_j_large, 1), heads, R_PLANES)
+            # Tiny non-persistent tensors preserve the shared autograd signature.
+            # J_LARGE=0 specializes all MOVT forward/backward work away.
+            self.register_buffer(
+                "phase_base", torch.zeros(1, heads, R_PLANES), persistent=False
+            )
+            self.register_buffer(
+                "phase_gain", torch.zeros(1, heads, R_PLANES), persistent=False
+            )
+            self.register_buffer("phase_gate", torch.zeros(1), persistent=False)
+            self.register_buffer(
+                "query_probes", torch.zeros(R_PLANES, self.head_dim), persistent=False
+            )
+            self.register_buffer(
+                "key_probes", torch.zeros(R_PLANES, self.head_dim), persistent=False
+            )
         raw_theta = _raw_npci_theta_from_effective(NPCI_THETA_INIT)
         self.npci_theta_k = nn.Parameter(torch.full((heads,), raw_theta))
         self.npci_theta_v = nn.Parameter(torch.full((heads,), raw_theta))
@@ -2995,6 +3031,8 @@ class DSQGAttentionV19(nn.Module):
         return self.scale_embed - self.scale_embed.mean(dim=0, keepdim=True)
 
     def reset_phase_probes_(self) -> None:
+        if not self.movt_enabled:
+            return
         query, key = _orthogonal_phase_probes(
             R_PLANES,
             self.head_dim,
@@ -3005,6 +3043,8 @@ class DSQGAttentionV19(nn.Module):
             self.key_probes.copy_(key.to(self.key_probes))
 
     def phase_probe_regularizer(self) -> torch.Tensor:
+        if not self.movt_enabled:
+            return self.scale_embed.sum() * 0.0
         if not self.train_phase_probes:
             return self.query_probes.sum() * 0.0
         query = F.normalize(self.query_probes.float(), dim=-1)
@@ -3042,6 +3082,7 @@ class DSQGAttentionV19(nn.Module):
             "offsets": self.offsets,
             "j_small": self.j_small,
             "j_large": self.j_large,
+            "movt": "dynamic_static" if self.movt_enabled else "disabled",
             "plane_shift": self.plane_shift,
             "positional_bias": "analytic_log_plus_residual",
             "pos_bias_scale": float(self.pos_bias_scale.detach().cpu()),
@@ -3059,7 +3100,9 @@ class DSQGAttentionV19(nn.Module):
             "query_support_start": self.minimum_offset,
             "support_crop_projections": self.support_crop_projections,
             "support_crop_min_offset": self.support_crop_min_offset,
-            "phase_probe_kernel": "fused_triton_or_eager",
+            "phase_probe_kernel": (
+                "fused_triton_or_eager" if self.movt_enabled else "disabled"
+            ),
             "k_group_size": self.k_group_size,
             "max_group_size": self.max_group_size,
             "max_group_spread": self.max_group_spread,
@@ -3228,40 +3271,50 @@ class DSQGAttentionV19(nn.Module):
                 key = torch.cat((rotated_key, key[:, :, key_end:]), dim=2)
                 value = torch.cat((rotated_value, value[:, :, key_end:]), dim=2)
 
-        query_probe = F.normalize(self.query_probes.float(), dim=-1)
-        key_probe = F.normalize(self.key_probes.float(), dim=-1)
-
-        query_float = query.float()
-        key_float = key.float()
-
-        probe_epsilon = 1e-6 * head_dim
-
-        query_inverse_norm = torch.rsqrt(
-            query_float.square().sum(-1, keepdim=True) + probe_epsilon
-        )
-        key_inverse_norm = torch.rsqrt(
-            key_float.square().sum(-1, keepdim=True) + probe_epsilon
-        )
-
-        y_pre = (
-            torch.einsum("bhnd,rd->bhnr", query_float, query_probe)
-            * query_inverse_norm
-        ).contiguous()
-
-        z_pre = (
-            torch.einsum("bhnd,rd->bhnr", key_float, key_probe)
-            * key_inverse_norm
-        ).contiguous()
-
-        phase_gate = torch.sigmoid(self.phase_gate)[:, None, None]
+        if self.movt_enabled:
+            query_probe = F.normalize(self.query_probes.float(), dim=-1)
+            key_probe = F.normalize(self.key_probes.float(), dim=-1)
+            query_float = query.float()
+            key_float = key.float()
+            probe_epsilon = 1e-6 * head_dim
+            query_inverse_norm = torch.rsqrt(
+                query_float.square().sum(-1, keepdim=True) + probe_epsilon
+            )
+            key_inverse_norm = torch.rsqrt(
+                key_float.square().sum(-1, keepdim=True) + probe_epsilon
+            )
+            y_pre = (
+                torch.einsum("bhnd,rd->bhnr", query_float, query_probe)
+                * query_inverse_norm
+            ).contiguous()
+            z_pre = (
+                torch.einsum("bhnd,rd->bhnr", key_float, key_probe)
+                * key_inverse_norm
+            ).contiguous()
+            phase_gate = torch.sigmoid(self.phase_gate)[:, None, None]
+            phase_base = self.phase_base * phase_gate
+            phase_gain = self.phase_gain * phase_gate
+        else:
+            phase_base = self.phase_base
+            phase_gain = self.phase_gain
+            if self.backend == "eager" or not query.is_cuda:
+                y_pre = query.new_zeros(
+                    (batch, heads, seq_len, R_PLANES), dtype=torch.float32
+                )
+                z_pre = key.new_zeros(
+                    (batch, heads, seq_len, R_PLANES), dtype=torch.float32
+                )
+            else:
+                y_pre = query.new_zeros((1, 1, 1, 1), dtype=torch.float32)
+                z_pre = key.new_zeros((1, 1, 1, 1), dtype=torch.float32)
         output = dsqg_attention_v18_grouped(
             query,
             key,
             value,
             self.pos_bias,
             self.centered_scale_embed,
-            self.phase_base * phase_gate,
-            self.phase_gain * phase_gate,
+            phase_base,
+            phase_gain,
             y_pre,
             z_pre,
             self.j_val,

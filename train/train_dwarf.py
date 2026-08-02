@@ -75,8 +75,8 @@ from hierarchical_sparse_attn_v18_hisa import (  # noqa: E402
     HierarchicalSparseAttentionV16HISACausal,
 )
 
-EXPECTED_PARAMETERS = 55_348_728
-EXPECTED_TRAINABLE_PARAMETERS = 55_344_120
+EXPECTED_PARAMETERS = 55_330_470
+EXPECTED_TRAINABLE_PARAMETERS = 55_330_470
 
 
 @dataclass(frozen=True)
@@ -128,6 +128,7 @@ class DwarfConfig:
     hisa_local_window: int = 64
     hisa_selector_tile: int = 16
     hisa_global_adapter_rank: int = 16
+    movt_enabled: bool = False
     ema_timescales: tuple[float, ...] = (16.0, 64.0, 256.0)
     init_seed: int = 42
 
@@ -208,11 +209,13 @@ def assert_public_kernel_contracts() -> None:
         "        DQ + b * stride_dqb + h * stride_dqh\n"
         "        + ns[:, None] * stride_dqn + ds[None, :] * stride_dqd,"
     )
-    phase_store = active_baseline.index("# Store dy_pre")
-    if not 0 <= query_store < phase_store:
+    no_movt_guard = active_baseline.index("if J_LARGE_VAL > 0:")
+    if not 0 <= query_store < no_movt_guard:
         raise AssertionError(
             "active grouped-baseline DSQG backward must store its accumulated dQ"
         )
+    if source.count("No-MOVT uses scalar dummy phase buffers") != 5:
+        raise AssertionError("every phase-side backward store must be guarded")
 
 
 class RMSNorm(nn.Module):
@@ -308,6 +311,7 @@ class DSQGBlock(nn.Module):
             plane_shift=plane_shift,
             pos_bias_scale=1.0,
             movt_dynamic_rms_target=0.01,
+            movt_enabled=config.movt_enabled,
             train_phase_probes=False,
             scale_embed_init_std=0.01,
             npci_strength_tau=0.25,
@@ -408,13 +412,26 @@ class DwarfForCausalLM(nn.Module):
                     nn.init.normal_(module.weight, mean=0.0, std=0.02)
             for module in self.modules():
                 if isinstance(module, DSQGAttentionV19):
-                    nn.init.normal_(module.phase_base, mean=0.0, std=0.01)
-                    nn.init.normal_(
-                        module.phase_gain,
-                        mean=0.0,
-                        std=module.movt_phase_gain_init_std,
-                    )
-                    nn.init.zeros_(module.phase_gate)
+                    if module.movt_enabled:
+                        nn.init.normal_(module.phase_base, mean=0.0, std=0.01)
+                        nn.init.normal_(
+                            module.phase_gain,
+                            mean=0.0,
+                            std=module.movt_phase_gain_init_std,
+                        )
+                        nn.init.zeros_(module.phase_gate)
+                    else:
+                        shape = (
+                            max(module.movt_reference_j_large, 1),
+                            module.num_heads,
+                            R_PLANES,
+                        )
+                        nn.init.normal_(torch.empty(shape), mean=0.0, std=0.01)
+                        nn.init.normal_(
+                            torch.empty(shape),
+                            mean=0.0,
+                            std=module.movt_phase_gain_init_std,
+                        )
                     nn.init.normal_(
                         module.scale_embed,
                         mean=0.0,
@@ -480,7 +497,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
         ),
         "topology": {
             "layers": "DSQG,DSQG,DSQG,HISA,DSQG,DSQG,DSQG,DSQG,DSQG,DSQG",
-            "dsqg": "v22-baseline-online-softmax",
+            "dsqg": "v22-baseline-online-softmax-no-movt",
             "hisa": "v18-strict-causal",
             "offset_groups": model.offset_groups,
         },
@@ -513,9 +530,10 @@ def make_parameter_groups(
     for module in model.modules():
         if isinstance(module, DSQGAttentionV19):
             special["scale"].append(module.scale_embed)
-            special["phase"].extend(
-                (module.phase_base, module.phase_gain, module.phase_gate)
-            )
+            if module.movt_enabled:
+                special["phase"].extend(
+                    (module.phase_base, module.phase_gain, module.phase_gate)
+                )
             special["npci"].extend((module.npci_theta_k, module.npci_theta_v))
             special["positional"].extend(
                 (module.pos_bias_log_slope, module.pos_bias_residual)
@@ -1225,6 +1243,14 @@ def self_test() -> None:
     assert global_mixer.attn.global_k_down is not None
     assert isinstance(global_mixer.packet, InterferencePacket)
     assert sum(isinstance(block, DSQGBlock) for block in model.blocks) == 9
+    dsqg_layers = [block.attn for block in model.blocks if isinstance(block, DSQGBlock)]
+    assert all(not module.movt_enabled for module in dsqg_layers)
+    assert all(module.j_large == 0 for module in dsqg_layers)
+    assert not any(
+        token in name
+        for name, _ in model.named_parameters()
+        for token in ("phase_base", "phase_gain", "phase_gate", "query_probes", "key_probes")
+    )
     print(json.dumps({"status": "PASS", **metadata}, sort_keys=True))
 
 
