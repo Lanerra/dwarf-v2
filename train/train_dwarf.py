@@ -68,8 +68,7 @@ from causal_ema_scan import (  # noqa: E402
 )
 from dsqg_attention_v22 import (  # noqa: E402
     ALL_OFFSETS,
-    DSQGAttentionV19,
-    R_PLANES,
+    DSQGAttentionV22,
 )
 from hierarchical_sparse_attn_v18_hisa import (  # noqa: E402
     HierarchicalSparseAttentionV16HISACausal,
@@ -77,6 +76,12 @@ from hierarchical_sparse_attn_v18_hisa import (  # noqa: E402
 
 EXPECTED_PARAMETERS = 55_330_470
 EXPECTED_TRAINABLE_PARAMETERS = 55_330_470
+EXPECTED_STATE_FINGERPRINT = (
+    "d52495a17037980311a1882a8436db7f698acabb1592640f7e4cb52344a0652d"
+)
+EXPECTED_SEEDED_RNG_FINGERPRINT = (
+    "8f5c48b93d039bfc2141c62d989638b4aa072d508a8b29b2ab2cddcd22adf449"
+)
 
 
 @dataclass(frozen=True)
@@ -130,7 +135,6 @@ class DwarfConfig:
     hisa_chunk_selection_scope: str = "token"
     hisa_token_routing_pack_size: int = 4
     hisa_global_adapter_rank: int = 16
-    movt_enabled: bool = False
     ema_timescales: tuple[float, ...] = (16.0, 64.0, 256.0)
     init_seed: int = 42
 
@@ -176,13 +180,26 @@ def build_offset_groups(config: DwarfConfig) -> tuple[tuple[int, ...], ...]:
     return groups
 
 
-def _small_large_counts(offsets: Iterable[int]) -> tuple[int, int]:
-    values = tuple(int(value) for value in offsets)
-    small = sum(value <= 28 for value in values)
-    large = sum(value >= 48 for value in values)
-    if small + large != len(values):
-        raise ValueError("DSQG offsets must remain in the supported kernel bands")
-    return small, large
+def _consume_retired_movt_rng(
+    offsets: Iterable[int],
+    num_heads: int,
+    head_dim: int,
+    *,
+    reset_path: bool,
+) -> None:
+    """Preserve the released scratch-initialization RNG lineage only.
+
+    MOVT no longer has model state or runtime semantics. The released constructor
+    and reset path nevertheless consumed two normal draws before later parameters;
+    keeping those draws here preserves seeded weights and the subsequent RNG stream.
+    """
+    shape = (max(sum(int(offset) >= 48 for offset in offsets), 1), num_heads, 4)
+    if reset_path:
+        nn.init.normal_(torch.empty(shape), mean=0.0, std=0.01)
+        nn.init.normal_(torch.empty(shape), mean=0.0, std=0.02 * head_dim)
+    else:
+        torch.randn(shape)
+        torch.randn(shape)
 
 
 def _sha256(path: Path) -> str:
@@ -206,22 +223,29 @@ def source_manifest() -> dict[str, str]:
 
 
 def assert_public_kernel_contracts() -> None:
-    source = (KERNEL_DIR / "dsqg_attention_v22.py").read_text()
-    start = source.index("def _bwd_dq_v18_grouped(")
-    end = source.index("def _bwd_dq_v18_overlap_slab(", start)
-    active_baseline = source[start:end]
-    query_store = active_baseline.find(
-        "tl.store(\n"
-        "        DQ + b * stride_dqb + h * stride_dqh\n"
-        "        + ns[:, None] * stride_dqn + ds[None, :] * stride_dqd,"
-    )
-    no_movt_guard = active_baseline.index("if J_LARGE_VAL > 0:")
-    if not 0 <= query_store < no_movt_guard:
-        raise AssertionError(
-            "active grouped-baseline DSQG backward must store its accumulated dQ"
-        )
-    if source.count("No-MOVT uses scalar dummy phase buffers") != 5:
-        raise AssertionError("every phase-side backward store must be guarded")
+    state = torch.random.get_rng_state()
+    try:
+        torch.manual_seed(17)
+        kwargs = {
+            "embedding_dim": 64,
+            "num_heads": 4,
+            "offsets": (29, 32, 47),
+            "seq_len": 64,
+            "dropout": 0.0,
+            "backend": "eager",
+        }
+        module = DSQGAttentionV22(**kwargs).double()
+        assert module.offsets == (29, 32, 47)
+        restored = DSQGAttentionV22(**kwargs).double()
+        incompatible = restored.load_state_dict(module.state_dict(), strict=True)
+        assert not incompatible.missing_keys and not incompatible.unexpected_keys
+        values = torch.randn(2, 64, 64, dtype=torch.float64, requires_grad=True)
+        output = module(values)
+        assert torch.equal(output[:, :29], torch.zeros_like(output[:, :29]))
+        output.square().mean().backward()
+        assert torch.isfinite(values.grad).all()
+    finally:
+        torch.random.set_rng_state(state)
 
 
 class RMSNorm(nn.Module):
@@ -298,32 +322,27 @@ class DSQGBlock(nn.Module):
         self,
         config: DwarfConfig,
         offsets: tuple[int, ...],
-        *,
-        plane_shift: int,
     ) -> None:
         super().__init__()
-        small, large = _small_large_counts(offsets)
         self.norm1 = RMSNorm(config.embedding_dim)
         self.norm2 = RMSNorm(config.embedding_dim)
-        self.attn = DSQGAttentionV19(
+        self.attn = DSQGAttentionV22(
             config.embedding_dim,
             config.num_heads,
             offsets,
-            small,
-            large,
             seq_len=config.seq_len,
             dropout=config.dropout,
-            grouped_mode="baseline",
-            plane_shift=plane_shift,
             pos_bias_scale=1.0,
-            movt_dynamic_rms_target=0.01,
-            movt_enabled=config.movt_enabled,
-            train_phase_probes=False,
             scale_embed_init_std=0.01,
             npci_strength_tau=0.25,
-            online_softmax=True,
             support_crop_projections=True,
             support_crop_min_offset=64,
+        )
+        _consume_retired_movt_rng(
+            offsets,
+            config.num_heads,
+            config.embedding_dim // config.num_heads,
+            reset_path=False,
         )
         self.ffn = SwiGLUFFN(config)
 
@@ -386,21 +405,11 @@ class DwarfForCausalLM(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         layout: tuple[int | None, ...] = (0, 1, 2, None, 0, 1, 2, 0, 1, 2)
         blocks: list[nn.Module] = []
-        dsqg_index = 0
-        plane_segment = max(2, (config.embedding_dim // config.num_heads) // R_PLANES)
         for group_index in layout:
             if group_index is None:
                 blocks.append(GlobalMixerBlock(config))
                 continue
-            plane_shift = 2 * (dsqg_index % max(1, plane_segment // 2))
-            blocks.append(
-                DSQGBlock(
-                    config,
-                    self.offset_groups[group_index],
-                    plane_shift=plane_shift,
-                )
-            )
-            dsqg_index += 1
+            blocks.append(DSQGBlock(config, self.offset_groups[group_index]))
         self.blocks = nn.ModuleList(blocks)
         self.norm = RMSNorm(config.embedding_dim)
         self.lm_head = nn.Linear(config.embedding_dim, config.vocab_size, bias=False)
@@ -419,27 +428,13 @@ class DwarfForCausalLM(nn.Module):
                 elif isinstance(module, nn.Embedding):
                     nn.init.normal_(module.weight, mean=0.0, std=0.02)
             for module in self.modules():
-                if isinstance(module, DSQGAttentionV19):
-                    if module.movt_enabled:
-                        nn.init.normal_(module.phase_base, mean=0.0, std=0.01)
-                        nn.init.normal_(
-                            module.phase_gain,
-                            mean=0.0,
-                            std=module.movt_phase_gain_init_std,
-                        )
-                        nn.init.zeros_(module.phase_gate)
-                    else:
-                        shape = (
-                            max(module.movt_reference_j_large, 1),
-                            module.num_heads,
-                            R_PLANES,
-                        )
-                        nn.init.normal_(torch.empty(shape), mean=0.0, std=0.01)
-                        nn.init.normal_(
-                            torch.empty(shape),
-                            mean=0.0,
-                            std=module.movt_phase_gain_init_std,
-                        )
+                if isinstance(module, DSQGAttentionV22):
+                    _consume_retired_movt_rng(
+                        module.offsets,
+                        module.num_heads,
+                        module.head_dim,
+                        reset_path=True,
+                    )
                     nn.init.normal_(
                         module.scale_embed,
                         mean=0.0,
@@ -447,7 +442,6 @@ class DwarfForCausalLM(nn.Module):
                     )
                     with torch.no_grad():
                         module.scale_embed.sub_(module.scale_embed.mean(0, keepdim=True))
-                    module.reset_phase_probes_()
                 elif isinstance(module, HierarchicalSparseAttentionV16HISACausal):
                     module.reset_global_adapters_()
                 elif isinstance(module, InterferencePacket):
@@ -505,12 +499,23 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
         ),
         "topology": {
             "layers": "DSQG,DSQG,DSQG,HISA,DSQG,DSQG,DSQG,DSQG,DSQG,DSQG",
-            "dsqg": "v22-baseline-online-softmax-no-movt",
+            "dsqg": "v22-online-sparse",
             "hisa": "v18-strict-causal",
             "offset_groups": model.offset_groups,
         },
         "sources": source_manifest(),
     }
+
+
+def _state_fingerprint(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in model.state_dict().items():
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode())
+        digest.update(str(tuple(value.shape)).encode())
+        digest.update(str(value.dtype).encode())
+        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _unique(parameters: Iterable[nn.Parameter]) -> list[nn.Parameter]:
@@ -529,19 +534,14 @@ def make_parameter_groups(
 ) -> dict[str, list[dict[str, Any]]]:
     special: dict[str, list[nn.Parameter]] = {
         "scale": [],
-        "phase": [],
         "npci": [],
         "route": [],
         "ema": [],
         "positional": [],
     }
     for module in model.modules():
-        if isinstance(module, DSQGAttentionV19):
+        if isinstance(module, DSQGAttentionV22):
             special["scale"].append(module.scale_embed)
-            if module.movt_enabled:
-                special["phase"].extend(
-                    (module.phase_base, module.phase_gain, module.phase_gate)
-                )
             special["npci"].extend((module.npci_theta_k, module.npci_theta_v))
             special["positional"].extend(
                 (module.pos_bias_log_slope, module.pos_bias_residual)
@@ -606,7 +606,6 @@ def make_parameter_groups(
             recipe.learning_rate * 4.0,
             0.0,
         ),
-        group("adam_phase", special["phase"], recipe.learning_rate * 2.0, 0.0),
         group("adam_npci", special["npci"], recipe.learning_rate * 4.0, 0.0),
         group("adam_route", special["route"], recipe.learning_rate * 2.0, 0.0),
         group("adam_ema", special["ema"], recipe.learning_rate, 0.0),
@@ -1237,10 +1236,18 @@ def train(args: argparse.Namespace) -> None:
 
 def self_test() -> None:
     assert_public_kernel_contracts()
+    rng_state = torch.random.get_rng_state()
+    torch.manual_seed(1234)
     model = DwarfForCausalLM()
+    seeded_rng_fingerprint = hashlib.sha256(
+        torch.get_rng_state().numpy().tobytes()
+    ).hexdigest()
+    torch.random.set_rng_state(rng_state)
     metadata = model_metadata(model)
     assert metadata["parameters"] == EXPECTED_PARAMETERS
     assert metadata["trainable_parameters"] == EXPECTED_TRAINABLE_PARAMETERS
+    assert _state_fingerprint(model) == EXPECTED_STATE_FINGERPRINT
+    assert seeded_rng_fingerprint == EXPECTED_SEEDED_RNG_FINGERPRINT
     assert len(model.blocks) == 10
     assert isinstance(model.blocks[3], GlobalMixerBlock)
     global_mixer = model.blocks[3]
@@ -1254,13 +1261,25 @@ def self_test() -> None:
     assert isinstance(global_mixer.packet, InterferencePacket)
     assert sum(isinstance(block, DSQGBlock) for block in model.blocks) == 9
     dsqg_layers = [block.attn for block in model.blocks if isinstance(block, DSQGBlock)]
-    assert all(not module.movt_enabled for module in dsqg_layers)
-    assert all(module.j_large == 0 for module in dsqg_layers)
+    assert all(isinstance(module, DSQGAttentionV22) for module in dsqg_layers)
+    assert all(not hasattr(module, "j_large") for module in dsqg_layers)
+    assert all(not hasattr(module, "movt_enabled") for module in dsqg_layers)
     assert not any(
         token in name
         for name, _ in model.named_parameters()
         for token in ("phase_base", "phase_gain", "phase_gate", "query_probes", "key_probes")
     )
+    groups = make_parameter_groups(model, RECIPE)
+    assert [item["name"] for item in groups["muon"]] == ["muon_linear_weights"]
+    assert [item["name"] for item in groups["adamw"]] == [
+        "adam_decay",
+        "adam_no_decay",
+        "adam_scale_embed",
+        "adam_npci",
+        "adam_route",
+        "adam_ema",
+        "adam_positional",
+    ]
     print(json.dumps({"status": "PASS", **metadata}, sort_keys=True))
 
 
