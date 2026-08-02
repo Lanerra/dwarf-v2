@@ -483,11 +483,13 @@ def _router_auxiliary_loss(
     anchor_query: torch.Tensor,
     global_key: torch.Tensor,
     metadata: HISAMetadata,
+    route_scale_by_head: torch.Tensor,
     *,
     samples: int,
     temperature: float,
+    selector_temperature: float,
 ) -> torch.Tensor:
-    """Train anchor routing toward sampled token-level chunk evidence."""
+    """Train the effective anchor route prior toward token-level evidence."""
     if samples <= 0:
         return anchor_logits.sum() * 0.0
     batch_size, heads, tiles, num_chunks = anchor_logits.shape
@@ -531,7 +533,16 @@ def _router_auxiliary_loss(
     mask = token_valid[:, :, None] & eligible[:, None, :, :, None]
     token_scores = token_scores.masked_fill(~mask, -1e9)
     oracle = torch.logsumexp(token_scores, dim=-1)
-    route = anchor_logits[:, :, tile_ids].float().masked_fill(
+    # _selected_route_scores uses the same normalized query/representative dot
+    # product, removes a per-row constant, and applies this learned head scale.
+    # Softmax CE is invariant to that centering constant, so these are the
+    # effective attention-prior logits over all eligible chunks.
+    effective_route = (
+        anchor_logits.float()
+        * float(selector_temperature)
+        * route_scale_by_head.reshape(1, heads, 1, 1).float()
+    )
+    route = effective_route[:, :, tile_ids].masked_fill(
         ~eligible[:, None],
         -1e9,
     )
@@ -2377,6 +2388,7 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             "route_aux_weight": self.route_aux_weight,
             "route_aux_samples": self.route_aux_samples,
             "route_aux_temperature": self.route_aux_temperature,
+            "route_auxiliary_target": "effective_route_prior",
             "global_adapter_rank": self.global_adapter_rank,
             "npci_theta_max": self.npci_theta_max,
             "token_selection_mode": self.token_selection_mode,
@@ -2662,8 +2674,10 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
                 anchor_query,
                 global_key,
                 metadata,
+                self.route_prior_scale,
                 samples=self.route_aux_samples,
                 temperature=self.route_aux_temperature,
+                selector_temperature=self.temperature,
             ) * self.route_aux_weight
             self._routing_auxiliary_loss = auxiliary
             self.hisa_evidence_capture = HISASelectionCapture(
