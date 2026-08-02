@@ -10,7 +10,7 @@ The public tree intentionally contains only the runtime source needed to constru
 
 ## Architecture
 
-- Nine triadic DSQG blocks using the canonical 96-offset lattice and calibrated content-dependent MOVT initialization.
+- Nine triadic DSQG blocks use disjoint thirds of the canonical offset lattice, centered FP32 virtual-key scale embeddings, and one online sparse-softmax traversal over each retained causal offset.
 - A causal-EMA interference injection in the final pre-L3 DSQG block.
 - One L3 global mixer: strict-causal V16 HISA by default, or full causal SDPA with `--global-mixer fa`.
 
@@ -18,7 +18,7 @@ The HISA kernel uses a 64-token local lane, 16-token selector tiles, blocked bou
 
 ## Training recipes
 
-The trainer applies Muon to eligible hidden matrices and AdamW to embeddings, biases, norms, and the explicitly special DSQG phase, scale-embedding, and NPCI groups. Those special groups retain their validated learning-rate multipliers. Both recipes use warmup-stable-cosine-decay (WSD) to a 0.1× floor.
+The trainer applies Muon to eligible hidden matrices and AdamW to embeddings, biases, norms, and the explicitly special DSQG scale-embedding and Norm-Preserving Coupled Injection (NPCI) groups. Those special groups retain their validated learning-rate multipliers. Both recipes use warmup-stable-cosine-decay (WSD) to a 0.1× floor.
 
 | Recipe | LR | BS × GA | Updates | Input positions | WSD |
 |---|---:|---:|---:|---:|---:|
