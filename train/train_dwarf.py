@@ -127,6 +127,8 @@ class DwarfConfig:
     hisa_top_m_tokens: int = 64
     hisa_local_window: int = 64
     hisa_selector_tile: int = 16
+    hisa_chunk_selection_scope: str = "token"
+    hisa_token_routing_pack_size: int = 4
     hisa_global_adapter_rank: int = 16
     movt_enabled: bool = False
     ema_timescales: tuple[float, ...] = (16.0, 64.0, 256.0)
@@ -142,6 +144,10 @@ class DwarfConfig:
         head_dim = self.embedding_dim // self.num_heads
         if head_dim & (head_dim - 1):
             raise ValueError("HISA requires a power-of-two head dimension")
+        if self.hisa_chunk_selection_scope not in {"token", "tile"}:
+            raise ValueError("HISA chunk selection scope must be token or tile")
+        if self.hisa_token_routing_pack_size not in {1, 2, 4, 8, 16}:
+            raise ValueError("HISA token routing pack size must be 1, 2, 4, 8, or 16")
 
     @property
     def model_length(self) -> int:
@@ -340,6 +346,8 @@ class GlobalMixerBlock(nn.Module):
             hisa_top_m_tokens=config.hisa_top_m_tokens,
             local_window=config.hisa_local_window,
             selector_tile_size=config.hisa_selector_tile,
+            chunk_selection_scope=config.hisa_chunk_selection_scope,
+            token_routing_pack_size=config.hisa_token_routing_pack_size,
             representative_mode="mean_max_blend",
             representative_blend_alpha=0.5,
             route_prior_scale=0.1,
@@ -1237,6 +1245,8 @@ def self_test() -> None:
     assert isinstance(model.blocks[3], GlobalMixerBlock)
     global_mixer = model.blocks[3]
     assert not global_mixer.attn.collect_routing_diagnostics
+    assert global_mixer.attn.chunk_selection_scope == "token"
+    assert global_mixer.attn.token_routing_pack_size == 4
     assert global_mixer.attn.route_aux_weight == 0.01
     assert global_mixer.attn.exploration_probability == 0.05
     assert global_mixer.attn.global_adapter_rank == 16

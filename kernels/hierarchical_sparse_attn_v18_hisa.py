@@ -1,15 +1,18 @@
 """Strict-causal HISA V18 under the V16/V17-compatible public class name.
 
 Compared with the supplied V16 implementation, this revision uses a fixed
-physical chunk size, tile-anchor routing logits, selected-only differentiable
+physical chunk size, token-scoped routing logits, selected-only differentiable
 route scores, an all-token metadata path with no redundant token-index tensor,
 learnable centered route priors, counterfactual router supervision, an optional
 exploration slot, normalized semantic chunk representatives, distinct local and
 global K/V lanes, global-only low-rank value/key adapters, and magnitude-aware
-EMA/NPCI injection. V18 additionally computes selected-route scores per selector
-tile, can run the regular local lane through FlexAttention, and merges local and
-irregular-global lanes exactly through their log-sum-exp normalizers. The legacy
-combined Triton kernel remains available as a parity/fallback backend.
+EMA/NPCI injection. Exact per-token chunk selections are deduplicated into small
+physical query-pack unions; membership-masked route priors ensure each token can
+consume only its own chunks while Triton retains shared K/V matrix multiplies.
+V18 can run the regular local lane through FlexAttention and merges local and
+irregular-global lanes exactly through their log-sum-exp normalizers. Legacy
+tile-scoped selection and the combined Triton kernel remain available as
+explicit parity/ablation backends.
 
 The eager implementation is the semantic oracle and CPU fallback. CUDA uses a
 custom Triton forward/backward with FP32 source-gradient atomics.
@@ -186,6 +189,7 @@ class HISAMetadata:
     chunk_size: int
     selector_tile_size: int
     enumerate_all: bool
+    query_chunk_idx: torch.Tensor | None = None  # int32 [B,H,N,K] for token routing
 
 
 @dataclass(frozen=True)
@@ -458,6 +462,78 @@ def _build_causal_tile_metadata(
     )
 
 
+def _pack_token_metadata(
+    token_metadata: HISAMetadata,
+    *,
+    pack_size: int,
+) -> HISAMetadata:
+    """Deduplicate exact per-token chunk choices into bounded physical packs.
+
+    The semantic selection remains ``query_chunk_idx`` with K chunks per token.
+    ``top_chunk_idx`` is only the physical union consumed by the tiled attention
+    kernel; per-query route masking prevents a token from using another token's
+    union member.
+    """
+    if pack_size < 1:
+        raise ValueError("pack_size must be positive")
+    if token_metadata.selector_tile_size != 1:
+        raise ValueError("token metadata must have selector_tile_size=1")
+    if not token_metadata.enumerate_all:
+        raise ValueError("physical token packing requires enumerate_all metadata")
+
+    token_chunks = token_metadata.top_chunk_idx
+    batch_size, heads, seq_len, slots = token_chunks.shape
+    tiles = math.ceil(seq_len / pack_size)
+    padded_len = tiles * pack_size
+    packed = F.pad(
+        token_chunks,
+        (0, 0, 0, padded_len - seq_len),
+        value=-1,
+    ).reshape(batch_size, heads, tiles, pack_size * slots)
+
+    # Sorting followed by an integer rank compacts each fixed-width set without
+    # host synchronization or a variable-size unique operation. The physical
+    # width remains pack_size*K, giving Triton one stable launch shape.
+    sentinel = token_chunks.clamp_min(0).amax().to(token_chunks.dtype) + 1
+    sorted_chunks = torch.where(
+        packed >= 0,
+        packed,
+        sentinel.expand_as(packed),
+    ).sort(dim=-1).values
+    unique = (sorted_chunks != sentinel) & torch.cat(
+        (
+            torch.ones_like(sorted_chunks[..., :1], dtype=torch.bool),
+            sorted_chunks[..., 1:] != sorted_chunks[..., :-1],
+        ),
+        dim=-1,
+    )
+    ranks = unique.cumsum(-1) - 1
+    union = sentinel.expand_as(sorted_chunks).clone()
+    union.scatter_reduce_(
+        -1,
+        ranks.clamp_min(0),
+        torch.where(unique, sorted_chunks, sentinel.expand_as(sorted_chunks)),
+        reduce="amin",
+        include_self=True,
+    )
+    union = torch.where(union == sentinel, torch.full_like(union, -1), union)
+    tile_starts = (
+        torch.arange(tiles, device=token_chunks.device, dtype=torch.int32)
+        * pack_size
+    )
+    return HISAMetadata(
+        top_chunk_idx=union.to(torch.int32),
+        token_idx=token_metadata.token_idx,
+        token_scores=token_metadata.token_scores,
+        tile_starts=tile_starts,
+        valid_lengths=token_metadata.valid_lengths,
+        chunk_size=token_metadata.chunk_size,
+        selector_tile_size=int(pack_size),
+        enumerate_all=True,
+        query_chunk_idx=token_chunks,
+    )
+
+
 def _global_ids(
     metadata: HISAMetadata,
     seq_len: int,
@@ -499,12 +575,10 @@ def _selected_route_scores(
     metadata: HISAMetadata,
     route_scale_by_head: torch.Tensor,
 ) -> torch.Tensor:
-    """Score selected representatives without an N x K x HD gather.
+    """Score semantic selections without an N x K x HD gather.
 
-    Selection is tile-scoped, so gather [B,H,T,K,HD] once and contract it with
-    the [B,H,T,S,HD] query tiles. The previous implementation expanded selected
-    representatives independently for every query row, creating a roughly
-    selector_tile_size-times larger intermediate.
+    Tile routing scores one physical K-set. Token routing scores a deduplicated
+    physical union but centers and exposes only each query's own semantic K-set.
     """
     batch_size, heads, seq_len, head_dim = query_normalized.shape
     tiles = metadata.top_chunk_idx.shape[2]
@@ -532,15 +606,22 @@ def _selected_route_scores(
         query_tiles.float(),
         selected.float(),
     )
-    valid = chunks >= 0
+    if metadata.query_chunk_idx is None:
+        valid = (chunks >= 0)[..., None, :].expand_as(scores)
+    else:
+        semantic_chunks = F.pad(
+            metadata.query_chunk_idx,
+            (0, 0, 0, padded_len - seq_len),
+            value=-1,
+        ).reshape(batch_size, heads, tiles, selector, -1)
+        valid = (
+            semantic_chunks[..., None] == chunks[..., None, None, :]
+        ).any(dim=-2) & (chunks[..., None, :] >= 0)
     count = valid.sum(-1, keepdim=True).clamp_min(1)
-    mean = (scores * valid[..., None, :]).sum(-1, keepdim=True) / count[..., None]
-    centered = torch.where(
-        valid[..., None, :],
-        scores - mean,
-        torch.zeros_like(scores),
-    )
+    mean = (scores * valid).sum(-1, keepdim=True) / count
+    centered = torch.where(valid, scores - mean, torch.zeros_like(scores))
     scaled = centered * route_scale_by_head.reshape(1, heads, 1, 1, 1).float()
+    scaled = torch.where(valid, scaled, torch.full_like(scaled, float("-inf")))
     return scaled.reshape(batch_size, heads, padded_len, -1)[:, :, :seq_len].to(
         query_normalized.dtype
     )
@@ -557,7 +638,7 @@ def _router_auxiliary_loss(
     temperature: float,
     selector_temperature: float,
 ) -> torch.Tensor:
-    """Train the effective anchor route prior toward token-level evidence."""
+    """Train effective selected-route priors toward token-level evidence."""
     if samples <= 0:
         return anchor_logits.sum() * 0.0
     batch_size, heads, tiles, num_chunks = anchor_logits.shape
@@ -955,6 +1036,7 @@ def _eager_global_lane(
         scores = torch.matmul(q, keys.transpose(-2, -1)) * scale + prior
         valid = (
             id_valid[:, :, None]
+            & torch.isfinite(prior)
             & _strict_global_key_mask(
                 positions.reshape(1, 1, -1, 1),
                 ids[:, :, None],
@@ -1098,6 +1180,7 @@ def _eager_attention(
         )
         global_valid = (
             id_valid[:, :, None]
+            & torch.isfinite(route_prior)
             & _strict_global_key_mask(
                 query_positions.reshape(1, 1, -1, 1),
                 ids[:, :, None],
@@ -1255,6 +1338,7 @@ if _TRITON_AVAILABLE:
             )
             selected = (
                 query_mask[:, None] & id_mask[None, :]
+                & (prior[:, None] > float("-inf"))
                 & (ids[None, :] < query_positions[:, None] - LOCAL_WINDOW)
             )
             scores = tl.where(selected, scores, float("-inf"))
@@ -1380,6 +1464,7 @@ if _TRITON_AVAILABLE:
             ).to(tl.float32)
             selected = (
                 query_mask[:, None] & id_mask[None, :]
+                & (prior[:, None] > float("-inf"))
                 & (ids[None, :] < query_positions[:, None] - LOCAL_WINDOW)
             )
             scores = (
@@ -1616,6 +1701,7 @@ if _TRITON_AVAILABLE:
             global_selected = (
                 query_mask[:, None]
                 & id_mask[None, :]
+                & (prior[:, None] > float("-inf"))
                 & (ids[None, :] < query_positions[:, None] - LOCAL_WINDOW)
             )
             global_scores = tl.where(
@@ -1980,6 +2066,7 @@ if _TRITON_AVAILABLE:
             global_selected = (
                 query_mask[:, None]
                 & id_mask[None, :]
+                & (prior[:, None] > float("-inf"))
                 & (ids[None, :] < query_positions[:, None] - LOCAL_WINDOW)
             )
             global_scores = (
@@ -2380,6 +2467,8 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         route_prior_scale: float = 0.1,
         backend: str | None = None,
         token_selection_mode: str | None = None,
+        chunk_selection_scope: str | None = None,
+        token_routing_pack_size: int | None = None,
         representative_mode: str = "mean_max_blend",
         representative_blend_alpha: float = 0.5,
         exploration_probability: float = 0.05,
@@ -2465,6 +2554,25 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         ).lower()
         if self.token_selection_mode not in {"auto", "canonical"}:
             raise ValueError("token_selection_mode must be auto or canonical")
+        self.chunk_selection_scope = (
+            chunk_selection_scope
+            or os.getenv("DWARF_HISA_V18_CHUNK_SELECTION_SCOPE", "token")
+        ).lower()
+        if self.chunk_selection_scope not in {"token", "tile"}:
+            raise ValueError("chunk_selection_scope must be token or tile")
+        self.token_routing_pack_size = int(
+            token_routing_pack_size
+            if token_routing_pack_size is not None
+            else os.getenv("DWARF_HISA_V18_TOKEN_ROUTING_PACK_SIZE", "4")
+        )
+        if (
+            self.token_routing_pack_size < 1
+            or self.token_routing_pack_size > 16
+            or not _is_power_of_two(self.token_routing_pack_size)
+        ):
+            raise ValueError(
+                "token_routing_pack_size must be a power of two in [1,16]"
+            )
         self.representative_mode = representative_mode
         self.representative_blend_alpha = float(representative_blend_alpha)
         self.exploration_probability = float(exploration_probability)
@@ -2552,7 +2660,13 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             "global_adapter_rank": self.global_adapter_rank,
             "npci_theta_max": self.npci_theta_max,
             "token_selection_mode": self.token_selection_mode,
-            "selected_route_scoring": "tile_gather",
+            "chunk_selection_scope": self.chunk_selection_scope,
+            "token_routing_pack_size": self.token_routing_pack_size,
+            "selected_route_scoring": (
+                "token_selection_physical_union"
+                if self.chunk_selection_scope == "token"
+                else "tile_gather"
+            ),
             "lane_merge": "exact_lse",
         }
 
@@ -2812,33 +2926,58 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             blend_alpha=self.representative_blend_alpha,
         )
         query_normalized = F.normalize(query.float(), dim=-1, eps=1e-6).to(query.dtype)
-        tiles = math.ceil(seq_len / self.selector_tile_size)
-        tile_starts_long = (
-            torch.arange(tiles, device=x.device, dtype=torch.long)
-            * self.selector_tile_size
-        )
-        anchor_query = query_normalized[:, :, tile_starts_long.clamp_max(seq_len - 1)]
-        anchor_logits = torch.matmul(
-            anchor_query.float(),
+        if self.chunk_selection_scope == "token":
+            selection_tile_size = 1
+            selection_query = query_normalized
+        else:
+            selection_tile_size = self.selector_tile_size
+            selection_positions = (
+                torch.arange(
+                    math.ceil(seq_len / selection_tile_size),
+                    device=x.device,
+                    dtype=torch.long,
+                )
+                * selection_tile_size
+            )
+            selection_query = query_normalized[
+                :, :, selection_positions.clamp_max(seq_len - 1)
+            ]
+        selection_logits = torch.matmul(
+            selection_query.float(),
             representatives.float().transpose(-2, -1),
         ) / self.temperature
-        canonical = self.token_selection_mode == "canonical" or return_metadata
-        metadata = _build_causal_tile_metadata(
-            anchor_query,
+        # Metadata inspection must not silently switch token-scoped execution to
+        # the query-granular [B,H,N,K,M] canonical builder. Enumerate-all metadata
+        # already carries enough information to reconstruct the global token IDs.
+        canonical = self.token_selection_mode == "canonical"
+        selection_metadata = _build_causal_tile_metadata(
+            selection_query,
             global_key,
-            anchor_logits,
+            selection_logits,
             chunk_size=self.chunk_size,
             top_k_chunks=self.top_k_chunks,
             top_m_tokens=self.hisa_top_m_tokens,
-            selector_tile_size=self.selector_tile_size,
+            selector_tile_size=selection_tile_size,
             valid_lengths=lengths,
             canonical_token_order=canonical,
             exploration_probability=(
                 self.exploration_probability if self.training else 0.0
             ),
         )
+        metadata = selection_metadata
+        if (
+            self.chunk_selection_scope == "token"
+            and selection_metadata.enumerate_all
+            and self.token_routing_pack_size > 1
+        ):
+            metadata = _pack_token_metadata(
+                selection_metadata,
+                pack_size=self.token_routing_pack_size,
+            )
         self._last_token_selection_path = (
-            "enumerate_all" if metadata.enumerate_all else "canonical_topk"
+            "enumerate_all_packed"
+            if metadata.query_chunk_idx is not None
+            else ("enumerate_all" if metadata.enumerate_all else "canonical_topk")
         )
         route = _selected_route_scores(
             query_normalized,
@@ -2848,10 +2987,10 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         )
         if self.training and self.route_aux_weight > 0.0:
             auxiliary = _router_auxiliary_loss(
-                anchor_logits,
-                anchor_query,
+                selection_logits,
+                selection_query,
                 global_key,
-                metadata,
+                selection_metadata,
                 self.route_prior_scale,
                 samples=self.route_aux_samples,
                 temperature=self.route_aux_temperature,
@@ -2859,20 +2998,50 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             ) * self.route_aux_weight
             self._routing_auxiliary_loss = auxiliary
             self.hisa_evidence_capture = HISASelectionCapture(
-                anchor_logits=anchor_logits,
-                metadata=metadata,
+                anchor_logits=selection_logits,
+                metadata=selection_metadata,
                 auxiliary_loss=auxiliary,
             )
 
         with torch.no_grad():
             self._routing_entropy = _eligible_route_entropy(
-                anchor_logits,
-                metadata,
+                selection_logits,
+                selection_metadata,
             ).detach()
+            finite_route = torch.isfinite(route)
+            finite_route_count = finite_route.sum().clamp_min(1)
+            physical_chunks = (metadata.top_chunk_idx >= 0).sum(-1).float()
+            semantic_chunks = (
+                selection_metadata.top_chunk_idx >= 0
+            ).sum(-1).float()
+            semantic_mean = semantic_chunks.mean().clamp_min(1.0)
             diagnostics: dict[str, torch.Tensor] = {
                 "routing_entropy": self._routing_entropy,
-                "selected_route_rms": route.float().square().mean().sqrt().detach(),
+                "selected_route_rms": torch.sqrt(
+                    torch.where(finite_route, route.float().square(), 0.0).sum()
+                    / finite_route_count
+                ).detach(),
                 "route_prior_scale_mean": self.route_prior_scale.mean().detach(),
+                "semantic_chunks_per_query": semantic_chunks.mean().detach(),
+                "physical_union_chunks_per_pack": physical_chunks.mean().detach(),
+                "physical_union_inflation": (
+                    physical_chunks.mean() / semantic_mean
+                ).detach(),
+                "physical_union_slot_fraction": (
+                    physical_chunks.mean()
+                    / (
+                        semantic_mean
+                        * (
+                            metadata.selector_tile_size
+                            if metadata.query_chunk_idx is not None
+                            else 1
+                        )
+                    )
+                ).detach(),
+                "physical_routing_pack_size": torch.tensor(
+                    float(metadata.selector_tile_size),
+                    device=x.device,
+                ),
                 "enumerate_all": torch.tensor(
                     float(metadata.enumerate_all),
                     device=x.device,
@@ -2884,8 +3053,8 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
                         query,
                         global_key,
                         representatives,
-                        anchor_logits,
-                        metadata,
+                        selection_logits,
+                        selection_metadata,
                         local_window=self.local_window,
                         max_queries_per_batch=self.diagnostic_max_queries,
                     )
@@ -2907,7 +3076,7 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
                     lengths,
                     self.chunk_size,
                     metadata.enumerate_all,
-                    self.selector_tile_size,
+                    metadata.selector_tile_size,
                     self.local_window,
                     self.triton_block_q,
                     self.backward_impl == "atomic_masked",
@@ -2956,7 +3125,7 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
             attended = _HISATritonFn.apply(
                 query, local_key, local_value, global_key, global_value, route,
                 metadata.top_chunk_idx, metadata.token_idx, lengths,
-                self.chunk_size, metadata.enumerate_all, self.selector_tile_size,
+                self.chunk_size, metadata.enumerate_all, metadata.selector_tile_size,
                 self.local_window, self.triton_block_q,
                 self.backward_impl == "atomic_masked",
             )
