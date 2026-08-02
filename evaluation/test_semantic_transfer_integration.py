@@ -7,8 +7,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 
 from evaluation import semantic_transfer_eval as evaluator
+
+
+class WhitespaceTokenizer:
+    pad_token_id = 0
+    vocabulary = {
+        "ctx": 1,
+        "neutral": 2,
+        "Answer:": 3,
+        "red": 4,
+        "blue": 5,
+    }
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        assert add_special_tokens is False
+        return [self.vocabulary[token] for token in text.split()]
 
 
 @dataclass(frozen=True)
@@ -85,6 +101,59 @@ def test_calibrated_suite_keeps_raw_metrics_and_rows_unchanged(
     assert diagnostic["overall"]["accuracy"] == 1.0
     assert output["scoring_revision"] == "raw_plus_content_free_pmi_v1"
     assert output["evaluator_source_hashes"] == evaluator.evaluator_source_hashes()
+
+
+def test_real_position_sensitive_scorer_runs_through_calibrated_wrapper() -> None:
+    tokenizer = WhitespaceTokenizer()
+    example = evaluator.SemanticTransferExample(
+        family="context_binding",
+        example_id="position-sensitive",
+        context="ctx",
+        query="Answer:",
+        target="blue",
+        choices=("red", "blue"),
+        paraphrase_group=None,
+        metadata={"correct_choice": "blue"},
+    )
+    observed_inputs: list[list[int]] = []
+
+    def logits_hook(input_ids: list[int]) -> torch.Tensor:
+        observed_inputs.append(list(input_ids))
+        logits = torch.full((1, len(input_ids), 6), -10.0)
+        # If scoring starts one row too early, this row predicts blue and the
+        # raw forced-choice assertion below fails instead of passing by chance.
+        logits[0, 0, tokenizer.vocabulary["blue"]] = 5.0
+        if input_ids[0] == tokenizer.vocabulary["ctx"]:
+            # Context narrows the red prior but does not overcome it raw.
+            logits[0, 1, tokenizer.vocabulary["red"]] = 2.0
+            logits[0, 1, tokenizer.vocabulary["blue"]] = 1.5
+        elif input_ids[0] == tokenizer.vocabulary["neutral"]:
+            # Content-free scoring exposes the stronger unconditional red prior.
+            logits[0, 1, tokenizer.vocabulary["red"]] = 2.0
+            logits[0, 1, tokenizer.vocabulary["blue"]] = 1.0
+        else:  # pragma: no cover - guards the test fixture itself
+            raise AssertionError(f"unexpected prompt IDs: {input_ids}")
+        return logits
+
+    output = evaluator.evaluate_suite_with_content_free_calibration(
+        [example],
+        tokenizer,
+        logits_hook,
+        prompts_by_family={"context_binding": ("neutral Answer:",)},
+    )
+
+    row = output["rows"][0]
+    calibrated = output["calibrated_rows"][0]
+    assert row["predicted_choice"] == "red"
+    assert row["choice_correct"] is False
+    assert row["choice_token_ids"] == {"red": [4], "blue": [5]}
+    assert calibrated["calibrated_predicted_choice"] == "blue"
+    assert calibrated["calibrated_choice_correct"] is True
+    assert calibrated["target_margin"] > 0.0
+    assert [1, 3, 4] in observed_inputs
+    assert [1, 3, 5] in observed_inputs
+    assert [2, 3, 4] in observed_inputs
+    assert [2, 3, 5] in observed_inputs
 
 
 def test_deconfounded_suite_has_balanced_context_labels_and_exact_family_sizes() -> None:
