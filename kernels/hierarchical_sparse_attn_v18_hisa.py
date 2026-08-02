@@ -237,15 +237,13 @@ def _eligibility(
     return completed & chunk_valid[:, None, :] & tile_valid[:, :, None]
 
 
-def _inject_exploration_slot(
+def _unseen_eligible_chunks(
     indices: torch.Tensor,
     valid: torch.Tensor,
     eligible: torch.Tensor,
-    probability: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if probability <= 0.0 or indices.shape[-1] == 0:
-        return indices, valid
-    batch_size, heads, tiles, slots = indices.shape
+) -> torch.Tensor:
+    """Return eligible chunks absent from every valid route slot."""
+    batch_size, heads, tiles, _ = indices.shape
     chunks = eligible.shape[-1]
     selected_counts = torch.zeros(
         batch_size,
@@ -263,7 +261,19 @@ def _inject_exploration_slot(
         valid.to(torch.int32),
     )
     selected = selected_counts > 0
-    candidate = eligible[:, None].expand(-1, heads, -1, -1) & ~selected
+    return eligible[:, None].expand(-1, heads, -1, -1) & ~selected
+
+
+def _inject_exploration_slot(
+    indices: torch.Tensor,
+    valid: torch.Tensor,
+    eligible: torch.Tensor,
+    probability: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if probability <= 0.0 or indices.shape[-1] == 0:
+        return indices, valid
+    batch_size, heads, tiles, slots = indices.shape
+    candidate = _unseen_eligible_chunks(indices, valid, eligible)
     random_scores = torch.rand(candidate.shape, device=indices.device).masked_fill(
         ~candidate,
         -1.0,
