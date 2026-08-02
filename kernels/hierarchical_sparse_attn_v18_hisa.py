@@ -425,6 +425,23 @@ def _global_ids(
     return ids, valid
 
 
+def _strict_local_key_mask(
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    local_window: int,
+) -> torch.Tensor:
+    distance = query_positions - key_positions
+    return (distance >= 1) & (distance <= local_window)
+
+
+def _strict_global_key_mask(
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    local_window: int,
+) -> torch.Tensor:
+    return query_positions - key_positions > local_window
+
+
 def _selected_route_scores(
     query_normalized: torch.Tensor,
     representatives: torch.Tensor,
@@ -732,7 +749,7 @@ def _eager_local_lane(
         ids = positions[:, None] - local_window + offsets[None]
         valid = (
             (ids >= 0)
-            & (ids < positions[:, None])
+            & _strict_local_key_mask(positions[:, None], ids, local_window)
             & (ids < valid_lengths.reshape(batch_size, 1, 1))
             & q_valid[:, :, None]
         )
@@ -802,7 +819,11 @@ def _eager_global_lane(
         scores = torch.matmul(q, keys.transpose(-2, -1)) * scale + prior
         valid = (
             id_valid[:, :, None]
-            & (ids[:, :, None] < positions.reshape(1, 1, -1, 1) - local_window)
+            & _strict_global_key_mask(
+                positions.reshape(1, 1, -1, 1),
+                ids[:, :, None],
+                local_window,
+            )
             & (ids[:, :, None] < metadata.valid_lengths.reshape(batch_size, 1, 1, 1))
             & q_valid[:, None, :, None]
         )
@@ -897,7 +918,9 @@ def _eager_attention(
         )
         local_valid = (
             (local_ids >= 0)
-            & (local_ids < query_positions[:, None])
+            & _strict_local_key_mask(
+                query_positions[:, None], local_ids, local_window
+            )
             & (local_ids < metadata.valid_lengths.reshape(batch_size, 1, 1))
             & query_valid[:, :, None]
         )
@@ -939,9 +962,10 @@ def _eager_attention(
         )
         global_valid = (
             id_valid[:, :, None]
-            & (
-                ids[:, :, None]
-                < query_positions.reshape(1, 1, -1, 1) - local_window
+            & _strict_global_key_mask(
+                query_positions.reshape(1, 1, -1, 1),
+                ids[:, :, None],
+                local_window,
             )
             & (ids[:, :, None] < metadata.valid_lengths.reshape(batch_size, 1, 1, 1))
             & query_valid[:, None, :, None]
@@ -2419,7 +2443,7 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         window = int(self.local_window)
 
         def local_mask(_batch, _head, query_index, key_index):
-            return (key_index < query_index) & (key_index >= query_index - window)
+            return _strict_local_key_mask(query_index, key_index, window)
 
         self._local_block_mask = create_block_mask(
             local_mask,
