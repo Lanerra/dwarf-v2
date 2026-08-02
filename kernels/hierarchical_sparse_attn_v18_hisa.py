@@ -58,6 +58,57 @@ def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
+def _resolve_attention_execution(
+    *,
+    backend: str,
+    is_cuda: bool,
+    triton_available: bool,
+    local_backend: str,
+    flex_available: bool,
+) -> tuple[bool, bool]:
+    """Resolve the global-kernel and split-lane paths before doing projections."""
+    if backend == "triton":
+        if not is_cuda:
+            raise RuntimeError(
+                "HISA backend='triton' requires CUDA; use backend='eager' "
+                "explicitly for the CPU reference path"
+            )
+        if not triton_available:
+            raise RuntimeError(
+                "HISA backend='triton' was requested, but Triton is unavailable"
+            )
+        use_triton = True
+    else:
+        use_triton = backend == "auto" and is_cuda and triton_available
+    split_lanes = local_backend == "flex" and (flex_available or not is_cuda)
+    return use_triton, split_lanes
+
+
+def _validate_triton_geometry(
+    *,
+    head_dim: int,
+    local_window: int,
+    selected_tokens_per_chunk: int,
+    block_q: int,
+    combined_kernel: bool,
+) -> None:
+    """Fail before metadata/projection work when resolved Triton geometry is invalid."""
+    if head_dim < 16 or not _is_power_of_two(head_dim):
+        raise ValueError(
+            "Triton HISA requires a power-of-two head dimension >=16"
+        )
+    if block_q < 16 or not _is_power_of_two(block_q):
+        raise ValueError("HISA BLOCK_Q must be a power of two >=16")
+    if max(16, _next_pow2(selected_tokens_per_chunk)) > 256:
+        raise ValueError(
+            "Triton HISA supports at most 256 selected tokens per chunk"
+        )
+    if combined_kernel and max(16, _next_pow2(local_window)) > 256:
+        raise ValueError(
+            "combined Triton HISA currently supports local_window <=256"
+        )
+
+
 def _inverse_softplus(value: float) -> float:
     value = float(value)
     if not math.isfinite(value) or value <= 0:
@@ -2344,10 +2395,10 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
     ) -> None:
         super().__init__()
         D, H, hd = int(D), int(H), int(hd)
+        if D < 1 or H < 1 or hd < 1:
+            raise ValueError("D, H, and hd must be positive")
         if D != H * hd:
             raise ValueError(f"D={D} must equal H*hd={H * hd}")
-        if not _is_power_of_two(hd):
-            raise ValueError("HISA head dimension must be a power of two")
         if top_k_chunks < 1 or hisa_top_m_tokens < 1:
             raise ValueError("top_k_chunks and hisa_top_m_tokens must be positive")
         if not math.isfinite(temperature) or temperature <= 0:
@@ -2685,10 +2736,23 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
     ):
         self.hisa_evidence_capture = None
         self._routing_auxiliary_loss = None
-        if self.backend == "triton" and not x.is_cuda:
-            raise RuntimeError(
-                "HISA backend='triton' requires CUDA; use backend='eager' "
-                "explicitly for the CPU reference path"
+        use_triton, split_lanes = _resolve_attention_execution(
+            backend=self.backend,
+            is_cuda=x.is_cuda,
+            triton_available=_TRITON_AVAILABLE,
+            local_backend=self.local_backend,
+            flex_available=_FLEX_ATTENTION_AVAILABLE,
+        )
+        if use_triton:
+            _validate_triton_geometry(
+                head_dim=self.hd,
+                local_window=self.local_window,
+                selected_tokens_per_chunk=min(
+                    self.chunk_size,
+                    self.hisa_top_m_tokens,
+                ),
+                block_q=self.triton_block_q,
+                combined_kernel=not split_lanes,
             )
         batch_size, seq_len, _ = x.shape
         lengths = _as_valid_lengths(
@@ -2828,17 +2892,11 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
                 )
             self._routing_diagnostics = diagnostics
 
-        use_triton = self.backend == "triton" or (
-            self.backend == "auto" and x.is_cuda and _TRITON_AVAILABLE
-        )
-        split_lanes = self.local_backend == "flex" and (
-            _FLEX_ATTENTION_AVAILABLE or not x.is_cuda
-        )
         if split_lanes:
             local_output, local_lse = self._local_lane(
                 query, local_key, local_value, lengths
             )
-            if use_triton and x.is_cuda and _TRITON_AVAILABLE:
+            if use_triton:
                 global_output, global_lse = _GlobalHISATritonFn.apply(
                     query,
                     global_key,
@@ -2894,7 +2952,7 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
                 self._routing_diagnostics["combined_lse_finite_rate"] = (
                     torch.isfinite(combined_lse).float().mean().detach()
                 )
-        elif use_triton and x.is_cuda and _TRITON_AVAILABLE:
+        elif use_triton:
             attended = _HISATritonFn.apply(
                 query, local_key, local_value, global_key, global_value, route,
                 metadata.top_chunk_idx, metadata.token_idx, lengths,
