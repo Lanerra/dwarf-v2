@@ -597,124 +597,209 @@ def _routing_quality_diagnostics(
     local_window: int,
     max_queries_per_batch: int,
 ) -> dict[str, torch.Tensor]:
-    """Exact-on-sampled-row routing metrics without an N-by-N allocation."""
+    """Exact-on-sampled-row routing metrics without host synchronization."""
     device = query.device
     batch_size, heads, seq_len, head_dim = query.shape
     num_chunks = representatives.shape[2]
     scale = 1.0 / math.sqrt(head_dim)
-    zeros = lambda: torch.zeros((), device=device, dtype=torch.float32)
-    selected_hits, selected_targets = zeros(), zeros()
-    candidate_hits, candidate_targets = zeros(), zeros()
-    representative_misses, representative_total, representative_regret = zeros(), zeros(), zeros()
-    overlap_removed, overlap_total = zeros(), zeros()
-    sampled = 0
+    selector = metadata.selector_tile_size
+    sample_slots = torch.arange(max_queries_per_batch, device=device)
+    first_useful_tile = math.ceil(metadata.chunk_size / selector)
+    valid_tile_count = torch.div(
+        metadata.valid_lengths.long() + selector - 1,
+        selector,
+        rounding_mode="floor",
+    ).clamp_max(metadata.tile_starts.numel())
+    eligible_tile_count = (valid_tile_count - first_useful_tile).clamp_min(0)
+    sample_budget = eligible_tile_count.clamp_max(max_queries_per_batch)
+    sample_valid = sample_slots.reshape(1, -1) < sample_budget.reshape(-1, 1)
+    denominator = (sample_budget - 1).clamp_min(1).reshape(-1, 1)
+    relative_tile = torch.round(
+        sample_slots.float().reshape(1, -1)
+        * (eligible_tile_count - 1).clamp_min(0).float().reshape(-1, 1)
+        / denominator.float()
+    ).long()
+    relative_tile = torch.where(
+        sample_budget.reshape(-1, 1) > 1,
+        relative_tile,
+        torch.zeros_like(relative_tile),
+    )
+    tile_ids = (relative_tile + first_useful_tile).clamp(
+        0, metadata.tile_starts.numel() - 1
+    )
+    query_positions = metadata.tile_starts.long()[tile_ids]
+    sampled_query = torch.gather(
+        query,
+        2,
+        query_positions[:, None, :, None].expand(
+            batch_size, heads, max_queries_per_batch, head_dim
+        ),
+    )
+
+    chunk_ids = torch.arange(num_chunks, device=device)
+    eligible_chunk_count = torch.div(
+        query_positions,
+        metadata.chunk_size,
+        rounding_mode="floor",
+    ).clamp_max(num_chunks)
+    eligible_chunks = (
+        chunk_ids.reshape(1, 1, -1)
+        < eligible_chunk_count[:, :, None]
+    ) & sample_valid[:, :, None]
+    key_chunks, token_valid, _ = _chunk_tensors(
+        global_key,
+        metadata.chunk_size,
+        metadata.valid_lengths,
+    )
+    token_scores = torch.einsum(
+        "bhqd,bhcmd->bhqcm",
+        sampled_query,
+        key_chunks,
+    ) * scale
+    token_score_valid = (
+        eligible_chunks[:, None, :, :, None]
+        & token_valid[:, :, None]
+    )
+    token_scores = token_scores.masked_fill(
+        ~token_score_valid,
+        float("-inf"),
+    )
+    chunk_scores = token_scores.max(-1).values
+    ideal_chunks = torch.argsort(
+        chunk_scores,
+        dim=-1,
+        descending=True,
+        stable=True,
+    )
+    selected = torch.gather(
+        metadata.top_chunk_idx,
+        2,
+        tile_ids[:, None, :, None].expand(
+            batch_size,
+            heads,
+            max_queries_per_batch,
+            metadata.top_chunk_idx.shape[-1],
+        ),
+    )
+    k_eff = eligible_chunk_count.clamp_max(metadata.top_chunk_idx.shape[-1])
+    ideal_valid = (
+        chunk_ids.reshape(1, 1, 1, -1) < k_eff[:, None, :, None]
+    ) & sample_valid[:, None, :, None]
+    selected_hits = (
+        (ideal_chunks.unsqueeze(-1) == selected.unsqueeze(-2)).any(-1)
+        & ideal_valid
+    ).sum()
+    selected_targets = (k_eff * sample_valid).sum() * heads
+
+    representative_scores = torch.einsum(
+        "bhqd,bhcd->bhqc",
+        F.normalize(sampled_query.float(), dim=-1),
+        representatives.float(),
+    ).masked_fill(~eligible_chunks[:, None], float("-inf"))
+    representative_choice = representative_scores.argmax(-1)
+    exact_choice = chunk_scores.argmax(-1)
+    representative_rows = sample_valid[:, None].expand(-1, heads, -1)
+    representative_misses = (
+        (representative_choice != exact_choice) & representative_rows
+    ).sum()
+    exact_maximum = chunk_scores.max(-1).values
+    chosen_exact = chunk_scores.gather(
+        -1,
+        representative_choice.unsqueeze(-1),
+    ).squeeze(-1)
+    representative_regret = torch.where(
+        representative_rows,
+        exact_maximum - chosen_exact,
+        torch.zeros_like(exact_maximum),
+    ).sum()
+    representative_total = representative_rows.sum()
+
     all_ids, all_valid = _global_ids(metadata, seq_len)
+    candidate_shape = all_ids.shape[3:]
+    candidate_ids = torch.gather(
+        all_ids,
+        2,
+        tile_ids[:, None, :, None, None].expand(
+            batch_size,
+            heads,
+            max_queries_per_batch,
+            *candidate_shape,
+        ),
+    ).reshape(batch_size, heads, max_queries_per_batch, -1)
+    candidate_valid = torch.gather(
+        all_valid,
+        2,
+        tile_ids[:, None, :, None, None].expand(
+            batch_size,
+            heads,
+            max_queries_per_batch,
+            *candidate_shape,
+        ),
+    ).reshape(batch_size, heads, max_queries_per_batch, -1)
+    candidate_valid = candidate_valid & sample_valid[:, None, :, None]
+    local_start = (query_positions - local_window).clamp_min(0)
+    removed = candidate_valid & (
+        candidate_ids >= local_start[:, None, :, None]
+    )
+    overlap_removed = removed.sum()
+    overlap_total = candidate_valid.sum()
+    kept = candidate_valid & (
+        candidate_ids < local_start[:, None, :, None]
+    )
 
-    for batch in range(batch_size):
-        valid_len = int(metadata.valid_lengths[batch].item())
-        eligible_tiles = [
-            tile
-            for tile, start in enumerate(metadata.tile_starts.tolist())
-            if start < valid_len and start // metadata.chunk_size > 0
-        ]
-        if not eligible_tiles:
-            continue
-        budget = min(max_queries_per_batch, len(eligible_tiles))
-        chosen = (
-            torch.linspace(0, len(eligible_tiles) - 1, steps=budget)
-            .round()
-            .long()
-            .tolist()
-        )
-        for choice in chosen:
-            tile = eligible_tiles[choice]
-            q_pos = int(metadata.tile_starts[tile].item())
-            eligible_count = min(num_chunks, q_pos // metadata.chunk_size)
-            if eligible_count <= 0:
-                continue
-            k_eff = min(metadata.top_chunk_idx.shape[-1], eligible_count)
-            chunk_ids = torch.arange(eligible_count, device=device)
-            token_ids = (
-                chunk_ids[:, None] * metadata.chunk_size
-                + torch.arange(metadata.chunk_size, device=device)[None, :]
-            )
-            token_mask = token_ids < valid_len
-            safe_ids = token_ids.clamp_max(seq_len - 1)
-            keys = global_key[batch, :, safe_ids, :]
-            token_scores = torch.einsum(
-                "hd,hcmd->hcm",
-                query[batch, :, q_pos],
-                keys,
-            ) * scale
-            token_scores = token_scores.masked_fill(~token_mask[None], float("-inf"))
-            chunk_scores = token_scores.max(-1).values
-            ideal_chunks = torch.argsort(
-                chunk_scores,
-                dim=-1,
-                descending=True,
-                stable=True,
-            )[..., :k_eff]
-            selected = metadata.top_chunk_idx[batch, :, tile]
-            selected_hits += (
-                ideal_chunks.unsqueeze(-1) == selected.unsqueeze(-2)
-            ).any(-1).sum()
-            selected_targets += heads * k_eff
-
-            representative_scores = torch.einsum(
-                "hd,hcd->hc",
-                F.normalize(query[batch, :, q_pos].float(), dim=-1),
-                representatives[batch, :, :eligible_count].float(),
-            )
-            exact_scores = chunk_scores
-            representative_misses += (
-                representative_scores.argmax(-1) != exact_scores.argmax(-1)
-            ).sum()
-            representative_regret += (
-                exact_scores.max(-1).values
-                - exact_scores.gather(
-                    -1,
-                    representative_scores.argmax(-1, keepdim=True),
-                ).squeeze(-1)
-            ).sum()
-            representative_total += heads
-
-            candidate_ids = all_ids[batch, :, tile].reshape(heads, -1)
-            candidate_valid = all_valid[batch, :, tile].reshape(heads, -1)
-            local_start = max(0, q_pos - local_window)
-            removed = candidate_valid & (candidate_ids >= local_start)
-            overlap_removed += removed.sum()
-            overlap_total += candidate_valid.sum()
-            kept = candidate_valid & (candidate_ids < local_start)
-
-            flat_ids = token_ids[token_mask]
-            global_eligible_ids = flat_ids[flat_ids < local_start]
-            candidate_budget = min(
-                int(kept.sum(-1).max().item()) if kept.numel() else 0,
-                int(global_eligible_ids.numel()),
-            )
-            if candidate_budget > 0:
-                oracle_scores = torch.einsum(
-                    "hd,hnd->hn",
-                    query[batch, :, q_pos],
-                    global_key[batch, :, global_eligible_ids],
-                ) * scale
-                oracle = global_eligible_ids[
-                    torch.argsort(
-                        oracle_scores,
-                        dim=-1,
-                        descending=True,
-                        stable=True,
-                    )[..., :candidate_budget]
-                ]
-                candidate_hits += (
-                    (oracle.unsqueeze(-1) == candidate_ids.unsqueeze(-2))
-                    & kept.unsqueeze(-2)
-                ).any(-1).sum()
-                candidate_targets += heads * candidate_budget
-            sampled += 1
+    completed_end = eligible_chunk_count * metadata.chunk_size
+    global_eligible_count = torch.minimum(local_start, completed_end)
+    candidate_budget = torch.minimum(
+        kept.sum(-1).max(1).values,
+        global_eligible_count,
+    )
+    oracle_scores = torch.einsum(
+        "bhqd,bhnd->bhqn",
+        sampled_query,
+        global_key,
+    ) * scale
+    key_positions = torch.arange(seq_len, device=device)
+    oracle_valid = (
+        key_positions.reshape(1, 1, -1)
+        < global_eligible_count[:, :, None]
+    ) & sample_valid[:, :, None]
+    oracle_scores = oracle_scores.masked_fill(
+        ~oracle_valid[:, None],
+        float("-inf"),
+    )
+    oracle_width = min(candidate_ids.shape[-1], seq_len)
+    oracle_ids = torch.argsort(
+        oracle_scores,
+        dim=-1,
+        descending=True,
+        stable=True,
+    )[..., :oracle_width]
+    candidate_membership = torch.zeros(
+        batch_size,
+        heads,
+        max_queries_per_batch,
+        seq_len,
+        dtype=torch.int32,
+        device=device,
+    )
+    candidate_membership.scatter_add_(
+        -1,
+        candidate_ids.clamp(0, seq_len - 1).long(),
+        kept.to(torch.int32),
+    )
+    oracle_rank_valid = (
+        torch.arange(oracle_width, device=device).reshape(1, 1, 1, -1)
+        < candidate_budget[:, None, :, None]
+    )
+    candidate_hits = (
+        (torch.gather(candidate_membership, -1, oracle_ids) > 0)
+        & oracle_rank_valid
+    ).sum()
+    candidate_targets = (candidate_budget * sample_valid).sum() * heads
+    sampled = sample_valid.sum().to(torch.float32)
 
     return {
-        "sampled_queries": torch.tensor(sampled, device=device, dtype=torch.float32),
+        "sampled_queries": sampled,
         "selected_chunk_recall": selected_hits / selected_targets.clamp_min(1),
         "final_candidate_recall": candidate_hits / candidate_targets.clamp_min(1),
         "representative_miss_rate": representative_misses / representative_total.clamp_min(1),
