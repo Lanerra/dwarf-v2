@@ -21,7 +21,6 @@ custom Triton forward/backward with FP32 source-gradient atomics.
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +69,10 @@ def _resolve_attention_execution(
     flex_available: bool,
 ) -> tuple[bool, bool]:
     """Resolve the global-kernel and split-lane paths before doing projections."""
+    if is_cuda and local_backend == "flex" and not flex_available:
+        raise RuntimeError(
+            "HISA local_backend='flex' was requested, but FlexAttention is unavailable"
+        )
     if backend == "triton":
         if not is_cuda:
             raise RuntimeError(
@@ -640,7 +643,7 @@ def _router_auxiliary_loss(
 ) -> torch.Tensor:
     """Train effective selected-route priors toward token-level evidence."""
     if samples <= 0:
-        return anchor_logits.sum() * 0.0
+        return anchor_logits.new_zeros(())
     batch_size, heads, tiles, num_chunks = anchor_logits.shape
     eligibility_all = _eligibility(
         metadata.tile_starts,
@@ -657,7 +660,7 @@ def _router_auxiliary_loss(
     )
     candidate_count = max(0, tiles - first_useful_tile)
     if candidate_count == 0:
-        return anchor_logits.sum() * 0.0
+        return anchor_logits.new_zeros(())
     sample_count = min(int(samples), candidate_count)
     useful_tiles = torch.arange(
         first_useful_tile, tiles, device=anchor_logits.device, dtype=torch.long
@@ -2479,6 +2482,8 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         npci_theta_max: float = 0.25,
         max_seq_len: int | None = None,
         local_backend: str = "flex",
+        triton_block_q: int | None = None,
+        backward_impl: str | None = None,
         collect_routing_diagnostics: bool | None = None,
         diagnostic_max_queries: int | None = None,
     ) -> None:
@@ -2519,17 +2524,17 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         resolved_chunk_size = (
             int(chunk_size)
             if chunk_size is not None
-            else int(os.getenv("DWARF_HISA_CHUNK_SIZE", "64"))
+            else 64
         )
         resolved_local_window = (
             int(local_window)
             if local_window is not None
-            else int(os.getenv("DWARF_HISA_V16_LOCAL_WINDOW", "64"))
+            else 64
         )
         resolved_selector_tile = (
             int(selector_tile_size)
             if selector_tile_size is not None
-            else int(os.getenv("DWARF_HISA_V16_SELECTOR_TILE", "16"))
+            else 16
         )
         if resolved_chunk_size < 1 or resolved_local_window < 1 or resolved_selector_tile < 1:
             raise ValueError("chunk_size, local_window, and selector_tile_size must be positive")
@@ -2545,25 +2550,25 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.local_window = resolved_local_window
         self.selector_tile_size = resolved_selector_tile
         self.temperature = float(temperature)
-        self.backend = (backend or os.getenv("DWARF_HISA_V16_BACKEND", "auto")).lower()
+        self.backend = (backend or "auto").lower()
         if self.backend not in {"auto", "eager", "triton"}:
             raise ValueError("backend must be auto, eager, or triton")
         self.token_selection_mode = (
             token_selection_mode
-            or os.getenv("DWARF_HISA_V16_TOKEN_SELECTION", "auto")
+            or "auto"
         ).lower()
         if self.token_selection_mode not in {"auto", "canonical"}:
             raise ValueError("token_selection_mode must be auto or canonical")
         self.chunk_selection_scope = (
             chunk_selection_scope
-            or os.getenv("DWARF_HISA_V18_CHUNK_SELECTION_SCOPE", "token")
+            or "token"
         ).lower()
         if self.chunk_selection_scope not in {"token", "tile"}:
             raise ValueError("chunk_selection_scope must be token or tile")
         self.token_routing_pack_size = int(
             token_routing_pack_size
             if token_routing_pack_size is not None
-            else os.getenv("DWARF_HISA_V18_TOKEN_ROUTING_PACK_SIZE", "4")
+            else 4
         )
         if (
             self.token_routing_pack_size < 1
@@ -2585,17 +2590,20 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         self.local_backend = local_backend
         self._local_block_mask = None
         self._local_block_mask_key: tuple[str, int | None, int, int] | None = None
-        self.triton_block_q = int(os.getenv("DWARF_HISA_V16_BLOCK_Q", "16"))
-        self.backward_impl = os.getenv(
-            "DWARF_HISA_V16_BWD",
-            "atomic_masked",
+        self.triton_block_q = int(
+            triton_block_q
+            if triton_block_q is not None
+            else 16
+        )
+        self.backward_impl = (
+            backward_impl
+            if backward_impl is not None
+            else "atomic_masked"
         ).lower()
         if self.backward_impl not in {"atomic", "atomic_masked"}:
-            raise ValueError("DWARF_HISA_V16_BWD must be atomic or atomic_masked")
+            raise ValueError("backward_impl must be atomic or atomic_masked")
         if collect_routing_diagnostics is None:
-            collect_routing_diagnostics = (
-                os.getenv("DWARF_HISA_V16_ROUTING_DIAGNOSTICS", "0") == "1"
-            )
+            collect_routing_diagnostics = False
         self.collect_routing_diagnostics = bool(collect_routing_diagnostics)
         self.diagnostic_max_queries = int(diagnostic_max_queries or 8)
         if self.diagnostic_max_queries < 1:
@@ -3142,7 +3150,7 @@ class HierarchicalSparseAttentionV16HISACausal(nn.Module):
         output = self.W_o(merged) * torch.sigmoid(gate)
         auxiliary = self._routing_auxiliary_loss
         if auxiliary is None:
-            auxiliary = output.sum() * 0.0
+            auxiliary = output.new_zeros(())
         if return_metadata and return_auxiliary:
             return output, metadata, auxiliary
         if return_metadata:

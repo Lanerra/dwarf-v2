@@ -57,8 +57,6 @@ except Exception:  # CPU-only semantic-oracle/test installations
     tl = _TLStub()
 
 _LOG2E = tl.constexpr(1.4426950408889634)
-NPCI_THETA_MAX = 0.25
-NPCI_THETA_INIT = 0.01
 
 
 def _env_float(name: str, default: float) -> float:
@@ -117,44 +115,6 @@ def _canonicalize_offsets(
         raise ValueError(f"Duplicate DSQG offsets are not supported: {values}")
 
     return sorted(values)
-
-
-def npci_rotate(
-    x: torch.Tensor,
-    x_delta: torch.Tensor,
-    theta_h: torch.Tensor,
-    *,
-    strength_tau: float = 0.25,
-) -> torch.Tensor:
-    """Apply the retained magnitude-aware causal injection rotation."""
-    tau = float(strength_tau)
-    if not math.isfinite(tau) or tau <= 0:
-        raise ValueError("strength_tau must be finite and positive")
-    original_dtype = x.dtype
-    xf, df = x.float(), x_delta.float()
-    theta = theta_h.float().reshape(1, -1, 1, 1)
-    norm = xf.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-    unit = xf / norm
-    perpendicular = df - (df * unit).sum(dim=-1, keepdim=True) * unit
-    perpendicular_norm = perpendicular.norm(dim=-1, keepdim=True)
-    active = perpendicular_norm > norm * 1e-7
-    direction = torch.where(
-        active,
-        perpendicular / perpendicular_norm.clamp_min(1e-20),
-        torch.zeros_like(perpendicular),
-    )
-    strength = torch.tanh(perpendicular_norm / (tau * norm + 1e-12))
-    angle = theta * strength
-    rotated = torch.cos(angle) * xf + torch.sin(angle) * norm * direction
-    return torch.where(active, rotated, xf).to(original_dtype)
-
-
-def _raw_npci_theta_from_effective(theta: float) -> float:
-    theta = float(theta)
-    limit = float(NPCI_THETA_MAX)
-    if not (0.0 <= abs(theta) < limit):
-        raise ValueError(f"NPCI_THETA_INIT={theta} must satisfy abs(theta) < {limit}")
-    return math.atanh(theta / limit)
 
 
 # ===========================================================================
@@ -732,7 +692,6 @@ class DSQGAttentionV22(nn.Module):
         *,
         backend: str = "auto",
         scale_embed_init_std: float = 0.01,
-        npci_strength_tau: float = 0.25,
         support_crop_projections: bool = True,
         support_crop_min_offset: int = 64,
     ):
@@ -753,15 +712,12 @@ class DSQGAttentionV22(nn.Module):
 
         if not math.isfinite(float(scale_embed_init_std)) or scale_embed_init_std < 0:
             raise ValueError("scale_embed_init_std must be finite and non-negative")
-        if not math.isfinite(float(npci_strength_tau)) or npci_strength_tau <= 0:
-            raise ValueError("npci_strength_tau must be finite and positive")
         crop_min = _strict_int(
             "support_crop_min_offset", support_crop_min_offset
         )
         if not isinstance(support_crop_projections, bool):
             raise TypeError("support_crop_projections must be bool")
         self.scale_embed_init_std = float(scale_embed_init_std)
-        self.npci_strength_tau = float(npci_strength_tau)
         self.support_crop_projections = support_crop_projections
         self.support_crop_min_offset = crop_min
 
@@ -802,11 +758,6 @@ class DSQGAttentionV22(nn.Module):
         with torch.no_grad():
             self.scale_embed.sub_(self.scale_embed.mean(0, keepdim=True))
         self.if_gain = nn.Parameter(torch.ones(heads))
-
-
-        raw_theta = _raw_npci_theta_from_effective(NPCI_THETA_INIT)
-        self.npci_theta_k = nn.Parameter(torch.full((heads,), raw_theta))
-        self.npci_theta_v = nn.Parameter(torch.full((heads,), raw_theta))
         self.dropout = nn.Dropout(float(dropout))
 
     @property
@@ -852,8 +803,6 @@ class DSQGAttentionV22(nn.Module):
             "positional_bias": "analytic_log_plus_residual",
             "pos_bias_scale": float(self.pos_bias_scale.detach().cpu()),
             "scale_embed": "centered_fp32_virtual_key",
-            "npci": "retained_magnitude_aware_causal_injection_rotation",
-            "npci_strength_tau": self.npci_strength_tau,
         }
 
     def execution_config(self) -> dict[str, object]:
@@ -932,11 +881,7 @@ class DSQGAttentionV22(nn.Module):
             error_msgs,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        kv_inject: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, dimension = x.shape
         heads, head_dim = self.num_heads, self.head_dim
         query_start = min(self.minimum_offset, seq_len)
@@ -978,38 +923,6 @@ class DSQGAttentionV22(nn.Module):
         query = q_flat.reshape(batch, seq_len, heads, head_dim).permute(0, 2, 1, 3)
         key = k_flat.reshape(batch, seq_len, heads, head_dim).permute(0, 2, 1, 3)
         value = v_flat.reshape(batch, seq_len, heads, head_dim).permute(0, 2, 1, 3)
-        if kv_inject is not None:
-            key_delta, value_delta = kv_inject
-            full_shape = key.shape
-            prefix_shape = (batch, heads, key_end, head_dim)
-            if key_delta.shape == full_shape and value_delta.shape == full_shape:
-                key_delta_live = key_delta[:, :, :key_end]
-                value_delta_live = value_delta[:, :, :key_end]
-            elif key_delta.shape == prefix_shape and value_delta.shape == prefix_shape:
-                key_delta_live = key_delta
-                value_delta_live = value_delta
-            else:
-                raise ValueError(
-                    "kv_inject must contain full [B,H,N,HD] tensors or the "
-                    "exact live source prefix [B,H,N-min_offset,HD]"
-                )
-            rotated_key = npci_rotate(
-                key[:, :, :key_end],
-                key_delta_live,
-                NPCI_THETA_MAX * torch.tanh(self.npci_theta_k),
-                strength_tau=self.npci_strength_tau,
-            )
-            rotated_value = npci_rotate(
-                value[:, :, :key_end],
-                value_delta_live,
-                NPCI_THETA_MAX * torch.tanh(self.npci_theta_v),
-                strength_tau=self.npci_strength_tau,
-            )
-            if key_end == seq_len:
-                key, value = rotated_key, rotated_value
-            else:
-                key = torch.cat((rotated_key, key[:, :, key_end:]), dim=2)
-                value = torch.cat((rotated_value, value[:, :, key_end:]), dim=2)
 
         output = dsqg_attention_v22(
             query,
@@ -1052,8 +965,6 @@ if __name__ == "__main__":
         "pos_bias_residual",
         "scale_embed",
         "if_gain",
-        "npci_theta_k",
-        "npci_theta_v",
         "qkvg_proj.weight",
         "qkvg_proj.bias",
         "out_proj.weight",
