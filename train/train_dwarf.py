@@ -3,7 +3,7 @@
 
 This reference implementation contains the active DWARF topology only:
 triadic DSQG sparse blocks, a causal EMA interference injection at L2, and one
-L3 global mixer.  The global mixer can be strict-causal V16 HISA or full causal
+L3 global mixer.  The global mixer can be strict-causal V19 HISA or full causal
 SDPA (`--global-mixer fa`), which is the topology used by DWARF-55M-Base.
 
 The trainer accepts packed token rows and includes the validated Muon+AdamW,
@@ -42,7 +42,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_FILES = (
     "causal_ema_scan.py",
     "dsqg_attention_v22.py",
-    "hierarchical_sparse_attn_v18_hisa.py",
+    "hierarchical_sparse_attn_v19_hisa.py",
 )
 KERNEL_DIR = next(
     (
@@ -70,37 +70,18 @@ from dsqg_attention_v22 import (  # noqa: E402
     ALL_OFFSETS,
     DSQGAttentionV22,
 )
-from hierarchical_sparse_attn_v18_hisa import (  # noqa: E402
-    HierarchicalSparseAttentionV16HISACausal,
+from hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
+    HierarchicalSparseAttentionV19HISACausal,
 )
 
-EXPECTED_PARAMETERS = 55_330_326
-EXPECTED_TRAINABLE_PARAMETERS = 55_330_326
+EXPECTED_PARAMETERS = 55_428_647
+EXPECTED_TRAINABLE_PARAMETERS = 55_428_647
 EXPECTED_STATE_FINGERPRINT = (
-    "151b7e812ec64650a503d8c30680e2223fea3646306a6470c26aab86baea70cc"
+    "11253670a9e5e65f60facd3992748792f3f0f09921c77fea305090580505cb51"
 )
 EXPECTED_SEEDED_RNG_FINGERPRINT = (
-    "8f5c48b93d039bfc2141c62d989638b4aa072d508a8b29b2ab2cddcd22adf449"
+    "a54450c44a9ad79c357762a980144091bca4a1c36401bff0ebaaf2fa3f40ce3b"
 )
-LEGACY_V1_PARAMETERS = 55_330_470
-LEGACY_V1_TRAINABLE_PARAMETERS = 55_330_470
-LEGACY_V1_SOURCE_MANIFEST = {
-    "train_dwarf.py": "8986368db370d5fff9ab8c2a945927d6f537cac37173e729dbbc9f98ea06b7f0",
-    "causal_ema_scan.py": "2bc12a9115b0f67d46d5dabd75f9d03e1b87f94aaf41bf83765476a4ceb1c518",
-    "dsqg_attention_v22.py": "64e967853cc0e894aff2cfd64bdab1344fd71ae6fb9c2741f253c07cdbaa8779",
-    "hierarchical_sparse_attn_v18_hisa.py": "443d9d4cdfad0b76323c2a62007770fbc7da94cbbabc5999489ca7ea880755a2",
-}
-HISA_POLICY_CONFIG_FIELDS = (
-    "hisa_backend",
-    "hisa_token_selection_mode",
-    "hisa_local_backend",
-    "hisa_triton_block_q",
-    "hisa_backward_impl",
-    "hisa_collect_routing_diagnostics",
-    "hisa_diagnostic_max_queries",
-)
-
-
 @dataclass(frozen=True)
 class TrainRecipe:
     learning_rate: float = 3.0e-4
@@ -255,8 +236,8 @@ def source_manifest() -> dict[str, str]:
         Path(__file__).name: Path(__file__).resolve(),
         "causal_ema_scan.py": Path(sys.modules["causal_ema_scan"].__file__).resolve(),
         "dsqg_attention_v22.py": Path(sys.modules["dsqg_attention_v22"].__file__).resolve(),
-        "hierarchical_sparse_attn_v18_hisa.py": Path(
-            sys.modules["hierarchical_sparse_attn_v18_hisa"].__file__
+        "hierarchical_sparse_attn_v19_hisa.py": Path(
+            sys.modules["hierarchical_sparse_attn_v19_hisa"].__file__
         ).resolve(),
     }
     return {name: _sha256(path) for name, path in locations.items()}
@@ -395,7 +376,7 @@ class GlobalMixerBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(config.embedding_dim)
         self.norm2 = RMSNorm(config.embedding_dim)
-        self.attn = HierarchicalSparseAttentionV16HISACausal(
+        self.attn = HierarchicalSparseAttentionV19HISACausal(
             D=config.embedding_dim,
             H=config.num_heads,
             hd=config.embedding_dim // config.num_heads,
@@ -486,7 +467,7 @@ class DwarfForCausalLM(nn.Module):
                     )
                     with torch.no_grad():
                         module.scale_embed.sub_(module.scale_embed.mean(0, keepdim=True))
-                elif isinstance(module, HierarchicalSparseAttentionV16HISACausal):
+                elif isinstance(module, HierarchicalSparseAttentionV19HISACausal):
                     module.reset_global_adapters_()
                 elif isinstance(module, InterferencePacket):
                     with torch.no_grad():
@@ -496,7 +477,7 @@ class DwarfForCausalLM(nn.Module):
 
     def prepare_runtime(self, device: torch.device | str) -> None:
         for module in self.modules():
-            if isinstance(module, HierarchicalSparseAttentionV16HISACausal):
+            if isinstance(module, HierarchicalSparseAttentionV19HISACausal):
                 module.prepare_runtime(device, self.config.model_length)
 
     def forward_hidden(
@@ -547,7 +528,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
         "topology": {
             "layers": "DSQG,DSQG,DSQG,HISA,DSQG,DSQG,DSQG,DSQG,DSQG,DSQG",
             "dsqg": "v22-online-sparse",
-            "hisa": "v18-strict-causal",
+            "hisa": "v19-strict-causal",
             "offset_groups": model.offset_groups,
         },
         "hisa": {
@@ -596,8 +577,16 @@ def make_parameter_groups(
             special["positional"].extend(
                 (module.pos_bias_log_slope, module.pos_bias_residual)
             )
-        elif isinstance(module, HierarchicalSparseAttentionV16HISACausal):
-            special["route"].append(module.route_prior_raw)
+        elif isinstance(module, HierarchicalSparseAttentionV19HISACausal):
+            special["route"].extend(
+                (
+                    module.route_prior_raw,
+                    module.representative_mix_raw,
+                    module.global_lane_logit_bias,
+                )
+            )
+            if module.binding_gain_raw is not None:
+                special["route"].append(module.binding_gain_raw)
             special["npci"].extend((module.npci_theta_k, module.npci_theta_v))
         elif isinstance(module, InterferencePacket):
             special["ema"].extend((module.ema_raw, module.mix_logits))
@@ -674,223 +663,6 @@ def make_parameter_groups(
     }:
         raise RuntimeError("optimizer partition is incomplete or overlapping")
     return {"muon": muon_groups, "adamw": adam_groups}
-
-
-def _legacy_dsqg_npci_model_keys(model: DwarfForCausalLM) -> set[str]:
-    return {
-        f"blocks.{index}.attn.{suffix}"
-        for index, block in enumerate(model.blocks)
-        if isinstance(block, DSQGBlock)
-        for suffix in ("npci_theta_k", "npci_theta_v")
-    }
-
-
-def migrate_legacy_dsqg_npci_model_state(
-    saved_model: dict[str, Any],
-    model: DwarfForCausalLM,
-) -> tuple[dict[str, Any], set[str]]:
-    """Remove exactly the unreachable per-DSQG NPCI tensors from public v1 state."""
-    if not isinstance(saved_model, dict):
-        raise ValueError("legacy checkpoint model state is invalid")
-    expected = model.state_dict()
-    expected_keys = set(expected)
-    legacy_keys = _legacy_dsqg_npci_model_keys(model)
-    missing = expected_keys - set(saved_model)
-    extra = set(saved_model) - expected_keys
-    if missing or extra != legacy_keys:
-        raise ValueError(
-            "legacy checkpoint model keys do not match the exact DSQG-NPCI v1 schema"
-        )
-    for name in sorted(legacy_keys):
-        value = saved_model[name]
-        if (
-            not torch.is_tensor(value)
-            or value.shape != (model.config.num_heads,)
-            or not value.is_floating_point()
-            or not torch.isfinite(value).all()
-        ):
-            raise ValueError(f"legacy DSQG NPCI tensor is invalid: {name}")
-    migrated = dict(saved_model)
-    for name in legacy_keys:
-        del migrated[name]
-    return migrated, legacy_keys
-
-
-def migrate_legacy_dsqg_npci_optimizer_state(
-    saved_optimizer: dict[str, Any],
-    *,
-    dsqg_blocks_before_global: int,
-    total_dsqg_blocks: int,
-) -> dict[str, Any]:
-    """Drop the exact v1 DSQG NPCI Adam states while preserving global HISA NPCI."""
-    if not isinstance(saved_optimizer, dict) or saved_optimizer.get("kind") != (
-        "dwarf-muon-adamw-v1"
-    ):
-        raise ValueError("legacy checkpoint optimizer kind does not match")
-    saved_items = saved_optimizer.get("optimizers")
-    if not isinstance(saved_items, list):
-        raise ValueError("legacy checkpoint optimizer list is invalid")
-
-    migrated_items: list[dict[str, Any]] = []
-    adamw_state: dict[str, Any] | None = None
-    for item in saved_items:
-        if not isinstance(item, dict) or not isinstance(item.get("state"), dict):
-            raise ValueError("legacy checkpoint optimizer item is invalid")
-        raw_state = item["state"]
-        raw_groups = raw_state.get("param_groups")
-        raw_slots = raw_state.get("state")
-        if not isinstance(raw_groups, list) or not isinstance(raw_slots, dict):
-            raise ValueError("legacy checkpoint optimizer payload is invalid")
-        copied_state = {
-            **raw_state,
-            "state": dict(raw_slots),
-            "param_groups": [
-                {**group, "params": list(group.get("params", []))}
-                if isinstance(group, dict)
-                else group
-                for group in raw_groups
-            ],
-        }
-        copied_item = {**item, "state": copied_state}
-        migrated_items.append(copied_item)
-        if item.get("name") == "adamw":
-            if adamw_state is not None:
-                raise ValueError("legacy checkpoint has duplicate AdamW optimizers")
-            adamw_state = copied_state
-    if adamw_state is None:
-        raise ValueError("legacy checkpoint is missing the AdamW optimizer")
-
-    flattened_ids: list[int] = []
-    for group in adamw_state["param_groups"]:
-        if not isinstance(group, dict) or not isinstance(group.get("params"), list):
-            raise ValueError("legacy AdamW parameter group is invalid")
-        flattened_ids.extend(group["params"])
-    if not all(isinstance(parameter_id, int) for parameter_id in flattened_ids) or (
-        flattened_ids != list(range(len(flattened_ids)))
-    ):
-        raise ValueError("legacy AdamW parameter IDs are not in canonical contiguous order")
-
-    npci_groups = [
-        group
-        for group in adamw_state["param_groups"]
-        if isinstance(group, dict) and group.get("name") == "adam_npci"
-    ]
-    if len(npci_groups) != 1:
-        raise ValueError("legacy checkpoint must contain one Adam NPCI group")
-    npci_group = npci_groups[0]
-    old_ids = npci_group["params"]
-    expected_count = 2 * (total_dsqg_blocks + 1)
-    if len(old_ids) != expected_count or len(set(old_ids)) != expected_count:
-        raise ValueError("legacy Adam NPCI parameter count does not match")
-    if not all(isinstance(parameter_id, int) for parameter_id in old_ids) or old_ids != list(
-        range(old_ids[0], old_ids[0] + expected_count)
-    ):
-        raise ValueError("legacy Adam NPCI parameter IDs are not in canonical contiguous order")
-    keep_start = 2 * dsqg_blocks_before_global
-    keep_ids = old_ids[keep_start : keep_start + 2]
-    removed_ids = set(old_ids) - set(keep_ids)
-    for group in adamw_state["param_groups"]:
-        if group is npci_group or not isinstance(group, dict):
-            continue
-        if removed_ids.intersection(group.get("params", [])):
-            raise ValueError("legacy DSQG NPCI parameter appears in multiple groups")
-    npci_group["params"] = keep_ids
-    for parameter_id in removed_ids:
-        adamw_state["state"].pop(parameter_id, None)
-    return {
-        **saved_optimizer,
-        "kind": "dwarf-muon-adamw-v2",
-        "optimizers": migrated_items,
-    }
-
-
-def _legacy_v1_architecture(current: dict[str, Any]) -> dict[str, Any]:
-    expected_policy = {
-        "hisa_backend": "triton",
-        "hisa_token_selection_mode": "auto",
-        "hisa_local_backend": "flex",
-        "hisa_triton_block_q": 16,
-        "hisa_backward_impl": "atomic_masked",
-        "hisa_collect_routing_diagnostics": False,
-        "hisa_diagnostic_max_queries": 8,
-    }
-    config = copy.deepcopy(current["config"])
-    observed_policy = {name: config.pop(name) for name in HISA_POLICY_CONFIG_FIELDS}
-    if observed_policy != expected_policy:
-        raise ValueError("legacy v1 migration requires the canonical explicit HISA policy")
-    return {
-        "format": "dwarf-55m-v1",
-        "config": config,
-        "parameters": LEGACY_V1_PARAMETERS,
-        "trainable_parameters": LEGACY_V1_TRAINABLE_PARAMETERS,
-        "topology": copy.deepcopy(current["topology"]),
-        "sources": dict(LEGACY_V1_SOURCE_MANIFEST),
-    }
-
-
-def migrate_legacy_checkpoint_payload(
-    checkpoint: dict[str, Any],
-    *,
-    model: DwarfForCausalLM,
-    architecture: dict[str, Any],
-) -> dict[str, Any]:
-    """Migrate only the hash-pinned public v1 schema into canonical v2."""
-    if checkpoint.get("kind") != "dwarf-55m-resume-v1":
-        raise ValueError("not a public v1 DWARF resumable checkpoint")
-    if checkpoint.get("architecture") != _legacy_v1_architecture(architecture):
-        raise ValueError("legacy checkpoint architecture or source manifest does not match")
-    migrated_model, removed_keys = migrate_legacy_dsqg_npci_model_state(
-        checkpoint.get("model"), model
-    )
-    global_index = next(
-        index
-        for index, block in enumerate(model.blocks)
-        if isinstance(block, GlobalMixerBlock)
-    )
-    dsqg_before = sum(
-        isinstance(block, DSQGBlock) for block in model.blocks[:global_index]
-    )
-    total_dsqg = sum(isinstance(block, DSQGBlock) for block in model.blocks)
-    migrated_optimizer = migrate_legacy_dsqg_npci_optimizer_state(
-        checkpoint.get("optimizer"),
-        dsqg_blocks_before_global=dsqg_before,
-        total_dsqg_blocks=total_dsqg,
-    )
-    receipt = {
-        "kind": "public-v1-dsqg-npci-to-v2",
-        "removed_model_keys": sorted(removed_keys),
-        "hisa_policy": copy.deepcopy(architecture["hisa"]),
-        "legacy_sources": dict(LEGACY_V1_SOURCE_MANIFEST),
-    }
-    validate_checkpoint_migration_receipt(
-        receipt,
-        model=model,
-        architecture=architecture,
-    )
-    return {
-        **checkpoint,
-        "kind": "dwarf-55m-resume-v2",
-        "model": migrated_model,
-        "optimizer": migrated_optimizer,
-        "architecture": architecture,
-        "migration": receipt,
-    }
-
-
-def validate_checkpoint_migration_receipt(
-    receipt: dict[str, Any],
-    *,
-    model: DwarfForCausalLM,
-    architecture: dict[str, Any],
-) -> None:
-    expected = {
-        "kind": "public-v1-dsqg-npci-to-v2",
-        "removed_model_keys": sorted(_legacy_dsqg_npci_model_keys(model)),
-        "hisa_policy": copy.deepcopy(architecture["hisa"]),
-        "legacy_sources": dict(LEGACY_V1_SOURCE_MANIFEST),
-    }
-    if receipt != expected:
-        raise ValueError("checkpoint migration receipt does not match")
 
 
 class MultiOptimizer:
@@ -1324,15 +1096,6 @@ def checkpoint_payload(
     architecture: dict[str, Any],
     dataset: dict[str, Any],
 ) -> dict[str, Any]:
-    migration = getattr(model, "_checkpoint_migration_receipt", None)
-    if migration is not None:
-        if not isinstance(migration, dict):
-            raise ValueError("checkpoint migration receipt is invalid")
-        validate_checkpoint_migration_receipt(
-            migration,
-            model=model,
-            architecture=architecture,
-        )
     payload = {
         "kind": "dwarf-55m-resume-v2",
         "step": step,
@@ -1344,7 +1107,6 @@ def checkpoint_payload(
         "python_rng": random.getstate(),
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all(),
-        "migration": copy.deepcopy(migration),
     }
     return payload
 
@@ -1356,22 +1118,11 @@ def restore_checkpoint(
     optimizer: MultiOptimizer,
     architecture: dict[str, Any],
     dataset: dict[str, Any],
-    migrate_legacy_v1: bool = False,
 ) -> int:
     checkpoint = torch.load(Path(path), map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise ValueError("not a 55M DWARF resumable checkpoint")
-    if checkpoint.get("kind") == "dwarf-55m-resume-v1":
-        if not migrate_legacy_v1:
-            raise ValueError(
-                "public v1 checkpoint requires --migrate-legacy-v1-default-hisa-policy"
-            )
-        checkpoint = migrate_legacy_checkpoint_payload(
-            checkpoint,
-            model=model,
-            architecture=architecture,
-        )
-    elif checkpoint.get("kind") != "dwarf-55m-resume-v2":
+    if checkpoint.get("kind") != "dwarf-55m-resume-v2":
         raise ValueError("not a 55M DWARF resumable checkpoint")
     if checkpoint.get("architecture") != architecture:
         raise ValueError("checkpoint architecture or source manifest does not match")
@@ -1399,20 +1150,6 @@ def restore_checkpoint(
         raise ValueError("checkpoint CPU RNG state is invalid")
     if not isinstance(checkpoint.get("optimizer"), dict):
         raise ValueError("checkpoint optimizer state is invalid")
-    if "migration" not in checkpoint:
-        raise ValueError("checkpoint migration receipt is missing")
-    migration = checkpoint["migration"]
-    if migration is not None:
-        if not isinstance(migration, dict):
-            raise ValueError("checkpoint migration receipt is invalid")
-        validate_checkpoint_migration_receipt(
-            migration,
-            model=model,
-            architecture=architecture,
-        )
-        model._checkpoint_migration_receipt = copy.deepcopy(migration)
-    elif hasattr(model, "_checkpoint_migration_receipt"):
-        delattr(model, "_checkpoint_migration_receipt")
     model.load_state_dict(saved_model, strict=True)
     optimizer.load_state_dict(
         checkpoint["optimizer"],
@@ -1482,7 +1219,6 @@ def train(args: argparse.Namespace) -> None:
                 optimizer=optimizer,
                 architecture=architecture,
                 dataset=identity,
-                migrate_legacy_v1=args.migrate_legacy_v1_default_hisa_policy,
             )
         if start_step >= stop_step:
             raise ValueError("checkpoint is already at or beyond --stop-after")
@@ -1577,7 +1313,7 @@ def train(args: argparse.Namespace) -> None:
                     "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
                 }
                 for module in model.modules():
-                    if isinstance(module, HierarchicalSparseAttentionV16HISACausal):
+                    if isinstance(module, HierarchicalSparseAttentionV19HISACausal):
                         event.update(
                             {
                                 f"hisa_{key}": float(value)
@@ -1690,14 +1426,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-sha256")
     parser.add_argument("--trust-dataset-sha256", action="store_true")
     parser.add_argument("--resume")
-    parser.add_argument(
-        "--migrate-legacy-v1-default-hisa-policy",
-        action="store_true",
-        help=(
-            "explicitly migrate the hash-pinned public v1 DSQG-NPCI schema and "
-            "assert its unreceipted HISA policy was triton/auto/flex/16/atomic_masked"
-        ),
-    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--stop-after", type=int)
     parser.add_argument("--save-every", type=int, default=0)
@@ -1707,8 +1435,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dataset and --output-dir are required for training")
     if args.trust_dataset_sha256 and not args.dataset_sha256:
         parser.error("--trust-dataset-sha256 requires --dataset-sha256")
-    if args.migrate_legacy_v1_default_hisa_policy and not args.resume:
-        parser.error("legacy v1 migration requires --resume")
     return args
 
 

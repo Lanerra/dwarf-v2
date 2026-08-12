@@ -12,7 +12,7 @@ The public tree intentionally contains only the runtime source needed to constru
 
 - Nine triadic DSQG blocks use disjoint thirds of the canonical offset lattice, centered FP32 virtual-key scale embeddings, and one online sparse-softmax traversal over each retained causal offset.
 - A causal-EMA interference packet constructed at the L3 boundary and injected only into the global mixer's K/V streams.
-- One strict-causal V18 HISA global mixer at L3. Per-DSQG NPCI state is not part of the public architecture.
+- One strict-causal V19 HISA global mixer at L3. Per-DSQG NPCI state is not part of the public architecture.
 
 The HISA kernel uses a 64-token local lane, 16-token selector tiles, blocked bounded-memory metadata construction, the Triton global backend, and the masked atomic backward path with `BLOCK_Q=16`. Token selection is `auto`, local attention is `flex`, and routing diagnostics are disabled. These values are explicit `DwarfConfig` fields, are passed directly to HISA rather than resolved from environment variables, and are serialized with HISA semantic/execution metadata in every resumable checkpoint.
 
@@ -66,9 +66,9 @@ python train/train_dwarf.py \
   --resume runs/dwarf-public/dwarf_step_0001164.pt
 ```
 
-The trainer saves at warmup completion, 25%, 50%, 75%, and final. `--save-every N` adds an interval, and bounded runs always save their stopping step. Schema-v2 checkpoints are atomically replaced and contain model, optimizer, recipe/configuration, resolved HISA policy, source hashes, RNG, dataset identity, and an explicit native-or-migrated lineage receipt required for fail-closed resume.
+The trainer saves at warmup completion, 25%, 50%, 75%, and final. `--save-every N` adds an interval, and bounded runs always save their stopping step. Schema-v2 checkpoints are atomically replaced and contain model, optimizer, recipe/configuration, resolved V19 HISA policy, source hashes, RNG, and dataset identity. Resume fails closed unless that complete native contract matches.
 
-The immediately preceding public v1 schema contained 18 unreachable per-DSQG NPCI tensors. Those exact hash-pinned checkpoints can be migrated only by adding `--migrate-legacy-v1-default-hisa-policy` to the resume command. The flag explicitly asserts that the unreceipted v1 HISA execution policy was the canonical `triton/auto/flex/BLOCK_Q=16/atomic_masked` policy. Any other source manifest, model-key set, optimizer layout, policy, scheduled LR, or lineage receipt still fails closed. Migrated checkpoints retain the exact migration receipt in subsequent saves.
+Pre-V19 checkpoints are not migrated into the canonical architecture. V1/V18 checkpoint kinds, source manifests, model state, and optimizer layouts are rejected rather than relabeled or partially converted.
 
 Run `python train/train_dwarf.py --self-test` before training to verify the canonical parameter count, seeded state fingerprint, HISA policy, optimizer partition, and public kernel contracts.
 
