@@ -157,6 +157,8 @@ class DwarfConfig:
     init_seed: int = 42
 
     def __post_init__(self) -> None:
+        if len(self.ema_timescales) != 3:
+            raise ValueError("DWARF requires exactly three EMA timescales")
         if self.embedding_dim % self.num_heads:
             raise ValueError("embedding_dim must be divisible by num_heads")
         if self.num_layers < 4:
@@ -371,18 +373,9 @@ class InterferencePacket(nn.Module):
     def ema_factors(self) -> torch.Tensor:
         return bounded_ema_factor(self.ema_raw)
 
-    def forward(
-        self,
-        normalized: torch.Tensor,
-        reset_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, normalized: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scan_input = normalized.to(torch.bfloat16) if normalized.is_cuda else normalized
-        scans = causal_ema_scan3(
-            scan_input,
-            self.ema_factors,
-            reset_mask=reset_mask,
-            lagged=True,
-        )
+        scans = causal_ema_scan3(scan_input, self.ema_factors)
         batch, seq_len, _ = normalized.shape
         stacked = scans.reshape(
             batch,
@@ -501,17 +494,12 @@ class GlobalMixerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        ema_reset_mask: torch.Tensor | None = None,
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = self.norm1(x)
-        kv_inject = (
-            self.packet(normalized, ema_reset_mask)
-            if self.packet is not None
-            else None
-        )
+        kv_inject = self.packet(normalized) if self.packet is not None else None
         attended, auxiliary = self.attn(
             normalized,
             kv_inject=kv_inject,
@@ -598,7 +586,6 @@ class DwarfForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         *,
-        ema_reset_mask: torch.Tensor | None = None,
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
@@ -613,7 +600,6 @@ class DwarfForCausalLM(nn.Module):
             if isinstance(block, GlobalMixerBlock):
                 x, block_auxiliary = block(
                     x,
-                    ema_reset_mask,
                     valid_lengths,
                     route_aux_tile_ids,
                     collect_diagnostics,
@@ -630,7 +616,6 @@ class DwarfForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         *,
-        ema_reset_mask: torch.Tensor | None = None,
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
@@ -639,7 +624,6 @@ class DwarfForCausalLM(nn.Module):
     ):
         hidden, auxiliary = self.forward_hidden(
             input_ids,
-            ema_reset_mask=ema_reset_mask,
             valid_lengths=valid_lengths,
             route_aux_tile_ids=route_aux_tile_ids,
             collect_diagnostics=collect_diagnostics,
@@ -1397,7 +1381,6 @@ class _TrainingForwardCallable(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(
             input_ids,
-            ema_reset_mask=None,
             valid_lengths=None,
             route_aux_tile_ids=route_aux_tile_ids,
             collect_diagnostics=self.diagnostics,
