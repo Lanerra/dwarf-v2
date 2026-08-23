@@ -10,6 +10,7 @@ __all__ = (
     "bounded_ema_factor",
     "causal_ema_scan3",
     "inverse_bounded_ema_factor",
+    "causal_ema_triton_available",
 )
 
 try:
@@ -17,7 +18,7 @@ try:
     import triton.language as tl
 
     _TRITON_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional on CPU
+except Exception:  # pragma: no cover - optional on CPU
     triton = None
     tl = None
     _TRITON_AVAILABLE = False
@@ -25,6 +26,11 @@ except ImportError:  # pragma: no cover - optional on CPU
 EMA_FLOOR = 1e-5
 EMA_CEILING = 0.5
 BLOCK_D = 64
+
+
+def causal_ema_triton_available() -> bool:
+    """Return whether the production Triton EMA backend is importable."""
+    return bool(_TRITON_AVAILABLE)
 
 
 def bounded_ema_factor(raw: torch.Tensor) -> torch.Tensor:
@@ -282,6 +288,15 @@ def causal_ema_scan3(
         raise ValueError(f"x must be [B,N,D], got {tuple(x.shape)}")
     if ema_factors.ndim != 1 or ema_factors.numel() != 3:
         raise ValueError("ema_factors must be a one-dimensional tensor of length 3")
-    if not x.is_cuda or not _TRITON_AVAILABLE:
+    if ema_factors.device != x.device:
+        raise ValueError("x and ema_factors must be on the same device")
+    if not x.is_cuda:
         return _reference(x, ema_factors)
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError(
+            "CUDA causal EMA execution requires Triton; the serial Python "
+            "reference is CPU-only"
+        )
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("CUDA causal EMA expects FP16, BF16, or FP32 input")
     return _CausalEMA3Fn.apply(x, ema_factors)
