@@ -12,7 +12,7 @@ try:
     import triton
     import triton.language as tl
     _TRITON_AVAILABLE = True
-except ImportError:
+except Exception:
     _TRITON_AVAILABLE = False
 
     class _KernelStub:
@@ -56,6 +56,12 @@ except ImportError:
 
     triton = _TritonStub()
     tl = _TLStub()
+
+
+def dsqg_triton_available() -> bool:
+    """Return whether the production Triton DSQG backend is importable."""
+    return bool(_TRITON_AVAILABLE)
+
 
 _LOG2E = tl.constexpr(1.4426950408889634)
 
@@ -136,6 +142,7 @@ def _canonicalize_offsets(
 @triton.jit
 def _fwd_v23_online(
     Q, K, V, POS_BIAS, SCALE_EMBED, NULL_KEY, NULL_BIAS, OUT, LSE, OFFSETS,
+    LOG_VALID_COUNT,
     stride_qb, stride_qh, stride_qn, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
@@ -173,14 +180,11 @@ def _fwd_v23_online(
         NULL_KEY + head * stride_nkh + dims * stride_nkd,
         mask=dmask, other=0.0,
     ).to(tl.float32)
-    valid_count = tl.zeros([BLOCK_N], tl.float32)
-    for logical_index in range(J_VAL):
-        count_delta = tl.load(OFFSETS + logical_index).to(tl.int32)
-        count_source = positions - count_delta
-        valid_count += (qmask & (count_source >= 0) & (count_source < N)).to(tl.float32)
     null_score = tl.sum(query * null_key[None, :], axis=1) * scale
-    # Calibrate the null score against the number of valid offsets.
-    null_score += tl.log(tl.maximum(valid_count, 1.0))
+    # Calibrate the null score against the number of valid offsets. The
+    # position-only term is precomputed once per module instead of traversing
+    # every offset a second time in each forward kernel.
+    null_score += tl.load(LOG_VALID_COUNT + positions, mask=qmask, other=0.0)
     null_score += tl.load(NULL_BIAS + head)
     running_max = tl.where(qmask, null_score, float('-inf'))
     running_sum = tl.where(qmask, 1.0, 0.0)
@@ -249,7 +253,7 @@ def _fwd_v23_online(
 @triton.jit
 def _bwd_dq_v23(
     Q, K, V, POS_BIAS, SCALE_EMBED, NULL_KEY, NULL_BIAS, DO, LSE, DELTA,
-    DQ, DNULL_KEY, DNULL_BIAS, OFFSETS,
+    DQ, DNULL_KEY, DNULL_BIAS, OFFSETS, LOG_VALID_COUNT,
     stride_qb, stride_qh, stride_qn, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
@@ -296,13 +300,8 @@ def _bwd_dq_v23(
         NULL_KEY + head * stride_nkh + dims * stride_nkd,
         mask=dmask, other=0.0,
     ).to(tl.float32)
-    valid_count = tl.zeros([BLOCK_N], tl.float32)
-    for logical_index in range(J_VAL):
-        count_delta = tl.load(OFFSETS + logical_index).to(tl.int32)
-        count_source = positions - count_delta
-        valid_count += (qmask & (count_source >= 0) & (count_source < N)).to(tl.float32)
     null_score = tl.sum(query * null_key[None, :], axis=1) * scale
-    null_score += tl.log(tl.maximum(valid_count, 1.0))
+    null_score += tl.load(LOG_VALID_COUNT + positions, mask=qmask, other=0.0)
     null_score += tl.load(NULL_BIAS + head)
     null_probability = tl.where(
         qmask & (lse > float('-inf')),
@@ -361,6 +360,8 @@ def _bwd_dq_v23(
         DELTA + batch * stride_db + head * stride_dh + positions * stride_dn,
         delta_row, mask=qmask,
     )
+    # DQ has the BF16 Triton-input dtype. This is the single final rounding at
+    # the custom-autograd boundary; all accumulation above remains FP32.
     tl.store(
         DQ + batch * stride_dqb + head * stride_dqh
         + positions[:, None] * stride_dqn + dims[None, :] * stride_dqd,
@@ -371,7 +372,7 @@ def _bwd_dq_v23(
     configs=_DSQG_AUTOTUNE_CONFIGS,
     key=[
         "BATCH", "H", "N", "HD", "J_VAL", "KV_HEAD_GROUP_SIZE",
-        "SOURCE_END",
+        "QUERY_START", "SOURCE_END",
     ],
     reset_to_zero=["DK", "DV", "DPOS_BIAS", "DSCALE_EMBED"],
     cache_results=True,
@@ -393,7 +394,7 @@ def _bwd_dkdv_v23(
     BATCH: tl.constexpr, H: tl.constexpr, N, HD: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
     J_VAL: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
-    SOURCE_END: tl.constexpr,
+    QUERY_START: tl.constexpr, SOURCE_END: tl.constexpr,
 ):
     bhkv = tl.program_id(0)
     block = tl.program_id(1)
@@ -425,7 +426,7 @@ def _bwd_dkdv_v23(
         for logical_index in range(J_VAL):
             offset = tl.load(OFFSETS + logical_index).to(tl.int32)
             positions = source + offset
-            valid = smask & (positions < N)
+            valid = smask & (positions >= QUERY_START) & (positions < N)
             query = tl.load(
                 Q + batch * stride_qb + head * stride_qh
                 + positions[:, None] * stride_qn + dims[None, :] * stride_qd,
@@ -471,6 +472,8 @@ def _bwd_dkdv_v23(
                 dscale, mask=dmask, sem="relaxed",
             )
 
+    # DK/DV have the BF16 Triton-input dtype. The grouped reductions above
+    # accumulate in FP32 before these final stores.
     tl.store(
         DK + batch * stride_dkb + kv_head * stride_dkh
         + source[:, None] * stride_dkn + dims[None, :] * stride_dkd,
@@ -493,6 +496,7 @@ class _DSQGV23Fn(torch.autograd.Function):
         scale_embed,
         null_key,
         null_bias,
+        log_valid_count,
         j_val,
         offsets_dev,
         query_start,
@@ -522,6 +526,8 @@ class _DSQGV23Fn(torch.autograd.Function):
             raise ValueError(f"null_key must have shape {(heads, head_dim)}")
         if null_bias.shape != (heads,):
             raise ValueError(f"null_bias must have shape {(heads,)}")
+        if log_valid_count.ndim != 1 or log_valid_count.numel() < seq_len:
+            raise ValueError("log_valid_count must cover every query position")
 
         query_start = max(0, min(int(query_start), seq_len))
         source_end = seq_len if source_end is None else int(source_end)
@@ -531,6 +537,7 @@ class _DSQGV23Fn(torch.autograd.Function):
         scale_embed = scale_embed.contiguous()
         null_key = null_key.contiguous()
         null_bias = null_bias.contiguous()
+        log_valid_count = log_valid_count[:seq_len].float().contiguous()
         offsets_dev = offsets_dev.contiguous()
 
         block_hd = _next_pow2(head_dim)
@@ -546,7 +553,7 @@ class _DSQGV23Fn(torch.autograd.Function):
             )
             _fwd_v23_online[grid](
                 q, k, v, pos_bias, scale_embed, null_key, null_bias,
-                output, lse, offsets_dev,
+                output, lse, offsets_dev, log_valid_count,
                 *q.stride(), *k.stride(), *v.stride(), *output.stride(), *lse.stride(),
                 *pos_bias.stride(), *scale_embed.stride(), *null_key.stride(),
                 BATCH=batch, H=heads, N=seq_len, HD=head_dim,
@@ -555,7 +562,8 @@ class _DSQGV23Fn(torch.autograd.Function):
             )
 
         ctx.save_for_backward(
-            q, k, v, pos_bias, scale_embed, null_key, null_bias, lse, offsets_dev
+            q, k, v, pos_bias, scale_embed, null_key, null_bias, lse, offsets_dev,
+            log_valid_count,
         )
         ctx.block_hd = block_hd
         ctx.j_val = int(j_val)
@@ -567,9 +575,10 @@ class _DSQGV23Fn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        q, k, v, pos_bias, scale_embed, null_key, null_bias, lse, offsets_dev = (
-            ctx.saved_tensors
-        )
+        (
+            q, k, v, pos_bias, scale_embed, null_key, null_bias, lse, offsets_dev,
+            log_valid_count,
+        ) = ctx.saved_tensors
         batch, heads, seq_len, head_dim = q.shape
         block_hd = ctx.block_hd
         dout = dout.contiguous()
@@ -598,6 +607,7 @@ class _DSQGV23Fn(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
             return gradients[:ctx.input_count]
 
@@ -609,6 +619,7 @@ class _DSQGV23Fn(torch.autograd.Function):
             _bwd_dq_v23[query_grid](
                 q, k, v, pos_bias, scale_embed, null_key, null_bias,
                 dout, lse, delta, dq, dnull_key, dnull_bias, offsets_dev,
+                log_valid_count,
                 *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
                 *lse.stride(), *delta.stride(), *dq.stride(),
                 *pos_bias.stride(), *scale_embed.stride(), *null_key.stride(),
@@ -634,6 +645,7 @@ class _DSQGV23Fn(torch.autograd.Function):
                 BATCH=batch, H=heads, N=seq_len, HD=head_dim,
                 BLOCK_HD=block_hd, J_VAL=ctx.j_val,
                 KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
+                QUERY_START=ctx.query_start,
                 SOURCE_END=ctx.source_end,
             )
 
@@ -645,6 +657,7 @@ class _DSQGV23Fn(torch.autograd.Function):
             dscale_embed,
             dnull_key.to(null_key.dtype),
             dnull_bias.to(null_bias.dtype),
+            None,
             None,
             None,
             None,
@@ -662,6 +675,7 @@ def _eager_dsqg_attention(
     null_key: torch.Tensor,
     null_bias: torch.Tensor,
     offsets: list[int] | tuple[int, ...] | torch.Tensor,
+    log_valid_count: torch.Tensor | None = None,
     *,
     query_start: int = 0,
 ) -> torch.Tensor:
@@ -713,14 +727,20 @@ def _eager_dsqg_attention(
         valid_columns.append(valid)
 
     # The zero-valued null source lets attention abstain from retrieval.
-    valid_count = torch.stack(valid_columns, dim=-1).sum(-1).clamp_min(1)
+    if log_valid_count is None:
+        valid_count = torch.stack(valid_columns, dim=-1).sum(-1).clamp_min(1)
+        log_count = valid_count.float().log()
+    else:
+        if log_valid_count.ndim != 1 or log_valid_count.numel() < seq_len:
+            raise ValueError("log_valid_count must cover every query position")
+        log_count = log_valid_count[:seq_len].to(device=q.device, dtype=torch.float32)
     null_score = (
         q.float() * null_key.float().reshape(1, query_heads, 1, head_dim)
     ).sum(-1) * scale
     null_score = (
         null_score
         + null_bias.float().reshape(1, query_heads, 1)
-        + valid_count.float().log().reshape(1, 1, seq_len)
+        + log_count.reshape(1, 1, seq_len)
     )
     score_columns.append(null_score)
     value_columns.append(torch.zeros_like(value_expanded.float()))
@@ -748,25 +768,41 @@ def _dsqg_attention_v23_dispatch(
     null_key: torch.Tensor,
     null_bias: torch.Tensor,
     offsets_dev: torch.Tensor,
+    log_valid_count: torch.Tensor,
     query_start: int = 0,
     *,
     source_end: int | None = None,
     backend: str = "auto",
+    offsets_host: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Select the eager or Triton implementation."""
     backend = str(backend).lower()
     if backend not in {"auto", "triton", "eager"}:
         raise ValueError("backend must be auto, triton, or eager")
-    use_triton = backend == "triton" or (
-        backend == "auto" and q.is_cuda and _TRITON_AVAILABLE
-    )
+    if backend == "eager":
+        use_triton = False
+    elif backend == "triton":
+        if not q.is_cuda or not _TRITON_AVAILABLE:
+            raise RuntimeError(
+                "Triton DSQG V23 was requested but CUDA/Triton is unavailable"
+            )
+        use_triton = True
+    elif q.is_cuda:
+        if not _TRITON_AVAILABLE:
+            raise RuntimeError(
+                "CUDA DSQG backend='auto' requires Triton; use backend='eager' "
+                "only for an explicit reference/debug run"
+            )
+        use_triton = True
+    else:
+        use_triton = False
+
     if not use_triton:
+        eager_offsets = offsets_host if offsets_host is not None else offsets_dev
         return _eager_dsqg_attention(
-            q, k, v, pos_bias, scale_embed, null_key, null_bias, offsets_dev,
-            query_start=int(query_start),
+            q, k, v, pos_bias, scale_embed, null_key, null_bias, eager_offsets,
+            log_valid_count, query_start=int(query_start),
         )
-    if not q.is_cuda or not _TRITON_AVAILABLE:
-        raise RuntimeError("Triton DSQG V23 was requested but CUDA/Triton is unavailable")
 
     original_dtype = q.dtype
     q_bf16 = q if q.dtype == torch.bfloat16 else q.to(torch.bfloat16)
@@ -780,12 +816,51 @@ def _dsqg_attention_v23_dispatch(
         scale_embed.float(),
         null_key.float(),
         null_bias.float(),
+        log_valid_count,
         int(offsets_dev.numel()),
         offsets_dev,
         int(query_start),
         source_end,
     )
     return output.to(original_dtype)
+
+
+def dsqg_attention_v23(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    pos_bias: torch.Tensor,
+    scale_embed: torch.Tensor,
+    null_key: torch.Tensor,
+    null_bias: torch.Tensor,
+    offsets_dev: torch.Tensor,
+    query_start: int = 0,
+    *,
+    backend: str = "auto",
+) -> torch.Tensor:
+    """Dispatch V23 without the module-only source-projection crop.
+
+    The Triton path computes with BF16 Q/K/V and follows PyTorch's BF16
+    attention-gradient contract. Use ``backend="eager"`` for an FP32 reference.
+    """
+    positions = torch.arange(
+        q.shape[2], device=offsets_dev.device, dtype=offsets_dev.dtype
+    ).reshape(-1, 1)
+    valid_count = (positions >= offsets_dev.reshape(1, -1)).sum(-1).clamp_min(1)
+    log_valid_count = valid_count.to(torch.float32).log()
+    return _dsqg_attention_v23_dispatch(
+        q,
+        k,
+        v,
+        pos_bias,
+        scale_embed,
+        null_key,
+        null_bias,
+        offsets_dev,
+        log_valid_count,
+        query_start,
+        backend=backend,
+    )
 
 
 class DSQGAttentionV23(nn.Module):
@@ -809,6 +884,7 @@ class DSQGAttentionV23(nn.Module):
         pos_bias_residual_limit: float = 1.5,
         support_crop_projections: bool = True,
         support_crop_min_offset: int = 64,
+        diagnostic_max_queries: int = 8,
     ):
         super().__init__()
         dimension = _strict_int("embedding_dim", embedding_dim, minimum=1)
@@ -843,9 +919,14 @@ class DSQGAttentionV23(nn.Module):
         )
         if not isinstance(support_crop_projections, bool):
             raise TypeError("support_crop_projections must be bool")
+        diagnostic_max = _strict_int(
+            "diagnostic_max_queries", diagnostic_max_queries, minimum=1
+        )
         self.scale_embed_init_std = float(scale_embed_init_std)
         self.support_crop_projections = support_crop_projections
         self.support_crop_min_offset = crop_min
+        self.diagnostic_max_queries = diagnostic_max
+        self._routing_diagnostics: dict[str, torch.Tensor] = {}
         self.register_buffer(
             "scale_embed_max_norm",
             torch.tensor(float(scale_embed_max_norm), dtype=torch.float32),
@@ -887,6 +968,14 @@ class DSQGAttentionV23(nn.Module):
         self.register_buffer(
             "offsets_dev",
             torch.tensor(canonical_offsets, dtype=torch.int32),
+            persistent=False,
+        )
+        positions = torch.arange(self.seq_len, dtype=torch.int32).reshape(-1, 1)
+        offset_table = torch.tensor(canonical_offsets, dtype=torch.int32).reshape(1, -1)
+        valid_count = (positions >= offset_table).sum(-1).clamp_min(1)
+        self.register_buffer(
+            "log_valid_count",
+            valid_count.to(torch.float32).log(),
             persistent=False,
         )
 
@@ -1011,7 +1100,7 @@ class DSQGAttentionV23(nn.Module):
         return {
             "implementation": "dsqg-v23-bounded-routing",
             "offsets": self.offsets,
-            "offset_loop": "single_j_val",
+            "offset_loop": "single_j_val_with_precomputed_null_count",
             "positional_bias": "bounded_analytic_log_plus_bounded_residual",
             "pos_bias_scale": float(self.pos_bias_scale.detach().cpu()),
             "pos_bias_max_slope": float(self.pos_bias_max_slope.detach().cpu()),
@@ -1021,6 +1110,7 @@ class DSQGAttentionV23(nn.Module):
             "scale_embed": "exact_centered_fp32_smooth_norm_capped_virtual_key",
             "scale_embed_max_norm": float(self.scale_embed_max_norm.detach().cpu()),
             "null_candidate": "count_calibrated_bounded_key_bias_zero_value",
+            "null_neutral_prior_mass": 0.5,
             "null_key_max_norm": float(self.null_key_max_norm.detach().cpu()),
             "null_bias_limit": float(self.null_bias_limit.detach().cpu()),
             "if_gain": "bounded_0_to_2",
@@ -1030,7 +1120,7 @@ class DSQGAttentionV23(nn.Module):
     def routing_diagnostics(self) -> dict[str, torch.Tensor]:
         scale_norm = self.centered_scale_embed.norm(dim=-1)
         residual = self.bounded_pos_bias_residual
-        return {
+        diagnostics = {
             "pos_slope_min": self.pos_bias_slope.min(),
             "pos_slope_mean": self.pos_bias_slope.mean(),
             "pos_slope_max": self.pos_bias_slope.max(),
@@ -1043,6 +1133,93 @@ class DSQGAttentionV23(nn.Module):
             "null_bias_mean": self.bounded_null_bias.mean(),
             "null_bias_max": self.bounded_null_bias.max(),
             "if_gain_mean": self.bounded_if_gain.mean(),
+        }
+        diagnostics.update(self._routing_diagnostics)
+        return diagnostics
+
+    @torch.no_grad()
+    def _sampled_live_diagnostics(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        content_gate: torch.Tensor,
+        query_start: int,
+    ) -> dict[str, torch.Tensor]:
+        """Measure actual routing mass on a bounded set of query positions."""
+        _, heads, seq_len, head_dim = query.shape
+        candidate_count = max(0, seq_len - int(query_start))
+        sample_count = min(self.diagnostic_max_queries, candidate_count)
+        if sample_count <= 0:
+            zero = torch.zeros((), device=query.device, dtype=torch.float32)
+            return {
+                "live_query_samples": zero,
+                "null_attention_mass": zero,
+                "local_offset_mass": zero,
+                "mid_offset_mass": zero,
+                "long_offset_mass": zero,
+                "content_gate_mean": zero,
+            }
+        if sample_count == candidate_count:
+            sample_ids = torch.arange(
+                query_start, seq_len, device=query.device, dtype=torch.long
+            )
+        else:
+            sample_ids = torch.linspace(
+                query_start, seq_len - 1, sample_count, device=query.device
+            ).round().to(torch.long)
+        sampled_query = query[:, :, sample_ids].float()
+        scale = 1.0 / math.sqrt(float(head_dim))
+        virtual_keys = self.centered_scale_embed
+        positional_bias = self.pos_bias
+        null_key = self.bounded_null_key
+        null_bias = self.bounded_null_bias
+        score_columns: list[torch.Tensor] = []
+        valid_columns: list[torch.Tensor] = []
+        for logical_index, offset in enumerate(self.offsets):
+            source = sample_ids - int(offset)
+            valid = source >= 0
+            selected_key = key[:, :, source.clamp_min(0)].float()
+            score = (
+                sampled_query
+                * (selected_key + virtual_keys[logical_index].float())
+            ).sum(-1) * scale
+            score = score + positional_bias[logical_index].float().reshape(1, heads, 1)
+            score_columns.append(
+                score.masked_fill(~valid.reshape(1, 1, -1), float("-inf"))
+            )
+            valid_columns.append(valid)
+        null_score = (
+            sampled_query
+            * null_key.float().reshape(1, heads, 1, head_dim)
+        ).sum(-1) * scale
+        null_score = (
+            null_score
+            + null_bias.float().reshape(1, heads, 1)
+            + self.log_valid_count[sample_ids].float().reshape(1, 1, -1)
+        )
+        scores = torch.stack((*score_columns, null_score), dim=-1)
+        probability = torch.softmax(scores, dim=-1)
+        offset_probability = probability[..., :-1]
+        offsets = torch.tensor(self.offsets, device=query.device)
+        local = offsets <= 8
+        middle = (offsets > 8) & (offsets < 64)
+        long = offsets >= 64
+
+        def mass(mask: torch.Tensor) -> torch.Tensor:
+            # Summing an empty selected dimension yields exact zeros without a
+            # CUDA host synchronization.
+            return offset_probability[..., mask].sum(-1).mean()
+
+        gate = torch.sigmoid(content_gate[:, sample_ids]).float().mean()
+        return {
+            "live_query_samples": torch.tensor(
+                float(sample_count), device=query.device
+            ),
+            "null_attention_mass": probability[..., -1].mean(),
+            "local_offset_mass": mass(local),
+            "mid_offset_mass": mass(middle),
+            "long_offset_mass": mass(long),
+            "content_gate_mean": gate,
         }
 
     def execution_config(self) -> dict[str, object]:
@@ -1057,9 +1234,17 @@ class DSQGAttentionV23(nn.Module):
             "configured_sequence_bound": self.seq_len,
             "support_crop_projections": self.support_crop_projections,
             "support_crop_min_offset": self.support_crop_min_offset,
+            "null_count_calibration": "precomputed_position_table",
+            "triton_qkv_gradient_storage": "bf16_input_dtype_with_fp32_accumulation",
+            "diagnostic_max_queries": self.diagnostic_max_queries,
         }
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, collect_diagnostics: bool = False
+    ) -> torch.Tensor:
+        compiling = torch.compiler.is_compiling()
+        if not compiling:
+            self._routing_diagnostics = {}
         batch, seq_len, dimension = x.shape
         if seq_len > self.seq_len:
             raise ValueError(
@@ -1116,10 +1301,19 @@ class DSQGAttentionV23(nn.Module):
             self.bounded_null_key,
             self.bounded_null_bias,
             self.offsets_dev,
+            self.log_valid_count,
             query_start,
             source_end=key_end,
             backend=self.backend,
+            offsets_host=self.offsets,
         )
+        if collect_diagnostics and not compiling:
+            self._routing_diagnostics = {
+                key: value.detach()
+                for key, value in self._sampled_live_diagnostics(
+                    query, key, content_gate, query_start
+                ).items()
+            }
         output = output * self.bounded_if_gain.reshape(1, heads, 1, 1)
         flattened = output.permute(0, 2, 1, 3).reshape(batch, seq_len, dimension)
         return self.dropout(
