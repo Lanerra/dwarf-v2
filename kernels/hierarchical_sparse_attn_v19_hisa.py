@@ -83,14 +83,6 @@ class _StableRMSNormalizeFn(torch.autograd.Function):
         return grad_value.to(value.dtype), None
 
 
-@torch.compiler.disable
-def _isolate_binding_mass(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expose two uses of attention mass outside AOTAutograd."""
-    return value.clone(), value.clone()
-
-
 try:
     import triton
     import triton.language as tl
@@ -101,12 +93,37 @@ except Exception:  # pragma: no cover - CPU-only development
     _TRITON_AVAILABLE = False
 
 
+def hisa_runtime_capabilities() -> dict[str, bool]:
+    """Return availability of the production HISA execution dependencies."""
+    return {
+        "flex_attention": bool(_FLEX_ATTENTION_AVAILABLE),
+        "triton": bool(_TRITON_AVAILABLE),
+    }
+
+
 def _next_pow2(value: int) -> int:
     return 1 if value <= 1 else 1 << (int(value) - 1).bit_length()
 
 
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
+
+
+def _representative_mix_shift(heads: int, target_mean: float) -> float:
+    """Shift the canonical head spread to a requested initial sigmoid mean."""
+    target = min(max(float(target_mean), 1e-4), 1.0 - 1e-4)
+    if target == 0.5:
+        return 0.0
+    base = torch.linspace(-2.0, 2.0, int(heads), dtype=torch.float64)
+    lower, upper = -30.0, 30.0
+    for _ in range(80):
+        midpoint = 0.5 * (lower + upper)
+        observed = float(torch.sigmoid(base + midpoint).mean())
+        if observed < target:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return 0.5 * (lower + upper)
 
 
 def _resolve_attention_execution(
@@ -231,10 +248,12 @@ class HISAMetadata:
 
 @dataclass(frozen=True)
 class HISASelectionCapture:
-    """Ephemeral differentiable route surface for external analysis/losses."""
+    """Ephemeral routing evidence produced only on explicit metadata requests."""
     anchor_logits: torch.Tensor
     metadata: HISAMetadata
     auxiliary_loss: torch.Tensor
+    sampled_anchor_logits: torch.Tensor | None = None
+    sampled_tile_ids: torch.Tensor | None = None
 
 
 def _chunk_layout(seq_len: int, chunk_size: int) -> tuple[int, int]:
@@ -319,56 +338,53 @@ def _eligibility(
     return completed_and_global & chunk_valid[:, None, :] & tile_valid[:, :, None]
 
 
-def _unseen_eligible_chunks(
-    indices: torch.Tensor,
-    valid: torch.Tensor,
-    eligible: torch.Tensor,
-) -> torch.Tensor:
-    """Return eligible chunks absent from every valid route slot."""
-    batch_size, heads, tiles, _ = indices.shape
-    chunks = eligible.shape[-1]
-    selected_counts = torch.zeros(
-        batch_size,
-        heads,
-        tiles,
-        chunks,
-        dtype=torch.int32,
-        device=indices.device,
-    )
-    # scatter_ can let an invalid -1 slot (clamped to zero) overwrite a valid
-    # chunk-zero selection. Integer scatter_add preserves set membership.
-    selected_counts.scatter_add_(
-        -1,
-        indices.clamp_min(0).long(),
-        valid.to(torch.int32),
-    )
-    selected = selected_counts > 0
-    return eligible[:, None].expand(-1, heads, -1, -1) & ~selected
-
-
 def _inject_exploration_slot(
     indices: torch.Tensor,
     valid: torch.Tensor,
     eligible: torch.Tensor,
     probability: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace the final route with a uniform unseen eligible chunk.
+
+    Causal chunk eligibility is always a contiguous prefix. Sampling a rank in
+    that prefix and skipping the at-most-K selected IDs avoids constructing the
+    former ``[B,H,T,C]`` count, candidate, and random-score tensors.
+    """
     if probability <= 0.0 or indices.shape[-1] == 0:
         return indices, valid
     batch_size, heads, tiles, slots = indices.shape
-    candidate = _unseen_eligible_chunks(indices, valid, eligible)
-    random_scores = torch.rand(candidate.shape, device=indices.device).masked_fill(
-        ~candidate,
-        -1.0,
+    eligible_count = eligible.sum(-1, dtype=torch.int64)[:, None].expand(
+        batch_size, heads, tiles
     )
-    best_value, best_choice = random_scores.max(-1)
+    selected_count = valid.sum(-1, dtype=torch.int64)
+    unseen_count = eligible_count - selected_count
+    has_candidate = unseen_count > 0
+
+    selected_sorted = torch.where(
+        valid,
+        indices.to(torch.int64),
+        eligible_count[..., None],
+    ).sort(dim=-1).values
+    random_rank = torch.floor(
+        torch.rand(batch_size, heads, tiles, device=indices.device)
+        * unseen_count.clamp_min(1).to(torch.float32)
+    ).to(torch.int64)
+    choice = random_rank
+    # Map the rank in the unseen set back into the contiguous eligible prefix.
+    # K is a fixed, very small architecture constant, so this loop has stable
+    # shape and O(B*H*T*K) memory/work.
+    for slot in range(slots):
+        selected_id = selected_sorted[..., slot]
+        choice = choice + (selected_id <= choice).to(choice.dtype)
+
     replace = (
         torch.rand(batch_size, heads, tiles, device=indices.device) < probability
-    ) & (best_value >= 0.0)
+    ) & has_candidate
     result_indices = indices.clone()
     result_valid = valid.clone()
     result_indices[..., slots - 1] = torch.where(
         replace,
-        best_choice.to(result_indices.dtype),
+        choice.to(result_indices.dtype),
         result_indices[..., slots - 1],
     )
     result_valid[..., slots - 1] = torch.where(
@@ -388,6 +404,7 @@ def _build_causal_tile_metadata(
     local_window: int,
     valid_lengths: torch.Tensor,
     exploration_probability: float,
+    preserve_anchor_logits: bool = True,
 ) -> HISAMetadata:
     _, _, tiles, num_chunks = anchor_logits.shape
     k_slots = min(top_k_chunks, num_chunks)
@@ -404,9 +421,11 @@ def _build_causal_tile_metadata(
         local_window,
     )
     with torch.no_grad():
-        masked_logits = anchor_logits.detach().masked_fill(
-            ~eligible[:, None],
-            float("-inf"),
+        detached_logits = anchor_logits.detach()
+        masked_logits = (
+            detached_logits.masked_fill(~eligible[:, None], float("-inf"))
+            if preserve_anchor_logits
+            else detached_logits.masked_fill_(~eligible[:, None], float("-inf"))
         )
         values, indices = masked_logits.topk(k_slots, dim=-1)
         valid_selected = torch.isfinite(values)
@@ -571,6 +590,8 @@ def _selected_route_scores(
     representatives: torch.Tensor,
     metadata: HISAMetadata,
     route_scale_by_head: torch.Tensor,
+    *,
+    temperature: float,
 ) -> torch.Tensor:
     """Score each query's chunks within its deduplicated physical pack."""
     batch_size, heads, seq_len, head_dim = query_normalized.shape
@@ -613,149 +634,188 @@ def _selected_route_scores(
     count = valid.sum(-1, keepdim=True).clamp_min(1)
     mean = (scores * valid).sum(-1, keepdim=True) / count
     centered = torch.where(valid, scores - mean, torch.zeros_like(scores))
-    scaled = centered * route_scale_by_head.reshape(1, heads, 1, 1, 1).float()
+    scaled = (
+        centered
+        * route_scale_by_head.reshape(1, heads, 1, 1, 1).float()
+        / float(temperature)
+    )
     scaled = torch.where(valid, scaled, torch.full_like(scaled, float("-inf")))
     return scaled.reshape(batch_size, heads, padded_len, -1)[:, :, :seq_len].to(
         query_normalized.dtype
     )
 
 
+def _resolve_route_aux_tile_ids(
+    metadata: HISAMetadata,
+    *,
+    samples: int,
+    local_window: int,
+    tile_ids: torch.Tensor | None,
+    device: torch.device,
+) -> torch.Tensor:
+    tiles = metadata.top_chunk_idx.shape[2]
+    first_useful_tile = math.ceil(
+        (metadata.chunk_size + int(local_window)) / metadata.selector_tile_size
+    )
+    candidate_count = max(0, tiles - first_useful_tile)
+    sample_count = min(int(samples), candidate_count)
+    if sample_count <= 0:
+        return torch.empty(0, device=device, dtype=torch.int64)
+    useful_tiles = torch.arange(
+        first_useful_tile, tiles, device=device, dtype=torch.int64
+    )
+    if tile_ids is None:
+        if sample_count == candidate_count:
+            return useful_tiles
+        permutation = torch.randperm(candidate_count, device=device)
+        return useful_tiles[permutation[:sample_count]]
+
+    if not torch.is_tensor(tile_ids):
+        raise TypeError("route_aux_tile_ids must be a tensor")
+    if tile_ids.ndim != 1:
+        raise ValueError("route_aux_tile_ids must be one-dimensional")
+    if tile_ids.dtype != torch.int64:
+        raise TypeError("route_aux_tile_ids must use int64")
+    if tile_ids.device != device:
+        raise ValueError("route_aux_tile_ids must be on the HISA input device")
+    if tile_ids.numel() != sample_count:
+        raise ValueError(
+            f"route_aux_tile_ids must contain exactly {sample_count} IDs"
+        )
+    # The canonical trainer creates these IDs from a deterministic validated
+    # recipe. Avoid a data-dependent scalar guard inside its compiled graph.
+    if torch.compiler.is_compiling():
+        return tile_ids
+    ordered = tile_ids.sort().values
+    unique = (
+        torch.ones((), dtype=torch.bool, device=device)
+        if ordered.numel() <= 1
+        else (ordered[1:] != ordered[:-1]).all()
+    )
+    valid_ids = (tile_ids >= first_useful_tile) & (tile_ids < tiles)
+    valid = valid_ids.all() & unique
+    message = "route_aux_tile_ids must be unique and in the eligible tile range"
+    if tile_ids.is_cuda:
+        torch._assert_async(valid, message)
+    elif not bool(valid):
+        if bool(((tile_ids < 0) | (tile_ids >= tiles)).any()):
+            raise ValueError("route_aux_tile_ids contains an out-of-range ID")
+        if bool((tile_ids < first_useful_tile).any()):
+            raise ValueError("route_aux_tile_ids contains an ineligible early tile")
+        raise ValueError("route_aux_tile_ids must be unique")
+    return tile_ids
+
+
 def _router_auxiliary_loss(
-    anchor_logits: torch.Tensor,
     anchor_query: torch.Tensor,
+    representatives: torch.Tensor,
     global_key: torch.Tensor,
     metadata: HISAMetadata,
     route_scale_by_head: torch.Tensor,
     *,
     samples: int,
-    temperature: float,
-    selector_temperature: float,
+    target_temperature: float,
+    routing_temperature: float,
     local_window: int,
     oracle_temperature: float,
     tile_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Train effective selected-route priors toward token-level evidence."""
-    if samples <= 0:
-        return anchor_logits.new_zeros(())
-    batch_size, heads, tiles, num_chunks = anchor_logits.shape
-    eligibility_all = _eligibility(
-        metadata.tile_starts,
-        num_chunks,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Train sampled effective route priors toward token-level evidence.
+
+    Only the sampled query rows participate in the differentiable selector
+    matmul. Hard top-k selection still uses the detached full routing surface.
+    """
+    resolved_ids = _resolve_route_aux_tile_ids(
+        metadata,
+        samples=samples,
+        local_window=local_window,
+        tile_ids=tile_ids,
+        device=anchor_query.device,
+    )
+    if resolved_ids.numel() == 0:
+        empty = anchor_query.new_empty(
+            anchor_query.shape[0], anchor_query.shape[1], 0, representatives.shape[2]
+        )
+        return anchor_query.new_zeros(()), empty, resolved_ids
+
+    _, heads, _, _ = anchor_query.shape
+    query = anchor_query[:, :, resolved_ids].float()
+    sampled_anchor_logits = torch.matmul(
+        query,
+        representatives.float().transpose(-2, -1),
+    ) / float(routing_temperature)
+    sampled_tile_starts = metadata.tile_starts[resolved_ids]
+    eligible = _eligibility(
+        sampled_tile_starts,
+        representatives.shape[2],
         metadata.chunk_size,
         metadata.valid_lengths,
         local_window,
     )
-    # At least one physical chunk can be complete only once tile_start reaches
-    # chunk_size. Build that static candidate range directly instead of using
-    # data-dependent nonzero(), which would split torch.compile graphs. Rows
-    # whose valid length still makes a sampled tile ineligible are masked below.
-    first_useful_tile = math.ceil(
-        (metadata.chunk_size + int(local_window)) / metadata.selector_tile_size
-    )
-    candidate_count = max(0, tiles - first_useful_tile)
-    if candidate_count == 0:
-        return anchor_logits.new_zeros(())
-    sample_count = min(int(samples), candidate_count)
-    useful_tiles = torch.arange(
-        first_useful_tile, tiles, device=anchor_logits.device, dtype=torch.long
-    )
-    if tile_ids is None:
-        if sample_count == candidate_count:
-            tile_ids = useful_tiles
-        else:
-            permutation = torch.randperm(candidate_count, device=anchor_logits.device)
-            tile_ids = useful_tiles[permutation[:sample_count]]
-    else:
-        if not torch.is_tensor(tile_ids):
-            raise TypeError("route_aux_tile_ids must be a tensor")
-        if tile_ids.ndim != 1:
-            raise ValueError("route_aux_tile_ids must be one-dimensional")
-        if tile_ids.dtype != torch.int64:
-            raise TypeError("route_aux_tile_ids must use int64")
-        if tile_ids.device != anchor_logits.device:
-            raise ValueError("route_aux_tile_ids must be on the HISA input device")
-        if tile_ids.numel() != sample_count:
-            raise ValueError(
-                f"route_aux_tile_ids must contain exactly {sample_count} IDs"
-            )
-        unique = torch.unique(tile_ids).numel() == tile_ids.numel()
-        valid_ids = (tile_ids >= first_useful_tile) & (tile_ids < tiles)
-        if tile_ids.is_cuda:
-            torch._assert_async(
-                valid_ids.all() & unique,
-                "route_aux_tile_ids must be unique and in the eligible tile range",
-            )
-        elif not bool(valid_ids.all()) or not bool(unique):
-            if bool(((tile_ids < 0) | (tile_ids >= tiles)).any()):
-                raise ValueError("route_aux_tile_ids contains an out-of-range ID")
-            if bool((tile_ids < first_useful_tile).any()):
-                raise ValueError("route_aux_tile_ids contains an ineligible early tile")
-            raise ValueError("route_aux_tile_ids must be unique")
-    key_chunks, token_valid, _ = _chunk_tensors(
-        global_key,
-        metadata.chunk_size,
-        metadata.valid_lengths,
-    )
-    query = anchor_query[:, :, tile_ids].float()
-    key_directions = F.normalize(key_chunks.float(), dim=-1, eps=1e-6)
-    token_scores = torch.einsum(
-        "bhsd,bhcmd->bhscm",
-        query,
-        key_directions,
-    ) / float(oracle_temperature)
-    eligible = eligibility_all[:, tile_ids]
-    mask = token_valid[:, :, None] & eligible[:, None, :, :, None]
-    token_scores = token_scores.masked_fill(~mask, -1e9)
-    token_count = mask.sum(-1).clamp_min(1).to(token_scores.dtype)
-    # Smoothly aggregate token-level evidence within each chunk.
-    oracle = float(oracle_temperature) * (
-        torch.logsumexp(token_scores, dim=-1) - token_count.log()
-    )
-    # _selected_route_scores uses the same normalized query/representative dot
-    # product, removes a per-row constant, and applies this learned head scale.
-    # Softmax CE is invariant to that centering constant, so these are the
-    # effective attention-prior logits over all eligible chunks.
-    # Mask placeholder logits before learned scaling. Ineligible incomplete
-    # representatives can carry NaN; masking only after multiplication leaves
-    # backward terms such as 0 * NaN and poisons sampled-query gradients while
-    # the scalar auxiliary loss remains finite.
+
+    # Oracle evidence is a detached target. Construct it without autograd so
+    # token-level chunk evidence does not retain a second global-key graph.
+    with torch.no_grad():
+        key_chunks, token_valid, _ = _chunk_tensors(
+            global_key,
+            metadata.chunk_size,
+            metadata.valid_lengths,
+        )
+        key_directions = F.normalize(key_chunks.float(), dim=-1, eps=1e-6)
+        token_scores = torch.einsum(
+            "bhsd,bhcmd->bhscm",
+            query.detach(),
+            key_directions,
+        ) / float(oracle_temperature)
+        mask = token_valid[:, :, None] & eligible[:, None, :, :, None]
+        token_scores = token_scores.masked_fill(~mask, -1e9)
+        token_count = mask.sum(-1).clamp_min(1).to(token_scores.dtype)
+        oracle = float(oracle_temperature) * (
+            torch.logsumexp(token_scores, dim=-1) - token_count.log()
+        )
+        target = torch.softmax(oracle / float(target_temperature), dim=-1)
+
     safe_anchor_logits = torch.where(
-        eligibility_all[:, None],
-        anchor_logits.float(),
-        torch.zeros_like(anchor_logits.float()),
+        eligible[:, None],
+        sampled_anchor_logits,
+        torch.zeros_like(sampled_anchor_logits),
     )
-    effective_route = (
+    route = (
         safe_anchor_logits
-        * float(selector_temperature)
         * route_scale_by_head.reshape(1, heads, 1, 1).float()
-    )
-    route = effective_route[:, :, tile_ids].masked_fill(
-        ~eligible[:, None],
-        -1e9,
-    )
-    target = torch.softmax((oracle / float(temperature)).detach(), dim=-1)
+    ).masked_fill(~eligible[:, None], -1e9)
     per_row = -(target * torch.log_softmax(route, dim=-1)).sum(-1)
     valid_rows = eligible.any(-1)[:, None].expand(-1, heads, -1)
-    return (per_row * valid_rows).sum() / valid_rows.sum().clamp_min(1)
+    loss = (per_row * valid_rows).sum() / valid_rows.sum().clamp_min(1)
+    return loss, sampled_anchor_logits, resolved_ids
 
 
 def _eligible_route_entropy(
     anchor_logits: torch.Tensor,
     metadata: HISAMetadata,
     local_window: int,
+    *,
+    tile_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    logits = anchor_logits if tile_ids is None else anchor_logits[:, :, tile_ids]
+    tile_starts = (
+        metadata.tile_starts
+        if tile_ids is None
+        else metadata.tile_starts[tile_ids]
+    )
     eligible = _eligibility(
-        metadata.tile_starts,
-        anchor_logits.shape[-1],
+        tile_starts,
+        logits.shape[-1],
         metadata.chunk_size,
         metadata.valid_lengths,
         local_window,
     )
-    masked = anchor_logits.float().masked_fill(~eligible[:, None], -1e9)
+    masked = logits.float().masked_fill(~eligible[:, None], -1e9)
     probability = torch.softmax(masked, dim=-1)
     entropy = -(probability * torch.log_softmax(masked, dim=-1)).sum(-1)
     valid = eligible.any(-1)[:, None].expand_as(entropy)
     return (entropy * valid).sum() / valid.sum().clamp_min(1)
+
 
 def _eager_local_lane(
     query: torch.Tensor,
@@ -1459,7 +1519,6 @@ def _global_hisa_triton_apply(*args):
     return _GlobalHISATritonFn.apply(*args)
 
 
-
 class HierarchicalSparseAttentionV19HISACausal(nn.Module):
     """Strict-causal local and routed-chunk attention for DWARF models."""
 
@@ -1468,9 +1527,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         D: int,
         H: int,
         hd: int,
-        num_chunks: int = 32,
+        num_chunks: int | None = None,
         top_k_chunks: int = 4,
-        hisa_top_m_tokens: int = 64,
+        hisa_top_m_tokens: int | None = None,
         *,
         chunk_size: int | None = None,
         local_window: int | None = None,
@@ -1507,8 +1566,12 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise ValueError("D, H, and hd must be positive")
         if D != H * hd:
             raise ValueError(f"D={D} must equal H*hd={H * hd}")
-        if top_k_chunks < 1 or hisa_top_m_tokens < 1:
-            raise ValueError("top_k_chunks and hisa_top_m_tokens must be positive")
+        if top_k_chunks < 1:
+            raise ValueError("top_k_chunks must be positive")
+        if hisa_top_m_tokens is not None and int(hisa_top_m_tokens) < 1:
+            raise ValueError("hisa_top_m_tokens must be positive when supplied")
+        if num_chunks is not None and int(num_chunks) < 1:
+            raise ValueError("num_chunks must be positive when supplied")
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and positive")
         if not math.isfinite(route_prior_scale) or route_prior_scale <= 0:
@@ -1570,19 +1633,42 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             if selector_tile_size is not None
             else 16
         )
-        if resolved_chunk_size < 1 or resolved_local_window < 1 or resolved_selector_tile < 1:
-            raise ValueError("chunk_size, local_window, and selector_tile_size must be positive")
-        if int(hisa_top_m_tokens) != resolved_chunk_size:
-            raise ValueError("hisa_top_m_tokens must equal chunk_size")
+        if (
+            resolved_chunk_size < 1
+            or resolved_local_window < 1
+            or resolved_selector_tile < 1
+        ):
+            raise ValueError(
+                "chunk_size, local_window, and selector_tile_size must be positive"
+            )
+        resolved_top_m = (
+            resolved_chunk_size
+            if hisa_top_m_tokens is None
+            else int(hisa_top_m_tokens)
+        )
+        if resolved_top_m != resolved_chunk_size:
+            raise ValueError(
+                "HISA V19 enumerates complete selected chunks; "
+                "hisa_top_m_tokens must equal chunk_size"
+            )
+        if num_chunks is not None and max_seq_len is not None:
+            expected_chunks = math.ceil(int(max_seq_len) / resolved_chunk_size)
+            if int(num_chunks) != expected_chunks:
+                raise ValueError(
+                    "num_chunks is a compatibility hint and must equal "
+                    "ceil(max_seq_len/chunk_size) when both are supplied"
+                )
 
         self.D = D
         self.H = H
         self.num_heads = H
         self.hd = hd
-        del num_chunks
+        self.num_chunks_compatibility_hint = (
+            None if num_chunks is None else int(num_chunks)
+        )
         self.chunk_size = resolved_chunk_size
         self.top_k_chunks = int(top_k_chunks)
-        self.hisa_top_m_tokens = int(hisa_top_m_tokens)
+        self.hisa_top_m_tokens = resolved_top_m
         self.local_window = resolved_local_window
         self.selector_tile_size = resolved_selector_tile
         self.temperature = float(temperature)
@@ -1647,10 +1733,12 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise ValueError("backward_impl must be atomic or atomic_masked")
         if collect_routing_diagnostics is None:
             collect_routing_diagnostics = False
-        if collect_routing_diagnostics:
-            raise ValueError("deep routing diagnostics are not part of the public kernel")
-        self.collect_routing_diagnostics = bool(collect_routing_diagnostics)
-        self.diagnostic_max_queries = int(diagnostic_max_queries or 8)
+        if not isinstance(collect_routing_diagnostics, bool):
+            raise TypeError("collect_routing_diagnostics must be bool")
+        self.collect_routing_diagnostics = collect_routing_diagnostics
+        self.diagnostic_max_queries = (
+            8 if diagnostic_max_queries is None else int(diagnostic_max_queries)
+        )
         if self.diagnostic_max_queries < 1:
             raise ValueError("diagnostic_max_queries must be positive")
 
@@ -1677,8 +1765,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             initial_route_fraction / (1.0 - initial_route_fraction)
         )
         self.route_prior_raw = nn.Parameter(torch.full((H,), initial_route_raw))
-        # Initialize heads across the normalized mean/max mixture.
-        self.representative_mix_raw = nn.Parameter(torch.linspace(-2.0, 2.0, H))
+        # Preserve the canonical per-head spread while making the public alpha
+        # control the exact initial mean blend. The canonical alpha=0.5 uses an
+        # exact zero shift and therefore retains the released state fingerprint.
+        mix_shift = _representative_mix_shift(H, self.representative_blend_alpha)
+        self.representative_mix_raw = nn.Parameter(
+            torch.linspace(-2.0, 2.0, H) + mix_shift
+        )
         neutral_global_bias = 0.0
         self.global_lane_logit_bias = nn.Parameter(
             torch.full((H,), neutral_global_bias)
@@ -1725,22 +1818,31 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         return {
             "implementation": "hisa-v19-accessible-routes-binding",
             "chunk_size": self.chunk_size,
+            "num_chunks_compatibility_hint": self.num_chunks_compatibility_hint,
             "top_k_chunks": self.top_k_chunks,
-            "top_m_tokens": self.hisa_top_m_tokens,
+            "selected_tokens_per_chunk": self.hisa_top_m_tokens,
+            "selected_token_policy": "enumerate_complete_selected_chunks",
             "local_window": self.local_window,
             "boundary_bridge": self.boundary_bridge,
-            "selector_tile_size": self.selector_tile_size,
-            "temperature": self.temperature,
+            "semantic_selection_scope": "per_token",
+            "reference_lane_tile_size": self.selector_tile_size,
+            "routing_temperature": self.temperature,
+            "routing_temperature_applies_to": (
+                "selected_route_priors_and_sampled_router_auxiliary"
+            ),
             "representative_mode": self.representative_mode,
-            "representative_blend_alpha": self.representative_blend_alpha,
+            "representative_blend_alpha_initial_mean": (
+                self.representative_blend_alpha
+            ),
             "exploration_probability": self.exploration_probability,
+            "exploration_policy": "uniform_unseen_eligible_chunk",
             "route_aux_weight": self.route_aux_weight,
             "route_aux_samples": self.route_aux_samples,
             "route_aux_temperature": self.route_aux_temperature,
             "route_aux_oracle_temperature": self.route_aux_oracle_temperature,
+            "route_auxiliary_target": "sampled_effective_route_prior",
             "route_prior_max_scale": self.route_prior_max_scale,
             "global_lane_bias_limit": self.global_lane_bias_limit,
-            "route_auxiliary_target": "effective_route_prior",
             "global_adapter_rank": self.global_adapter_rank,
             "binding_rank": self.binding_rank,
             "binding_source": "global_lane_weighted_by_exact_merged_mass",
@@ -1752,6 +1854,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "token_routing_pack_size": self.token_routing_pack_size,
             "selected_route_scoring": "token_selection_physical_union",
             "lane_merge": "exact_lse",
+            "selector_complexity": "O(N*ceil(N/chunk_size)*D)",
+            "incremental_kv_cache": "not_implemented_by_this_module",
+            "max_seq_len": self.max_seq_len,
         }
 
     def execution_config(self) -> dict[str, object]:
@@ -1761,10 +1866,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "triton_block_q": self.triton_block_q,
             "backward_impl": self.backward_impl,
             "collect_routing_diagnostics": self.collect_routing_diagnostics,
+            "diagnostic_max_queries": self.diagnostic_max_queries,
+            "selector_autograd": "sampled_auxiliary_rows_only",
+            "hard_selector": "detached_full_token_chunk_surface",
+            "exploration_workspace": "O(B*H*N*K)_beyond_hard_selector",
             "flex_attention_available": _FLEX_ATTENTION_AVAILABLE,
+            "triton_available": _TRITON_AVAILABLE,
             "flex_lse_api": "aux_request" if AuxRequest is not None else "return_lse",
         }
-
 
     def _ensure_local_block_mask(
         self, device: torch.device, seq_len: int
@@ -1879,14 +1988,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             nn.init.normal_(self.global_k_up.weight, mean=0.0, std=0.002)
             nn.init.normal_(self.global_v_up.weight, mean=0.0, std=0.002)
 
-    @torch.compiler.disable
     def _binding_correction(
         self,
         x: torch.Tensor,
         binding_evidence_heads: torch.Tensor,
         binding_confidence: torch.Tensor,
     ) -> torch.Tensor:
-        """Evaluate the binding MLP outside AOTAutograd without changing semantics."""
+        """Evaluate the query/evidence semantic binding correction."""
         if self.bind_query is None or self.bind_evidence is None or self.bind_output is None:
             raise RuntimeError("binding correction modules are incomplete")
         binding_evidence = binding_evidence_heads.permute(0, 2, 1, 3).reshape(
@@ -1917,9 +2025,16 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         return_metadata: bool = False,
         return_auxiliary: bool = False,
     ):
-        self.hisa_evidence_capture = None
-        self._routing_auxiliary_loss = None
-        self._routing_diagnostics = {}
+        compiling = torch.compiler.is_compiling()
+        collect_diagnostics = bool(
+            collect_diagnostics or self.collect_routing_diagnostics
+        )
+        emit_diagnostics = collect_diagnostics and not compiling
+        if not compiling:
+            self.hisa_evidence_capture = None
+            self._routing_auxiliary_loss = None
+            self._routing_diagnostics = {}
+
         use_triton = _resolve_attention_execution(
             backend=self.backend,
             is_cuda=x.is_cuda,
@@ -1930,13 +2045,16 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             _validate_triton_geometry(
                 head_dim=self.hd,
                 local_window=self.local_window,
-                selected_tokens_per_chunk=min(
-                    self.chunk_size,
-                    self.hisa_top_m_tokens,
-                ),
+                selected_tokens_per_chunk=self.chunk_size,
                 block_q=self.triton_block_q,
             )
+
         batch_size, seq_len, _ = x.shape
+        if self.max_seq_len is not None and seq_len > self.max_seq_len:
+            raise ValueError(
+                f"input sequence length {seq_len} exceeds configured HISA bound "
+                f"{self.max_seq_len}"
+            )
         lengths = _as_valid_lengths(
             valid_lengths
             if valid_lengths is not None
@@ -1946,8 +2064,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             device=x.device,
         )
         query_flat, key_flat, value_flat, gate = self.qkvg_proj(x).split(
-            self.D,
-            dim=-1,
+            self.D, dim=-1
         )
         query = _to_heads(query_flat, batch_size, seq_len, self.H, self.hd)
         local_key = _to_heads(key_flat, batch_size, seq_len, self.H, self.hd)
@@ -1975,7 +2092,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             )
         if kv_inject is not None:
             key_delta, value_delta = kv_inject
-            if key_delta.shape != global_key.shape or value_delta.shape != global_value.shape:
+            if (
+                key_delta.shape != global_key.shape
+                or value_delta.shape != global_value.shape
+            ):
                 raise ValueError("kv_inject must contain [B,H,N,HD] tensors")
             global_key = _magnitude_aware_rotate(
                 global_key,
@@ -1994,41 +2114,59 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             valid_lengths=lengths,
             blend_alpha=self.representative_mix,
         )
-        query_normalized = F.normalize(query.float(), dim=-1, eps=1e-6).to(query.dtype)
-        selection_tile_size = 1
+        query_normalized = F.normalize(query.float(), dim=-1, eps=1e-6).to(
+            query.dtype
+        )
         selection_query = query_normalized
-        selection_logits = torch.matmul(
-            selection_query.float(),
-            representatives.float().transpose(-2, -1),
-        ) / self.temperature
+
+        # Hard top-k routing has no useful gradient. Keep the complete token/chunk
+        # selector out of autograd; the auxiliary below recomputes only its sampled
+        # query rows with gradients enabled.
+        with torch.no_grad():
+            selection_logits = torch.matmul(
+                selection_query.float(),
+                representatives.float().transpose(-2, -1),
+            )
+        retain_selection_logits = emit_diagnostics or (
+            return_metadata and not compiling
+        )
         selection_metadata = _build_causal_tile_metadata(
             selection_logits,
             chunk_size=self.chunk_size,
             top_k_chunks=self.top_k_chunks,
-            selector_tile_size=selection_tile_size,
+            selector_tile_size=1,
             local_window=self.local_window,
             valid_lengths=lengths,
             exploration_probability=(
                 self.exploration_probability if self.training else 0.0
             ),
+            preserve_anchor_logits=retain_selection_logits,
         )
+        analysis_selection_logits = (
+            selection_logits if retain_selection_logits else None
+        )
+        del selection_logits
+
         metadata = selection_metadata
         if selection_metadata.enumerate_all and self.token_routing_pack_size > 1:
             metadata = _pack_token_metadata(
-                selection_metadata,
-                pack_size=self.token_routing_pack_size,
+                selection_metadata, pack_size=self.token_routing_pack_size
             )
-        self._last_token_selection_path = (
-            "enumerate_all_packed"
-            if metadata.query_chunk_idx is not None
-            else ("enumerate_all" if metadata.enumerate_all else "selected_tokens")
-        )
+        if not compiling:
+            self._last_token_selection_path = (
+                "enumerate_all_packed"
+                if metadata.query_chunk_idx is not None
+                else ("enumerate_all" if metadata.enumerate_all else "selected_tokens")
+            )
+
         route = _selected_route_scores(
             query_normalized,
             representatives,
             metadata,
             self.route_prior_scale,
+            temperature=self.temperature,
         )
+
         # Correct the lane prior for the number of available local/global keys.
         positions = torch.arange(seq_len, device=x.device, dtype=torch.int32)
         local_count = positions.clamp(max=self.local_window).float()
@@ -2055,34 +2193,74 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             count_correction[..., None]
             + self.bounded_global_lane_logit_bias.reshape(1, self.H, 1, 1).float()
         ).to(route.dtype)
-        if self.training and self.route_aux_weight > 0.0:
-            auxiliary = _router_auxiliary_loss(
-                selection_logits,
-                selection_query,
-                global_key,
-                selection_metadata,
-                self.route_prior_scale,
-                samples=self.route_aux_samples,
-                temperature=self.route_aux_temperature,
-                selector_temperature=self.temperature,
-                local_window=self.local_window,
-                oracle_temperature=self.route_aux_oracle_temperature,
-                tile_ids=route_aux_tile_ids,
-            ) * self.route_aux_weight
-            self._routing_auxiliary_loss = auxiliary
-            self.hisa_evidence_capture = HISASelectionCapture(
-                anchor_logits=selection_logits,
-                metadata=selection_metadata,
-                auxiliary_loss=auxiliary,
-            )
 
-        if collect_diagnostics:
-            with torch.no_grad():
-                self._routing_entropy = _eligible_route_entropy(
-                    selection_logits,
+        auxiliary = torch.zeros((), device=x.device, dtype=torch.float32)
+        sampled_anchor_logits: torch.Tensor | None = None
+        sampled_tile_ids: torch.Tensor | None = None
+        if self.training and self.route_aux_weight > 0.0:
+            auxiliary_raw, sampled_anchor_logits, sampled_tile_ids = (
+                _router_auxiliary_loss(
+                    selection_query,
+                    representatives,
+                    global_key,
                     selection_metadata,
-                    self.local_window,
-                ).detach()
+                    self.route_prior_scale,
+                    samples=self.route_aux_samples,
+                    target_temperature=self.route_aux_temperature,
+                    routing_temperature=self.temperature,
+                    local_window=self.local_window,
+                    oracle_temperature=self.route_aux_oracle_temperature,
+                    tile_ids=route_aux_tile_ids,
+                )
+            )
+            auxiliary = auxiliary_raw * self.route_aux_weight
+
+        if not compiling:
+            self._routing_auxiliary_loss = auxiliary
+            if return_metadata:
+                if analysis_selection_logits is None:
+                    raise RuntimeError("HISA selector capture was not retained")
+                self.hisa_evidence_capture = HISASelectionCapture(
+                    anchor_logits=analysis_selection_logits,
+                    metadata=selection_metadata,
+                    auxiliary_loss=auxiliary,
+                    sampled_anchor_logits=sampled_anchor_logits,
+                    sampled_tile_ids=sampled_tile_ids,
+                )
+
+        if emit_diagnostics:
+            if analysis_selection_logits is None:
+                raise RuntimeError("HISA diagnostic selector was not retained")
+            with torch.no_grad():
+                first_useful = self.chunk_size + self.local_window
+                candidate_count = max(0, seq_len - first_useful)
+                diagnostic_count = min(
+                    self.diagnostic_max_queries, candidate_count
+                )
+                if diagnostic_count > 0:
+                    if diagnostic_count == candidate_count:
+                        diagnostic_ids = torch.arange(
+                            first_useful,
+                            seq_len,
+                            device=x.device,
+                            dtype=torch.int64,
+                        )
+                    else:
+                        diagnostic_ids = torch.linspace(
+                            first_useful,
+                            seq_len - 1,
+                            diagnostic_count,
+                            device=x.device,
+                        ).round().to(torch.int64)
+                    self._routing_entropy = _eligible_route_entropy(
+                        analysis_selection_logits,
+                        selection_metadata,
+                        self.local_window,
+                        tile_ids=diagnostic_ids,
+                    ).detach()
+                else:
+                    self._routing_entropy = torch.zeros((), device=x.device)
+
                 finite_route = torch.isfinite(route)
                 finite_route_count = finite_route.sum().clamp_min(1)
                 physical_chunks = (metadata.top_chunk_idx >= 0).sum(-1).float()
@@ -2099,20 +2277,29 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 ).expand_as(physical_chunks)
                 semantic_mean = (
                     torch.where(
-                        semantic_valid, semantic_chunks, torch.zeros_like(semantic_chunks)
+                        semantic_valid,
+                        semantic_chunks,
+                        torch.zeros_like(semantic_chunks),
                     ).sum()
                     / semantic_valid.sum().clamp_min(1)
                 )
                 physical_mean = (
                     torch.where(
-                        physical_valid, physical_chunks, torch.zeros_like(physical_chunks)
+                        physical_valid,
+                        physical_chunks,
+                        torch.zeros_like(physical_chunks),
                     ).sum()
                     / physical_valid.sum().clamp_min(1)
                 )
-                diagnostics: dict[str, torch.Tensor] = {
+                self._routing_diagnostics = {
                     "routing_entropy": self._routing_entropy,
+                    "routing_entropy_queries": torch.tensor(
+                        float(diagnostic_count), device=x.device
+                    ),
                     "selected_route_rms": torch.sqrt(
-                        torch.where(finite_route, route.float().square(), 0.0).sum()
+                        torch.where(
+                            finite_route, route.float().square(), 0.0
+                        ).sum()
                         / finite_route_count
                     ).detach(),
                     "route_prior_scale_mean": self.route_prior_scale.mean().detach(),
@@ -2153,18 +2340,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         )
                     ).detach(),
                     "physical_routing_pack_size": torch.tensor(
-                        float(metadata.selector_tile_size),
-                        device=x.device,
+                        float(metadata.selector_tile_size), device=x.device
                     ),
                     "enumerate_all": torch.tensor(
-                        float(metadata.enumerate_all),
-                        device=x.device,
+                        float(metadata.enumerate_all), device=x.device
                     ),
                 }
-                self._routing_diagnostics = diagnostics
 
-        binding_evidence_heads: torch.Tensor
-        binding_confidence: torch.Tensor
         local_output, local_lse = self._local_lane(
             query, local_key, local_value, lengths
         )
@@ -2186,70 +2368,53 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             )
         else:
             global_output, global_lse = _eager_global_lane(
-                query, global_key, global_value, route, metadata,
+                query,
+                global_key,
+                global_value,
+                route,
+                metadata,
                 local_window=self.local_window,
             )
         attended, combined_lse, head_global_mass = _merge_attention_lanes_with_mass(
             local_output, local_lse, global_output, global_lse
         )
-        evidence_mass, confidence_mass = _isolate_binding_mass(head_global_mass)
-        binding_evidence_heads = global_output.float() * evidence_mass.unsqueeze(-1)
-        binding_confidence = confidence_mass.mean(1).unsqueeze(-1)
-        if collect_diagnostics:
+        binding_evidence_heads = (
+            global_output.float() * head_global_mass.unsqueeze(-1)
+        )
+        binding_confidence = head_global_mass.mean(1).unsqueeze(-1)
+
+        if emit_diagnostics:
             with torch.no_grad():
-                valid_local = torch.isfinite(local_lse)
-                valid_global = torch.isfinite(global_lse)
-                maximum = torch.maximum(local_lse, global_lse)
-                safe = torch.where(
-                    valid_local | valid_global,
-                    maximum,
-                    torch.zeros_like(maximum),
-                )
-                local_weight = torch.where(
-                    valid_local,
-                    torch.exp(local_lse - safe),
-                    torch.zeros_like(local_lse),
-                )
-                global_weight = torch.where(
-                    valid_global,
-                    torch.exp(global_lse - safe),
-                    torch.zeros_like(global_lse),
-                )
-                denominator = local_weight + global_weight
-                valid_rows = denominator > 0.0
+                valid_rows = torch.isfinite(combined_lse)
                 valid_count = valid_rows.sum().clamp_min(1)
                 global_mass = torch.where(
                     valid_rows,
-                    global_weight / denominator.clamp_min(1.0),
-                    torch.zeros_like(global_weight),
+                    head_global_mass.float(),
+                    torch.zeros_like(head_global_mass.float()),
                 )
                 self._routing_diagnostics["global_attention_mass"] = (
                     global_mass.sum() / valid_count
                 ).detach()
                 self._routing_diagnostics["local_attention_mass"] = (
-                    (torch.where(valid_rows, 1.0 - global_mass, 0.0).sum())
+                    torch.where(
+                        valid_rows, 1.0 - global_mass, 0.0
+                    ).sum()
                     / valid_count
                 ).detach()
                 self._routing_diagnostics["combined_lse_finite_rate"] = (
-                    torch.isfinite(combined_lse).float().mean().detach()
+                    valid_rows.float().mean().detach()
                 )
+
         merged = attended.permute(0, 2, 1, 3).reshape(
-            batch_size,
-            seq_len,
-            self.D,
+            batch_size, seq_len, self.D
         )
         projected = self.W_o(merged)
         output = projected * torch.sigmoid(gate)
         if self.binding_rank:
             # Scale remote evidence by its exact merged-softmax mass.
             output = output + self._binding_correction(
-                x,
-                binding_evidence_heads,
-                binding_confidence,
+                x, binding_evidence_heads, binding_confidence
             )
-        auxiliary = self._routing_auxiliary_loss
-        if auxiliary is None:
-            auxiliary = output.new_zeros(())
         if return_metadata and return_auxiliary:
             return output, metadata, auxiliary
         if return_metadata:
