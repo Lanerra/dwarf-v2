@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -34,29 +35,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from liger_kernel.transformers.fused_linear_cross_entropy import (
-    LigerFusedLinearCrossEntropyLoss,
-)
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_FILES = (
     "causal_ema_scan.py",
     "dsqg_attention_v23.py",
     "hierarchical_sparse_attn_v19_hisa.py",
 )
+KERNEL_CANDIDATES = (
+    SCRIPT_DIR,
+    SCRIPT_DIR / "kernels",
+    SCRIPT_DIR.parent / "kernels",
+    SCRIPT_DIR.parent.parent / "kernels",
+)
 KERNEL_DIR = next(
     (
         candidate
-        for candidate in (
-            SCRIPT_DIR,
-            SCRIPT_DIR / "kernels",
-            SCRIPT_DIR.parent / "kernels",
-            SCRIPT_DIR.parent.parent / "kernels",
-        )
+        for candidate in KERNEL_CANDIDATES
         if all((candidate / name).is_file() for name in KERNEL_FILES)
     ),
-    SCRIPT_DIR,
+    None,
 )
+if KERNEL_DIR is None:
+    searched = ", ".join(str(path) for path in KERNEL_CANDIDATES)
+    raise FileNotFoundError(
+        "canonical DWARF kernel files were not found together; searched: " + searched
+    )
 for directory in (SCRIPT_DIR, KERNEL_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
@@ -64,17 +67,22 @@ for directory in (SCRIPT_DIR, KERNEL_DIR):
 from causal_ema_scan import (  # noqa: E402
     bounded_ema_factor,
     causal_ema_scan3,
+    causal_ema_triton_available,
     inverse_bounded_ema_factor,
 )
 from dsqg_attention_v23 import (  # noqa: E402
     ALL_OFFSETS,
     DSQGAttentionV23,
+    dsqg_triton_available,
 )
 from hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
     HierarchicalSparseAttentionV19HISACausal,
+    hisa_runtime_capabilities,
 )
 
-CHECKPOINT_KIND = "dwarf-58m-dsqgv23-hisav19-resume-v1"
+CHECKPOINT_KIND = "dwarf-58m-dsqgv23-hisav19-resume-v2"
+LEGACY_CHECKPOINT_KIND = "dwarf-58m-dsqgv23-hisav19-resume-v1"
+RELEASE_KIND = "dwarf-58m-dsqgv23-hisav19-weights-v1"
 ROUTE_AUX_RECIPE_SEED = 20_260_809
 EXPECTED_PARAMETERS = 58_591_773
 EXPECTED_TRAINABLE_PARAMETERS = 58_591_757
@@ -84,6 +92,8 @@ EXPECTED_STATE_FINGERPRINT = (
 EXPECTED_SEEDED_RNG_FINGERPRINT = (
     "366b83cd1650cf2de8ccd2ffe5fb3ef27344c37e53c9ee57bd6c0914dd44c9b6"
 )
+
+
 @dataclass(frozen=True)
 class TrainRecipe:
     learning_rate: float = 3.0e-4
@@ -128,6 +138,7 @@ class DwarfConfig:
     global_mixer_layers: tuple[int, ...] = (3, 9)
     dropout: float = 0.05
     min_offset_support: int = 64
+    dsqg_backend: str = "triton"
     hisa_chunk_size: int = 32
     top_k_chunks: int = 4
     hisa_top_m_tokens: int = 32
@@ -178,16 +189,22 @@ class DwarfConfig:
         head_dim = self.embedding_dim // self.num_heads
         if head_dim & (head_dim - 1):
             raise ValueError("HISA requires a power-of-two head dimension")
-        if self.hisa_chunk_selection_scope not in {"token", "tile"}:
-            raise ValueError("HISA chunk selection scope must be token or tile")
+        if self.dsqg_backend not in {"auto", "eager", "triton"}:
+            raise ValueError("DSQG backend must be auto, eager, or triton")
+        if self.hisa_top_m_tokens != self.hisa_chunk_size:
+            raise ValueError(
+                "canonical HISA enumerates complete chunks; top-M must equal chunk size"
+            )
+        if self.hisa_chunk_selection_scope != "token":
+            raise ValueError("canonical HISA chunk selection scope must be token")
         if self.hisa_token_routing_pack_size not in {1, 2, 4, 8, 16}:
             raise ValueError("HISA token routing pack size must be 1, 2, 4, 8, or 16")
         if self.hisa_backend not in {"auto", "eager", "triton"}:
             raise ValueError("HISA backend must be auto, eager, or triton")
-        if self.hisa_token_selection_mode not in {"auto", "canonical"}:
-            raise ValueError("HISA token selection mode must be auto or canonical")
-        if self.hisa_local_backend not in {"flex", "combined"}:
-            raise ValueError("HISA local backend must be flex or combined")
+        if self.hisa_token_selection_mode != "auto":
+            raise ValueError("canonical HISA token selection mode must be auto")
+        if self.hisa_local_backend != "flex":
+            raise ValueError("canonical HISA local backend must be flex")
         if self.hisa_triton_block_q < 16 or self.hisa_triton_block_q & (
             self.hisa_triton_block_q - 1
         ):
@@ -298,35 +315,464 @@ def source_manifest() -> dict[str, str]:
     return {name: _sha256(path) for name, path in locations.items()}
 
 
+def _package_version(name: str) -> str | None:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _load_liger_loss_class():
+    try:
+        from liger_kernel.transformers.fused_linear_cross_entropy import (
+            LigerFusedLinearCrossEntropyLoss,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "DWARF training requires Liger fused linear cross-entropy"
+        ) from error
+    return LigerFusedLinearCrossEntropyLoss
+
+
+def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
+    environment: dict[str, Any] = {
+        "python": sys.version.split()[0],
+        "pytorch": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "cudnn": (
+            None if not torch.backends.cudnn.is_available()
+            else torch.backends.cudnn.version()
+        ),
+        "triton": _package_version("triton"),
+        "liger_kernel": _package_version("liger-kernel"),
+        "tokenizers": _package_version("tokenizers"),
+        "execution_policy": {
+            "autocast_dtype": "bfloat16",
+            "compile_mode": "default",
+            "compile_dynamic": False,
+            "compiled_backward_autocast": "off",
+        },
+    }
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        resolved = torch.device(
+            "cuda", torch.cuda.current_device() if device.index is None else device.index
+        )
+        properties = torch.cuda.get_device_properties(resolved)
+        environment["gpu"] = {
+            "logical_device": resolved.index,
+            "name": properties.name,
+            "uuid": str(properties.uuid),
+            "compute_capability": [properties.major, properties.minor],
+            "total_memory": properties.total_memory,
+            "visible_device_count": torch.cuda.device_count(),
+        }
+    return environment
+
+
+def validate_training_runtime(
+    device: torch.device, config: DwarfConfig
+) -> tuple[type, dict[str, Any]]:
+    """Fail before data hashing or model allocation when production backends are absent."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("DWARF training requires CUDA")
+    resolved_index = torch.cuda.current_device() if device.index is None else device.index
+    if not 0 <= resolved_index < torch.cuda.device_count():
+        raise ValueError(f"CUDA device index {resolved_index} is not visible")
+    torch.cuda.set_device(resolved_index)
+    resolved = torch.device("cuda", resolved_index)
+    try:
+        native_bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:  # Compatibility with older supported PyTorch point releases.
+        native_bf16 = torch.cuda.is_bf16_supported()
+    if not native_bf16:
+        raise RuntimeError("canonical DWARF training requires native CUDA BF16 support")
+    if not hasattr(torch.optim, "Muon"):
+        raise RuntimeError("DWARF requires torch.optim.Muon (PyTorch >= 2.9)")
+    if config.dsqg_backend != "eager" and not dsqg_triton_available():
+        raise RuntimeError("canonical CUDA DSQG execution requires Triton")
+    if not causal_ema_triton_available():
+        raise RuntimeError("canonical CUDA causal EMA execution requires Triton")
+    hisa = hisa_runtime_capabilities()
+    if not hisa["flex_attention"]:
+        raise RuntimeError("canonical CUDA HISA execution requires FlexAttention")
+    if config.hisa_backend != "eager" and not hisa["triton"]:
+        raise RuntimeError("canonical CUDA HISA global execution requires Triton")
+    loss_class = _load_liger_loss_class()
+    return loss_class, runtime_environment(resolved)
+
+
+def _environment_abi(value: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint runtime environment is invalid")
+    gpu = value.get("gpu")
+    if not isinstance(gpu, dict):
+        raise ValueError("checkpoint GPU environment is invalid")
+    return {
+        "python": value.get("python"),
+        "pytorch": value.get("pytorch"),
+        "cuda_runtime": value.get("cuda_runtime"),
+        "cudnn": value.get("cudnn"),
+        "triton": value.get("triton"),
+        "liger_kernel": value.get("liger_kernel"),
+        "execution_policy": value.get("execution_policy"),
+        # Device UUID, logical index, memory size, and visible-device count are
+        # intentionally excluded. The numerical/runtime ABI is tied to the GPU
+        # family and compute capability, not to unrelated visibility changes.
+        "gpu_name": gpu.get("name"),
+        "compute_capability": gpu.get("compute_capability"),
+    }
+
+
+def validate_checkpoint_environment(
+    saved: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    allow_mismatch: bool = False,
+) -> None:
+    saved_abi = _environment_abi(saved)
+    current_abi = _environment_abi(current)
+    if saved_abi == current_abi:
+        return
+    if allow_mismatch:
+        return
+    differences = {
+        key: {"saved": saved_abi.get(key), "current": current_abi.get(key)}
+        for key in sorted(set(saved_abi) | set(current_abi))
+        if saved_abi.get(key) != current_abi.get(key)
+    }
+    raise ValueError(
+        "checkpoint runtime environment does not match; pass "
+        "--allow-environment-mismatch only after reviewing: "
+        + json.dumps(differences, sort_keys=True)
+    )
+
+
+def _architecture_without_sources(value: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint architecture metadata is invalid")
+    result = copy.deepcopy(value)
+    result.pop("sources", None)
+    return result
+
+
 def validate_checkpoint_architecture(
+    saved: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    allow_source_mismatch: bool = False,
+) -> None:
+    if _architecture_without_sources(saved) != _architecture_without_sources(current):
+        raise ValueError("checkpoint semantic architecture does not match")
+    if saved.get("sources") != current.get("sources") and not allow_source_mismatch:
+        raise ValueError(
+            "checkpoint source manifest does not match; pass "
+            "--allow-source-mismatch only after reviewing the source diff"
+        )
+
+
+def validate_legacy_v1_architecture(
     saved: dict[str, Any], current: dict[str, Any]
 ) -> None:
-    if saved != current:
-        raise ValueError("checkpoint architecture or source manifest does not match")
+    """Validate a pre-hardening v1 checkpoint without trusting stale source hashes."""
+    if not isinstance(saved, dict) or saved.get("format") != (
+        "dwarf-58m-dsqgv23-hisav19-v1"
+    ):
+        raise ValueError("legacy checkpoint architecture format does not match")
+    if saved.get("parameters") != current.get("parameters") or saved.get(
+        "trainable_parameters"
+    ) != current.get("trainable_parameters"):
+        raise ValueError("legacy checkpoint parameter counts do not match")
+    current_config = copy.deepcopy(current.get("config"))
+    if not isinstance(current_config, dict):
+        raise ValueError("current architecture config is invalid")
+    current_config.pop("dsqg_backend", None)
+    if saved.get("config") != current_config:
+        raise ValueError("legacy checkpoint model config does not match")
+    saved_topology = saved.get("topology")
+    current_topology = current.get("topology")
+    if not isinstance(saved_topology, dict) or not isinstance(current_topology, dict):
+        raise ValueError("legacy checkpoint topology is invalid")
+    for key in (
+        "layers",
+        "global_mixer_layers",
+        "dsqg",
+        "hisa",
+        "offset_groups",
+    ):
+        if saved_topology.get(key) != current_topology.get(key):
+            raise ValueError(f"legacy checkpoint topology does not match: {key}")
+
+
+def _require(condition: bool, message: str) -> None:
+    """Raise an explicit release-test failure even under ``python -O``."""
+    if not bool(condition):
+        raise AssertionError(message)
+
+
+def _require_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+    message: str,
+) -> None:
+    if actual.shape != expected.shape or not torch.allclose(
+        actual, expected, atol=atol, rtol=rtol
+    ):
+        maximum = (
+            float((actual - expected).abs().max())
+            if actual.shape == expected.shape and actual.numel()
+            else float("inf")
+        )
+        raise AssertionError(f"{message}; maximum absolute difference={maximum}")
+
+
+def _require_raises(
+    error_type: type[BaseException], callable_, message: str
+) -> None:
+    try:
+        callable_()
+    except error_type:
+        return
+    except BaseException as error:
+        raise AssertionError(
+            f"{message}; raised {type(error).__name__} instead of {error_type.__name__}"
+        ) from error
+    raise AssertionError(f"{message}; no exception was raised")
+
+
+def _independent_lagged_ema(
+    x: torch.Tensor, factors: torch.Tensor
+) -> torch.Tensor:
+    accumulator_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    state = torch.zeros(
+        x.shape[0], 3, x.shape[2], device=x.device, dtype=accumulator_dtype
+    )
+    alpha = factors.to(accumulator_dtype).reshape(1, 3, 1)
+    rows: list[torch.Tensor] = []
+    values = x.to(accumulator_dtype)
+    for token in range(x.shape[1]):
+        rows.append(state)
+        state = alpha * values[:, token, None] + (1.0 - alpha) * state
+    if not rows:
+        return x.new_empty((x.shape[0], 0, 3, x.shape[2]))
+    return torch.stack(rows, dim=1).to(x.dtype)
 
 
 def assert_public_kernel_contracts() -> None:
+    """Exercise CPU reference semantics without relying on optimized asserts."""
     state = torch.random.get_rng_state()
     try:
         torch.manual_seed(17)
-        kwargs = {
+
+        # Causal EMA: preceding-state semantics and exact CPU gradients.
+        ema_x = torch.randn(2, 9, 7, dtype=torch.float64, requires_grad=True)
+        ema_factors = torch.tensor(
+            (0.07, 0.19, 0.41), dtype=torch.float64, requires_grad=True
+        )
+        ema_actual = causal_ema_scan3(ema_x, ema_factors)
+        ema_expected = _independent_lagged_ema(ema_x, ema_factors)
+        _require_close(
+            ema_actual,
+            ema_expected,
+            atol=0.0,
+            rtol=0.0,
+            message="causal EMA preceding-state recurrence changed",
+        )
+        probe = torch.randn_like(ema_actual)
+        actual_gradients = torch.autograd.grad(
+            (ema_actual * probe).sum(), (ema_x, ema_factors), retain_graph=False
+        )
+        expected_gradients = torch.autograd.grad(
+            (ema_expected * probe).sum(), (ema_x, ema_factors), retain_graph=False
+        )
+        for name, actual, expected in zip(
+            ("input", "factor"), actual_gradients, expected_gradients, strict=True
+        ):
+            _require_close(
+                actual,
+                expected,
+                atol=1e-12,
+                rtol=1e-12,
+                message=f"causal EMA {name} gradient changed",
+            )
+
+        # DSQG: state compatibility, support boundary, strict causality, and
+        # bounded live telemetry.
+        dsqg_kwargs = {
             "embedding_dim": 64,
             "num_heads": 4,
             "offsets": (29, 32, 47),
             "seq_len": 64,
             "dropout": 0.0,
             "backend": "eager",
+            "diagnostic_max_queries": 5,
         }
-        module = DSQGAttentionV23(**kwargs).double()
-        assert module.offsets == (29, 32, 47)
-        restored = DSQGAttentionV23(**kwargs).double()
-        incompatible = restored.load_state_dict(module.state_dict(), strict=True)
-        assert not incompatible.missing_keys and not incompatible.unexpected_keys
+        dsqg = DSQGAttentionV23(**dsqg_kwargs).double().eval()
+        _require(dsqg.offsets == (29, 32, 47), "DSQG offsets changed")
+        restored = DSQGAttentionV23(**dsqg_kwargs).double()
+        incompatible = restored.load_state_dict(dsqg.state_dict(), strict=True)
+        _require(
+            not incompatible.missing_keys and not incompatible.unexpected_keys,
+            "DSQG state-dict compatibility changed",
+        )
         values = torch.randn(2, 64, 64, dtype=torch.float64, requires_grad=True)
-        output = module(values)
-        assert torch.equal(output[:, :29], torch.zeros_like(output[:, :29]))
-        output.square().mean().backward()
-        assert torch.isfinite(values.grad).all()
+        output = dsqg(values, collect_diagnostics=True)
+        _require(
+            torch.equal(output[:, :29], torch.zeros_like(output[:, :29])),
+            "DSQG emitted values before minimum-offset support",
+        )
+        _require(
+            torch.isfinite(output).all(), "DSQG CPU reference emitted non-finite values"
+        )
+        diagnostics = dsqg.routing_diagnostics()
+        for key in (
+            "null_attention_mass",
+            "local_offset_mass",
+            "mid_offset_mass",
+            "long_offset_mass",
+            "content_gate_mean",
+        ):
+            _require(key in diagnostics, f"DSQG diagnostic is absent: {key}")
+            _require(
+                torch.isfinite(diagnostics[key]).all(),
+                f"DSQG diagnostic is non-finite: {key}",
+            )
+        split = 49
+        changed = values.detach().clone()
+        changed[:, split:] = torch.randn_like(changed[:, split:]) * 7.0
+        prefix_a = dsqg(values.detach())[:, :split]
+        prefix_b = dsqg(changed)[:, :split]
+        _require_close(
+            prefix_a,
+            prefix_b,
+            atol=0.0,
+            rtol=0.0,
+            message="DSQG future-token perturbation changed a causal prefix",
+        )
+        future_gradient = torch.autograd.grad(
+            output[:, :split].square().sum(), values, retain_graph=False
+        )[0][:, split:]
+        _require(
+            torch.count_nonzero(future_gradient) == 0,
+            "DSQG causal prefix has a future-token gradient",
+        )
+
+        # HISA: local/global merge, sampled auxiliary, strict causality, and
+        # formerly dead controls.
+        hisa_kwargs = {
+            "D": 64,
+            "H": 4,
+            "hd": 16,
+            "top_k_chunks": 2,
+            "hisa_top_m_tokens": 8,
+            "chunk_size": 8,
+            "local_window": 16,
+            "selector_tile_size": 4,
+            "token_routing_pack_size": 2,
+            "exploration_probability": 0.0,
+            "route_aux_weight": 0.02,
+            "route_aux_samples": 2,
+            "route_aux_temperature": 0.5,
+            "route_aux_oracle_temperature": 0.3,
+            "global_adapter_rank": 8,
+            "binding_rank": 8,
+            "max_seq_len": 64,
+            "backend": "eager",
+            "diagnostic_max_queries": 4,
+        }
+        hisa = HierarchicalSparseAttentionV19HISACausal(**hisa_kwargs).train()
+        hisa_input = torch.randn(2, 64, 64, requires_grad=True)
+        auxiliary_ids = torch.tensor((24, 47), dtype=torch.int64)
+        hisa_output, hisa_auxiliary = hisa(
+            hisa_input,
+            route_aux_tile_ids=auxiliary_ids,
+            collect_diagnostics=True,
+            return_auxiliary=True,
+        )
+        _require(
+            torch.isfinite(hisa_output).all() and torch.isfinite(hisa_auxiliary),
+            "HISA CPU reference emitted a non-finite output or auxiliary",
+        )
+        _require(
+            torch.equal(hisa_output[:, :1], torch.zeros_like(hisa_output[:, :1])),
+            "strict-causal HISA position zero is not exactly zero",
+        )
+        (hisa_output.square().mean() + hisa_auxiliary).backward()
+        _require(
+            hisa_input.grad is not None and torch.isfinite(hisa_input.grad).all(),
+            "HISA CPU backward produced an absent or non-finite input gradient",
+        )
+        _require(
+            hisa.hisa_evidence_capture is None,
+            "ordinary HISA diagnostics retained the full selector capture",
+        )
+        _require(
+            "global_attention_mass" in hisa._routing_diagnostics,
+            "HISA live routing diagnostics were not populated",
+        )
+
+        hisa.eval()
+        causal_input = torch.randn(1, 64, 64, requires_grad=True)
+        causal_changed = causal_input.detach().clone()
+        causal_split = 51
+        causal_changed[:, causal_split:] = torch.randn_like(
+            causal_changed[:, causal_split:]
+        ) * 11.0
+        causal_a = hisa(causal_input)[:, :causal_split]
+        causal_b = hisa(causal_changed)[:, :causal_split]
+        _require_close(
+            causal_a,
+            causal_b,
+            atol=0.0,
+            rtol=0.0,
+            message="HISA future-token perturbation changed a causal prefix",
+        )
+        hisa_future_gradient = torch.autograd.grad(
+            causal_a.square().sum(), causal_input, retain_graph=False
+        )[0][:, causal_split:]
+        _require(
+            torch.count_nonzero(hisa_future_gradient) == 0,
+            "HISA causal prefix has a future-token gradient",
+        )
+
+        cold = HierarchicalSparseAttentionV19HISACausal(
+            **hisa_kwargs, temperature=0.5
+        ).eval()
+        hot = HierarchicalSparseAttentionV19HISACausal(
+            **hisa_kwargs, temperature=2.0
+        ).eval()
+        hot.load_state_dict(cold.state_dict(), strict=True)
+        control_input = torch.randn(1, 64, 64)
+        cold_output = cold(control_input)
+        hot_output = hot(control_input)
+        _require(
+            not torch.allclose(cold_output, hot_output, atol=1e-8, rtol=1e-8),
+            "HISA temperature is still a semantic no-op",
+        )
+        mean_low = float(
+            HierarchicalSparseAttentionV19HISACausal(
+                **hisa_kwargs, representative_blend_alpha=0.2
+            ).representative_mix.detach().mean()
+        )
+        mean_high = float(
+            HierarchicalSparseAttentionV19HISACausal(
+                **hisa_kwargs, representative_blend_alpha=0.8
+            ).representative_mix.detach().mean()
+        )
+        _require(
+            mean_low < 0.25 and mean_high > 0.75,
+            "HISA representative_blend_alpha does not control initialization",
+        )
+        bounded = HierarchicalSparseAttentionV19HISACausal(
+            **{**hisa_kwargs, "max_seq_len": 32}
+        )
+        _require_raises(
+            ValueError,
+            lambda: bounded(torch.randn(1, 33, 64)),
+            "HISA max_seq_len is not enforced",
+        )
     finally:
         torch.random.set_rng_state(state)
 
@@ -430,8 +876,12 @@ class DSQGBlock(nn.Module):
             null_bias_limit=6.0,
             pos_bias_max_slope=0.75,
             pos_bias_residual_limit=1.5,
-            support_crop_projections=True,
+            backend=config.dsqg_backend,
+            # Every canonical group contains offsets 1..8, so projection cropping
+            # can never activate and only creates a misleading execution surface.
+            support_crop_projections=False,
             support_crop_min_offset=64,
+            diagnostic_max_queries=config.hisa_diagnostic_max_queries,
         )
         _consume_retired_movt_rng(
             offsets,
@@ -441,8 +891,12 @@ class DSQGBlock(nn.Module):
         )
         self.ffn = SwiGLUFFN(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
+    def forward(
+        self, x: torch.Tensor, *, collect_diagnostics: bool = False
+    ) -> torch.Tensor:
+        x = x + self.attn(
+            self.norm1(x), collect_diagnostics=collect_diagnostics
+        )
         return x + self.ffn(self.norm2(x))
 
 
@@ -582,7 +1036,7 @@ class DwarfForCausalLM(nn.Module):
             if isinstance(module, HierarchicalSparseAttentionV19HISACausal):
                 module.prepare_runtime(device, self.config.model_length)
 
-    def forward_hidden(
+    def _forward_hidden_impl(
         self,
         input_ids: torch.Tensor,
         *,
@@ -595,7 +1049,7 @@ class DwarfForCausalLM(nn.Module):
         if x.is_cuda:
             x = x.to(torch.bfloat16)
         x = self.dropout(x)
-        auxiliary = x.new_zeros(())
+        auxiliary = x.new_zeros((), dtype=torch.float32)
         for block in self.blocks:
             if isinstance(block, GlobalMixerBlock):
                 x, block_auxiliary = block(
@@ -604,13 +1058,53 @@ class DwarfForCausalLM(nn.Module):
                     route_aux_tile_ids,
                     collect_diagnostics,
                 )
-                auxiliary = auxiliary + block_auxiliary
+                auxiliary = auxiliary + block_auxiliary.float()
             else:
-                x = block(x)
+                x = block(x, collect_diagnostics=collect_diagnostics)
         hidden = self.norm(x)
         if hidden.is_cuda:
             hidden = hidden.to(torch.bfloat16)
         return (hidden, auxiliary) if return_auxiliary else hidden
+
+    def forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        valid_lengths: torch.Tensor | None = None,
+        route_aux_tile_ids: torch.Tensor | None = None,
+        collect_diagnostics: bool = False,
+        return_auxiliary: bool = False,
+    ):
+        kwargs = {
+            "valid_lengths": valid_lengths,
+            "route_aux_tile_ids": route_aux_tile_ids,
+            "collect_diagnostics": collect_diagnostics,
+            "return_auxiliary": return_auxiliary,
+        }
+        if input_ids.is_cuda and not torch.is_autocast_enabled():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                return self._forward_hidden_impl(input_ids, **kwargs)
+        return self._forward_hidden_impl(input_ids, **kwargs)
+
+    def _forward_impl(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        valid_lengths: torch.Tensor | None = None,
+        route_aux_tile_ids: torch.Tensor | None = None,
+        collect_diagnostics: bool = False,
+        return_hidden: bool = False,
+        return_auxiliary: bool = False,
+    ):
+        hidden, auxiliary = self._forward_hidden_impl(
+            input_ids,
+            valid_lengths=valid_lengths,
+            route_aux_tile_ids=route_aux_tile_ids,
+            collect_diagnostics=collect_diagnostics,
+            return_auxiliary=True,
+        )
+        output = hidden if return_hidden else self.lm_head(hidden)
+        return (output, auxiliary) if return_auxiliary else output
 
     def forward(
         self,
@@ -622,15 +1116,17 @@ class DwarfForCausalLM(nn.Module):
         return_hidden: bool = False,
         return_auxiliary: bool = False,
     ):
-        hidden, auxiliary = self.forward_hidden(
-            input_ids,
-            valid_lengths=valid_lengths,
-            route_aux_tile_ids=route_aux_tile_ids,
-            collect_diagnostics=collect_diagnostics,
-            return_auxiliary=True,
-        )
-        output = hidden if return_hidden else self.lm_head(hidden)
-        return (output, auxiliary) if return_auxiliary else output
+        kwargs = {
+            "valid_lengths": valid_lengths,
+            "route_aux_tile_ids": route_aux_tile_ids,
+            "collect_diagnostics": collect_diagnostics,
+            "return_hidden": return_hidden,
+            "return_auxiliary": return_auxiliary,
+        }
+        if input_ids.is_cuda and not torch.is_autocast_enabled():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                return self._forward_impl(input_ids, **kwargs)
+        return self._forward_impl(input_ids, **kwargs)
 
 
 def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
@@ -639,16 +1135,23 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
         for index, block in enumerate(model.blocks)
         if isinstance(block, GlobalMixerBlock)
     ]
+    dsqg_mixers = [
+        (index, block)
+        for index, block in enumerate(model.blocks)
+        if isinstance(block, DSQGBlock)
+    ]
     layer_names = [
         "HISA" if isinstance(block, GlobalMixerBlock) else "DSQG"
         for block in model.blocks
     ]
     return {
-        "format": "dwarf-58m-dsqgv23-hisav19-v1",
+        "format": "dwarf-58m-dsqgv23-hisav19-v2",
         "config": asdict(model.config),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameters": sum(
-            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
         ),
         "topology": {
             "layers": ",".join(layer_names),
@@ -657,6 +1160,24 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
             "hisa": "v19-accessible-routing-semantic-binder",
             "offset_groups": model.offset_groups,
         },
+        "complexity": {
+            "dsqg_attention": "linear_in_sequence_length_for_fixed_offsets",
+            "hisa_selected_attention": "linear_in_sequence_length_for_fixed_routing",
+            "selector": "quadratic_in_sequence_length_at_fixed_chunk_size",
+        },
+        "cache": {
+            "bounded_dsqg_history": True,
+            "model_level_o1_kv_cache": False,
+            "incremental_generation_api": False,
+        },
+        "dsqg": [
+            {
+                "layer": index,
+                "semantic": block.attn.semantic_config(),
+                "execution": block.attn.execution_config(),
+            }
+            for index, block in dsqg_mixers
+        ],
         "hisa": [
             {
                 "layer": index,
@@ -1286,12 +1807,15 @@ def build_training_row_order(
         raise ValueError(
             f"dataset has {dataset_rows} rows; this run requires {minimum_rows}"
         )
-    selected_steps = min(recipe.steps, dataset_rows // recipe.effective_batch)
+    # Select exactly the requested run horizon. A later resume may safely extend
+    # this same deterministic sequential prefix without rescanning unused rows.
+    selected_steps = stop_step
     selected_rows = selected_steps * recipe.effective_batch
     return torch.arange(selected_rows, dtype=torch.int64), {
         "mode": "sequential_prefix",
         "rows": selected_rows,
         "steps": selected_steps,
+        "dataset_order_requirement": "rows_must_be_pre_shuffled",
     }
 
 
@@ -1333,8 +1857,9 @@ def validate_dataset_identity(
         for value in (saved_rows, current_rows)
     ):
         raise ValueError("checkpoint dataset selection does not cover consumed rows")
-    if current_rows < saved_rows:
-        raise ValueError("checkpoint dataset selection cannot shrink on resume")
+    # The selected horizon may grow or shrink across invocations. Both selections
+    # are the same sequential prefix, and the consumed-row bound above is the only
+    # condition needed for an exact resume.
 
 
 def preflight_training_rows(
@@ -1342,6 +1867,7 @@ def preflight_training_rows(
     *,
     selected_rows: int,
     vocab_size: int,
+    pad_token_id: int | None = None,
     chunk_rows: int = 1024,
 ) -> dict[str, int]:
     if dataset.device.type != "cpu" or dataset.ndim != 2:
@@ -1350,21 +1876,31 @@ def preflight_training_rows(
         raise ValueError("dataset preflight bounds are invalid")
     minimum = vocab_size
     maximum = -1
+    pad_tokens = 0
     for start in range(0, selected_rows, chunk_rows):
         rows = dataset[start : min(start + chunk_rows, selected_rows)]
-        local_min = int(rows.min())
-        local_max = int(rows.max())
+        local_min_tensor, local_max_tensor = torch.aminmax(rows)
+        local_min = int(local_min_tensor)
+        local_max = int(local_max_tensor)
         if local_min < 0 or local_max >= vocab_size:
             raise ValueError(
                 f"selected row contains a token outside vocabulary [0,{vocab_size})"
             )
+        if pad_token_id is not None:
+            pad_tokens += int((rows == int(pad_token_id)).sum())
         minimum = min(minimum, local_min)
         maximum = max(maximum, local_max)
+    if pad_tokens:
+        raise ValueError(
+            f"selected packed rows contain {pad_tokens} pad tokens, but the canonical "
+            "fused language-model loss has no padding mask"
+        )
     return {
         "rows": selected_rows,
         "tokens": selected_rows * dataset.shape[1],
         "minimum_token_id": minimum,
         "maximum_token_id": maximum,
+        "pad_tokens": pad_tokens,
     }
 
 
@@ -1379,7 +1915,7 @@ class _TrainingForwardCallable(nn.Module):
         input_ids: torch.Tensor,
         route_aux_tile_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.model(
+        return self.model._forward_impl(
             input_ids,
             valid_lengths=None,
             route_aux_tile_ids=route_aux_tile_ids,
@@ -1397,15 +1933,15 @@ def compiled_training_callables(
         mode="default",
         dynamic=False,
     )
-    diagnostic = torch.compile(
-        _TrainingForwardCallable(model, diagnostics=True),
-        mode="default",
-        dynamic=False,
-    )
+    # Diagnostics intentionally remain eager: they mutate per-layer telemetry
+    # dictionaries and run only on the final microbatch of logging updates.
+    diagnostic = _TrainingForwardCallable(model, diagnostics=True)
     return normal, diagnostic
 
 
 class BatchStager:
+    """Double-buffer contiguous packed rows with overlapped H2D transfer."""
+
     def __init__(
         self,
         dataset: torch.Tensor,
@@ -1416,65 +1952,110 @@ class BatchStager:
         self.dataset = dataset
         self.batch_size = batch_size
         self.device = device
-        self.buffers = [
-            torch.empty(
-                (batch_size, dataset.shape[1]),
-                dtype=dataset.dtype,
-                pin_memory=True,
-            )
+        shape = (batch_size, dataset.shape[1])
+        self.host_buffers = [
+            torch.empty(shape, dtype=dataset.dtype, pin_memory=True)
             for _ in range(2)
         ]
-        self.stream = torch.cuda.Stream(device=device)
-        self.events = [torch.cuda.Event() for _ in range(2)]
-        self.recorded = [False, False]
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dwarf-data")
+        self.device_buffers = [
+            torch.empty(shape, dtype=torch.long, device=device)
+            for _ in range(2)
+        ]
+        self.transfer_stream = torch.cuda.Stream(device=device)
+        self.copy_done = [torch.cuda.Event() for _ in range(2)]
+        self.compute_done = [torch.cuda.Event() for _ in range(2)]
+        self.copy_recorded = [False, False]
+        self.compute_recorded = [False, False]
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dwarf-data"
+        )
 
-    def _fill(self, indices: torch.Tensor, slot: int) -> int:
-        if self.recorded[slot]:
-            self.events[slot].synchronize()
-        self.buffers[slot].copy_(self.dataset[indices])
+    def _fill_contiguous(self, row_start: int, slot: int) -> int:
+        if self.copy_recorded[slot]:
+            self.copy_done[slot].synchronize()
+        source = self.dataset.narrow(0, row_start, self.batch_size)
+        self.host_buffers[slot].copy_(source)
         return slot
 
-    def _to_device(self, slot: int) -> torch.Tensor:
-        with torch.cuda.stream(self.stream):
-            result = self.buffers[slot].to(
-                device=self.device,
-                dtype=torch.long,
-                non_blocking=True,
+    def _enqueue_copy(self, slot: int) -> None:
+        with torch.cuda.stream(self.transfer_stream):
+            if self.compute_recorded[slot]:
+                self.transfer_stream.wait_event(self.compute_done[slot])
+            self.device_buffers[slot].copy_(
+                self.host_buffers[slot], non_blocking=True
             )
-            self.events[slot].record(self.stream)
-            self.recorded[slot] = True
+            self.copy_done[slot].record(self.transfer_stream)
+            self.copy_recorded[slot] = True
+
+    def _wait_for_copy(self, slot: int) -> torch.Tensor:
         current = torch.cuda.current_stream(self.device)
-        current.wait_stream(self.stream)
-        result.record_stream(current)
-        return result
+        current.wait_event(self.copy_done[slot])
+        return self.device_buffers[slot]
 
     def batches(self, update_indices: torch.Tensor) -> Iterator[torch.Tensor]:
-        microbatches = [
-            update_indices[start : start + self.batch_size]
-            for start in range(0, len(update_indices), self.batch_size)
+        if update_indices.device.type != "cpu" or update_indices.ndim != 1:
+            raise ValueError("batch staging indices must be a one-dimensional CPU tensor")
+        if len(update_indices) % self.batch_size:
+            raise ValueError("update row count must be divisible by the microbatch size")
+        if not len(update_indices):
+            return
+        first = int(update_indices[0])
+        expected = torch.arange(first, first + len(update_indices), dtype=torch.int64)
+        if not torch.equal(update_indices.to(torch.int64), expected):
+            raise ValueError(
+                "canonical BatchStager requires contiguous sequential row indices"
+            )
+        starts = list(range(first, first + len(update_indices), self.batch_size))
+
+        initial_fills = [
+            self.executor.submit(self._fill_contiguous, starts[index], index)
+            for index in range(min(2, len(starts)))
         ]
-        future: Future[int] = self.executor.submit(self._fill, microbatches[0], 0)
-        for index in range(len(microbatches)):
-            slot = future.result()
-            if index + 1 < len(microbatches):
-                next_slot = (index + 1) % 2
-                future = self.executor.submit(
-                    self._fill,
-                    microbatches[index + 1],
-                    next_slot,
+        for future in initial_fills:
+            self._enqueue_copy(future.result())
+
+        for index in range(len(starts)):
+            slot = index % 2
+            batch = self._wait_for_copy(slot)
+            next_index = index + 2
+            # The previous H2D read of this host slot has completed, so refill it
+            # while the consumer computes on the corresponding device buffer.
+            next_fill = (
+                self.executor.submit(
+                    self._fill_contiguous, starts[next_index], slot
                 )
-            yield self._to_device(slot)
+                if next_index < len(starts)
+                else None
+            )
+            yield batch
+
+            # The consumer has now enqueued forward/backward work on the current
+            # stream. Record when this persistent device slot becomes reusable.
+            current = torch.cuda.current_stream(self.device)
+            self.compute_done[slot].record(current)
+            self.compute_recorded[slot] = True
+
+            if next_fill is not None:
+                next_fill.result()
+                # This transfer waits for compute_done[slot] and can overlap the
+                # other slot's next microbatch.
+                self._enqueue_copy(slot)
 
     def close(self) -> None:
         self.executor.shutdown(wait=True)
+        self.transfer_stream.synchronize()
 
 
 def _tensor_storage_key(value: torch.Tensor) -> tuple[Any, ...] | None:
     if value.layout != torch.strided:
         return None
     storage = value.untyped_storage()
-    return (value.device.type, value.device.index, storage._cdata, storage.nbytes())
+    return (
+        value.device.type,
+        value.device.index,
+        storage.data_ptr(),
+        storage.nbytes(),
+    )
 
 
 @dataclass
@@ -1642,6 +2223,15 @@ class AsyncCheckpointWriter:
             self.executor.shutdown(wait=True)
 
 
+def _resolved_cuda_device(device: torch.device | str) -> torch.device:
+    value = torch.device(device)
+    if value.type != "cuda":
+        raise ValueError("expected a CUDA device")
+    return torch.device(
+        "cuda", torch.cuda.current_device() if value.index is None else value.index
+    )
+
+
 def checkpoint_payload(
     *,
     step: int,
@@ -1649,8 +2239,11 @@ def checkpoint_payload(
     optimizer: MultiOptimizer,
     architecture: dict[str, Any],
     dataset: dict[str, Any],
+    device: torch.device,
+    environment: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = {
+    resolved = _resolved_cuda_device(device)
+    return {
         "kind": CHECKPOINT_KIND,
         "step": step,
         "model": model.state_dict(),
@@ -1658,11 +2251,43 @@ def checkpoint_payload(
         "architecture": architecture,
         "recipe": asdict(RECIPE),
         "dataset": dataset,
+        "environment": copy.deepcopy(environment),
         "python_rng": random.getstate(),
         "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all(),
+        # Save only the selected training device. Resume is then independent of
+        # unrelated GPUs becoming visible, hidden, or reordered.
+        "cuda_rng": torch.cuda.get_rng_state(resolved),
     }
-    return payload
+
+
+def release_payload(
+    *,
+    step: int,
+    model: DwarfForCausalLM,
+    architecture: dict[str, Any],
+    tokenizer: dict[str, Any],
+    environment: dict[str, Any],
+) -> dict[str, Any]:
+    public_tokenizer = copy.deepcopy(tokenizer)
+    public_tokenizer.pop("path", None)
+    public_environment = copy.deepcopy(environment)
+    gpu = public_environment.get("gpu")
+    if isinstance(gpu, dict):
+        for private_key in (
+            "logical_device",
+            "uuid",
+            "visible_device_count",
+            "total_memory",
+        ):
+            gpu.pop(private_key, None)
+    return {
+        "kind": RELEASE_KIND,
+        "step": int(step),
+        "model": model.state_dict(),
+        "architecture": copy.deepcopy(architecture),
+        "tokenizer": public_tokenizer,
+        "environment": public_environment,
+    }
 
 
 def restore_checkpoint(
@@ -1672,13 +2297,39 @@ def restore_checkpoint(
     optimizer: MultiOptimizer,
     architecture: dict[str, Any],
     dataset: dict[str, Any],
+    device: torch.device,
+    environment: dict[str, Any] | None = None,
+    allow_source_mismatch: bool = False,
+    allow_environment_mismatch: bool = False,
+    allow_legacy_v1: bool = False,
 ) -> int:
     checkpoint = torch.load(Path(path), map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise ValueError("not a canonical DWARF resumable checkpoint")
-    if checkpoint.get("kind") != CHECKPOINT_KIND:
+    kind = checkpoint.get("kind")
+    legacy = kind == LEGACY_CHECKPOINT_KIND
+    if kind not in {CHECKPOINT_KIND, LEGACY_CHECKPOINT_KIND}:
         raise ValueError("not a canonical DWARF resumable checkpoint")
-    validate_checkpoint_architecture(checkpoint.get("architecture"), architecture)
+    if legacy and not allow_legacy_v1:
+        raise ValueError(
+            "this is a pre-hardening v1 checkpoint; pass "
+            "--allow-legacy-v1-resume after reviewing compatibility"
+        )
+    if legacy:
+        validate_legacy_v1_architecture(
+            checkpoint.get("architecture"), architecture
+        )
+    else:
+        validate_checkpoint_architecture(
+            checkpoint.get("architecture"),
+            architecture,
+            allow_source_mismatch=allow_source_mismatch,
+        )
+        validate_checkpoint_environment(
+            checkpoint.get("environment"),
+            runtime_environment(device) if environment is None else environment,
+            allow_mismatch=allow_environment_mismatch,
+        )
     if checkpoint.get("recipe") != asdict(RECIPE):
         raise ValueError("checkpoint recipe does not match")
     step = checkpoint.get("step")
@@ -1695,12 +2346,24 @@ def restore_checkpoint(
         raise ValueError("checkpoint model keys do not match")
     for name, expected in expected_model.items():
         saved = saved_model[name]
-        if not torch.is_tensor(saved) or saved.shape != expected.shape or saved.dtype != expected.dtype:
+        if (
+            not torch.is_tensor(saved)
+            or saved.shape != expected.shape
+            or saved.dtype != expected.dtype
+        ):
             raise ValueError(f"checkpoint model tensor does not match: {name}")
+    resolved = _resolved_cuda_device(device)
     cuda_rng = checkpoint.get("cuda_rng")
-    if not isinstance(cuda_rng, list) or len(cuda_rng) != torch.cuda.device_count():
-        raise ValueError("checkpoint CUDA RNG state does not match visible devices")
-    if not all(torch.is_tensor(state) and state.dtype == torch.uint8 for state in cuda_rng):
+    if legacy:
+        if not isinstance(cuda_rng, list) or not cuda_rng:
+            raise ValueError("legacy checkpoint CUDA RNG state is invalid")
+        logical_index = int(resolved.index)
+        if logical_index >= len(cuda_rng):
+            raise ValueError(
+                "legacy checkpoint does not contain RNG state for the selected device"
+            )
+        cuda_rng = cuda_rng[logical_index]
+    if not torch.is_tensor(cuda_rng) or cuda_rng.dtype != torch.uint8:
         raise ValueError("checkpoint CUDA RNG state is invalid")
     if not torch.is_tensor(checkpoint.get("torch_rng")):
         raise ValueError("checkpoint CPU RNG state is invalid")
@@ -1714,7 +2377,7 @@ def restore_checkpoint(
     )
     random.setstate(checkpoint["python_rng"])
     torch.set_rng_state(checkpoint["torch_rng"])
-    torch.cuda.set_rng_state_all(cuda_rng)
+    torch.cuda.set_rng_state(cuda_rng, resolved)
     return step
 
 
@@ -1741,6 +2404,96 @@ def _assert_finite(value: torch.Tensor, message: str) -> None:
     torch._assert_async(torch.isfinite(value).all(), message)
 
 
+def _capture_rng_state(device: torch.device) -> tuple[Any, torch.Tensor, torch.Tensor]:
+    resolved = _resolved_cuda_device(device)
+    return (
+        random.getstate(),
+        torch.get_rng_state(),
+        torch.cuda.get_rng_state(resolved),
+    )
+
+
+def _restore_rng_state(
+    state: tuple[Any, torch.Tensor, torch.Tensor], device: torch.device
+) -> None:
+    python_state, cpu_state, cuda_state = state
+    random.setstate(python_state)
+    torch.set_rng_state(cpu_state)
+    torch.cuda.set_rng_state(cuda_state, _resolved_cuda_device(device))
+
+
+def warm_compiled_training_step(
+    *,
+    model: DwarfForCausalLM,
+    compiled: nn.Module,
+    loss_fn: nn.Module,
+    device: torch.device,
+    config: DwarfConfig,
+) -> None:
+    """Compile/autotune the real training graph without advancing training RNG."""
+    state = _capture_rng_state(device)
+    try:
+        synthetic = torch.randint(
+            5,
+            config.vocab_size,
+            (RECIPE.batch_size, config.seq_len),
+            device=device,
+            dtype=torch.long,
+        )
+        input_ids, labels = synthetic[:, :-1], synthetic[:, 1:]
+        route_ids = route_aux_tile_ids_for_update(1, device, config)
+        model.zero_grad(set_to_none=True)
+        with amp_context():
+            hidden, auxiliary = compiled(input_ids, route_ids)
+            language_loss = loss_fn(
+                model.lm_head.weight, hidden.flatten(0, 1), labels.flatten()
+            )
+            loss = language_loss + auxiliary
+        loss.backward()
+        torch.cuda.synchronize(device)
+        model.zero_grad(set_to_none=True)
+    finally:
+        _restore_rng_state(state, device)
+
+
+@torch.no_grad()
+def collect_model_diagnostics(
+    *,
+    model: DwarfForCausalLM,
+    diagnostic: nn.Module,
+    input_ids: torch.Tensor,
+    route_aux_tile_ids: torch.Tensor,
+    device: torch.device,
+) -> tuple[dict[str, float], float, int, int]:
+    """Run one RNG-neutral eager diagnostic forward and collect layer-qualified data."""
+    state = _capture_rng_state(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
+    try:
+        with amp_context():
+            diagnostic(input_ids, route_aux_tile_ids)
+        torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+        metrics: dict[str, float] = {}
+        for layer_index, block in enumerate(model.blocks):
+            if isinstance(block, DSQGBlock):
+                values = block.attn.routing_diagnostics()
+                prefix = f"dsqg_l{layer_index:02d}_"
+            elif isinstance(block, GlobalMixerBlock):
+                values = block.attn._routing_diagnostics
+                prefix = f"hisa_l{layer_index:02d}_"
+            else:
+                continue
+            for key, value in values.items():
+                if torch.is_tensor(value) and value.numel() == 1:
+                    metrics[prefix + key] = float(value)
+        allocated = torch.cuda.max_memory_allocated(device)
+        reserved = torch.cuda.max_memory_reserved(device)
+        return metrics, elapsed, allocated, reserved
+    finally:
+        _restore_rng_state(state, device)
+
+
 def nonfinite_gradient_report(model: nn.Module) -> list[dict[str, Any]]:
     report: list[dict[str, Any]] = []
     for name, parameter in model.named_parameters():
@@ -1761,26 +2514,29 @@ def nonfinite_gradient_report(model: nn.Module) -> list[dict[str, Any]]:
 
 
 def train(args: argparse.Namespace) -> None:
-    device = torch.device(args.device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("DWARF training requires CUDA")
+    requested_device = torch.device(args.device)
     stop_step = RECIPE.steps if args.stop_after is None else int(args.stop_after)
     if not 0 < stop_step <= RECIPE.steps:
         raise ValueError(f"--stop-after must be between 1 and {RECIPE.steps}")
     if args.save_every < 0 or args.log_every < 1:
         raise ValueError("invalid save/log interval")
+
+    config = DwarfConfig()
+    loss_class, environment = validate_training_runtime(requested_device, config)
+    device = _resolved_cuda_device(requested_device)
     compile_policy = configure_compiled_backward_autocast()
 
     random.seed(42)
     torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-    config = DwarfConfig()
+    torch.cuda.manual_seed(42)
     tokenizer = tokenizer_identity(args.tokenizer, config.vocab_size)
     source = ValidatedDatasetSource(
         args.dataset,
         expected_sha256=args.dataset_sha256,
         trust_expected_sha256=args.trust_dataset_sha256,
     )
+    stager: BatchStager | None = None
+    writer: AsyncCheckpointWriter | None = None
     try:
         dataset = source.load(seq_len=config.seq_len)
         order, selection = build_training_row_order(
@@ -1790,6 +2546,7 @@ def train(args: argparse.Namespace) -> None:
             dataset,
             selected_rows=len(order),
             vocab_size=config.vocab_size,
+            pad_token_id=config.pad_token_id,
         )
         identity = source.identity(len(dataset), tokenizer, args.dataset_id)
         identity["selection"] = selection
@@ -1801,6 +2558,9 @@ def train(args: argparse.Namespace) -> None:
             raise RuntimeError("canonical DWARF parameter count changed")
         if architecture["trainable_parameters"] != EXPECTED_TRAINABLE_PARAMETERS:
             raise RuntimeError("canonical DWARF trainable parameter count changed")
+        if _state_fingerprint(model) != EXPECTED_STATE_FINGERPRINT:
+            raise RuntimeError("canonical DWARF initial state fingerprint changed")
+
         optimizer = build_optimizer(model)
         start_step = 0
         if args.resume:
@@ -1810,47 +2570,62 @@ def train(args: argparse.Namespace) -> None:
                 optimizer=optimizer,
                 architecture=architecture,
                 dataset=identity,
+                device=device,
+                environment=environment,
+                allow_source_mismatch=args.allow_source_mismatch,
+                allow_environment_mismatch=args.allow_environment_mismatch,
+                allow_legacy_v1=args.allow_legacy_v1_resume,
             )
         if start_step >= stop_step:
             raise ValueError("checkpoint is already at or beyond --stop-after")
 
-        compiled, _ = compiled_training_callables(model)
-        loss_fn = LigerFusedLinearCrossEntropyLoss(accum_dtype=torch.float32)
-        stager = BatchStager(dataset, batch_size=RECIPE.batch_size, device=device)
+        compiled, diagnostic = compiled_training_callables(model)
+        loss_fn = loss_class(accum_dtype=torch.float32)
+        stager = BatchStager(
+            dataset, batch_size=RECIPE.batch_size, device=device
+        )
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         writer = AsyncCheckpointWriter()
-    except BaseException:
-        source.close()
-        raise
-    print(
-        json.dumps(
-            {
-                "architecture": architecture,
-                "recipe": asdict(RECIPE),
-                "dataset": identity,
-                "dataset_preflight": preflight,
-                "start_step": start_step,
-                "stop_step": stop_step,
-                "device": str(device),
-                "device_name": torch.cuda.get_device_name(device),
-                "device_uuid": str(torch.cuda.get_device_properties(device).uuid),
-                "compiled": True,
-                "compile_policy": compile_policy,
-                "liger_fused_cross_entropy": True,
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
 
-    compiled.train()
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.synchronize(device)
-    interval_started = time.perf_counter()
-    interval_start_step = start_step
-    training_started = interval_started
-    try:
+        compiled.train()
+        diagnostic.train()
+        warm_compiled_training_step(
+            model=model,
+            compiled=compiled,
+            loss_fn=loss_fn,
+            device=device,
+            config=config,
+        )
+
+        print(
+            json.dumps(
+                {
+                    "architecture": architecture,
+                    "recipe": asdict(RECIPE),
+                    "dataset": identity,
+                    "dataset_preflight": preflight,
+                    "environment": environment,
+                    "start_step": start_step,
+                    "stop_step": stop_step,
+                    "device": str(device),
+                    "compiled": True,
+                    "compile_policy": compile_policy,
+                    "compile_warmup": "complete_rng_neutral",
+                    "liger_fused_cross_entropy": True,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+        interval_started = time.perf_counter()
+        interval_start_step = start_step
+        wall_started = interval_started
+        training_compute_elapsed = 0.0
+
         for step_index in range(start_step, stop_step):
             step = step_index + 1
             factor = wsd_multiplier(step_index)
@@ -1862,8 +2637,10 @@ def train(args: argparse.Namespace) -> None:
             language_accumulator = torch.zeros((), device=device, dtype=torch.float32)
             auxiliary_accumulator = torch.zeros((), device=device, dtype=torch.float32)
             route_aux_tile_ids = route_aux_tile_ids_for_update(step, device, config)
+            last_input_ids: torch.Tensor | None = None
             for batch in stager.batches(update):
                 input_ids, labels = batch[:, :-1], batch[:, 1:]
+                last_input_ids = input_ids
                 with amp_context():
                     hidden, auxiliary = compiled(input_ids, route_aux_tile_ids)
                     language_loss = loss_fn(
@@ -1904,12 +2681,32 @@ def train(args: argparse.Namespace) -> None:
                 )
             optimizer.step()
 
-            if step % args.log_every == 0 or step in {1, stop_step}:
+            logged = step % args.log_every == 0 or step in {1, stop_step}
+            if logged:
+                if last_input_ids is None:
+                    raise RuntimeError("logging update contained no microbatches")
                 torch.cuda.synchronize(device)
-                now = time.perf_counter()
-                interval_seconds = now - interval_started
+                training_now = time.perf_counter()
+                interval_seconds = training_now - interval_started
+                training_compute_elapsed += interval_seconds
                 interval_steps = step - interval_start_step
-                targets = interval_steps * RECIPE.effective_batch * config.model_length
+                targets = (
+                    interval_steps * RECIPE.effective_batch * config.model_length
+                )
+                training_peak_allocated = torch.cuda.max_memory_allocated(device)
+                training_peak_reserved = torch.cuda.max_memory_reserved(device)
+                (
+                    diagnostics,
+                    diagnostic_seconds,
+                    diagnostic_peak_allocated,
+                    diagnostic_peak_reserved,
+                ) = collect_model_diagnostics(
+                    model=model,
+                    diagnostic=diagnostic,
+                    input_ids=last_input_ids,
+                    route_aux_tile_ids=route_aux_tile_ids,
+                    device=device,
+                )
                 event: dict[str, Any] = {
                     "step": step,
                     "loss": float(loss_accumulator),
@@ -1930,25 +2727,21 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "grad_clip_muon_clipped": norms["muon"]["clipped"],
                     "grad_clip_adamw_clipped": norms["adamw"]["clipped"],
-                    "shifted_targets": step * RECIPE.effective_batch * config.model_length,
-                    "interval_seconds": interval_seconds,
+                    "shifted_targets": (
+                        step * RECIPE.effective_batch * config.model_length
+                    ),
+                    "interval_training_seconds": interval_seconds,
                     "shifted_targets_per_second": targets / interval_seconds,
-                    "training_elapsed_seconds": now - training_started,
-                    "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
-                    "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+                    "training_compute_elapsed_seconds": training_compute_elapsed,
+                    "wall_elapsed_seconds": time.perf_counter() - wall_started,
+                    "training_peak_allocated_bytes": training_peak_allocated,
+                    "training_peak_reserved_bytes": training_peak_reserved,
+                    "diagnostic_seconds": diagnostic_seconds,
+                    "diagnostic_peak_allocated_bytes": diagnostic_peak_allocated,
+                    "diagnostic_peak_reserved_bytes": diagnostic_peak_reserved,
                 }
-                for module in model.modules():
-                    if isinstance(module, HierarchicalSparseAttentionV19HISACausal):
-                        event.update(
-                            {
-                                f"hisa_{key}": float(value)
-                                for key, value in module._routing_diagnostics.items()
-                                if torch.is_tensor(value) and value.numel() == 1
-                            }
-                        )
+                event.update(diagnostics)
                 print(json.dumps(event, sort_keys=True), flush=True)
-                interval_started = now
-                interval_start_step = step
 
             should_save = step in RECIPE.checkpoint_steps or step == stop_step
             should_save |= args.save_every > 0 and step % args.save_every == 0
@@ -1963,22 +2756,48 @@ def train(args: argparse.Namespace) -> None:
                         optimizer=optimizer,
                         architecture=architecture,
                         dataset=identity,
+                        device=device,
+                        environment=environment,
                     ),
                     output_dir / f"dwarf_step_{step:07d}.pt",
-                    producer_streams={device: torch.cuda.current_stream(device)},
+                    producer_streams={
+                        device: torch.cuda.current_stream(device)
+                    },
                 )
+
+            if logged:
+                torch.cuda.reset_peak_memory_stats(device)
+                interval_started = time.perf_counter()
+                interval_start_step = step
+
+        if args.export_weights:
+            source.assert_unchanged()
+            writer.submit(
+                release_payload(
+                    step=stop_step,
+                    model=model,
+                    architecture=architecture,
+                    tokenizer=tokenizer,
+                    environment=environment,
+                ),
+                Path(args.export_weights),
+                producer_streams={device: torch.cuda.current_stream(device)},
+            )
     finally:
         try:
-            stager.close()
+            if stager is not None:
+                stager.close()
         finally:
             try:
-                writer.close()
+                if writer is not None:
+                    writer.close()
                 source.assert_unchanged()
             finally:
                 source.close()
 
 
 def self_test() -> None:
+    """Run deterministic CPU release checks for public model and kernel contracts."""
     assert_public_kernel_contracts()
     rng_state = torch.random.get_rng_state()
     torch.manual_seed(1234)
@@ -1988,58 +2807,169 @@ def self_test() -> None:
     ).hexdigest()
     torch.random.set_rng_state(rng_state)
     metadata = model_metadata(model)
-    assert metadata["parameters"] == EXPECTED_PARAMETERS
-    assert metadata["trainable_parameters"] == EXPECTED_TRAINABLE_PARAMETERS
-    assert _state_fingerprint(model) == EXPECTED_STATE_FINGERPRINT
-    assert seeded_rng_fingerprint == EXPECTED_SEEDED_RNG_FINGERPRINT
-    assert len(model.blocks) == 12
-    global_mixers = [block for block in model.blocks if isinstance(block, GlobalMixerBlock)]
-    assert [index for index, block in enumerate(model.blocks) if isinstance(block, GlobalMixerBlock)] == [3, 9]
-    assert isinstance(global_mixers[0].packet, InterferencePacket)
-    assert global_mixers[1].packet is None
-    assert global_mixers[0].attn.npci_theta_k.requires_grad
-    assert not global_mixers[1].attn.npci_theta_k.requires_grad
+    _require(
+        metadata["parameters"] == EXPECTED_PARAMETERS,
+        "canonical DWARF parameter count changed",
+    )
+    _require(
+        metadata["trainable_parameters"] == EXPECTED_TRAINABLE_PARAMETERS,
+        "canonical DWARF trainable parameter count changed",
+    )
+    _require(
+        _state_fingerprint(model) == EXPECTED_STATE_FINGERPRINT,
+        "canonical DWARF seeded state fingerprint changed",
+    )
+    _require(
+        seeded_rng_fingerprint == EXPECTED_SEEDED_RNG_FINGERPRINT,
+        "canonical DWARF seeded RNG lineage changed",
+    )
+    _require(len(model.blocks) == 12, "canonical DWARF layer count changed")
+    global_mixers = [
+        block for block in model.blocks if isinstance(block, GlobalMixerBlock)
+    ]
+    _require(
+        [
+            index
+            for index, block in enumerate(model.blocks)
+            if isinstance(block, GlobalMixerBlock)
+        ]
+        == [3, 9],
+        "canonical HISA layer placement changed",
+    )
+    _require(
+        isinstance(global_mixers[0].packet, InterferencePacket),
+        "first HISA mixer lost its EMA interference packet",
+    )
+    _require(global_mixers[1].packet is None, "second HISA mixer gained a packet")
+    _require(
+        global_mixers[0].attn.npci_theta_k.requires_grad,
+        "packet-enabled NPCI parameter is frozen",
+    )
+    _require(
+        not global_mixers[1].attn.npci_theta_k.requires_grad,
+        "packet-disabled NPCI parameter is trainable",
+    )
     for global_mixer in global_mixers:
-        assert not global_mixer.attn.collect_routing_diagnostics
-        assert global_mixer.attn.chunk_selection_scope == "token"
-        assert global_mixer.attn.token_routing_pack_size == 4
-        assert global_mixer.attn.route_aux_weight == model.config.hisa_route_aux_weight
-        assert global_mixer.attn.exploration_probability == model.config.hisa_exploration_probability
-        assert global_mixer.attn.global_adapter_rank == model.config.hisa_global_adapter_rank
-        assert global_mixer.attn.binding_rank == model.config.hisa_binding_rank
-        assert global_mixer.attn.backend == model.config.hisa_backend
-        assert global_mixer.attn.token_selection_mode == model.config.hisa_token_selection_mode
-        assert global_mixer.attn.local_backend == model.config.hisa_local_backend
-        assert global_mixer.attn.triton_block_q == model.config.hisa_triton_block_q
-        assert global_mixer.attn.backward_impl == model.config.hisa_backward_impl
-        assert global_mixer.attn.global_k_down is not None
-        assert hasattr(global_mixer.attn, "npci_theta_k")
-        assert hasattr(global_mixer.attn, "npci_theta_v")
-    assert sum(isinstance(block, DSQGBlock) for block in model.blocks) == 10
-    dsqg_layers = [block.attn for block in model.blocks if isinstance(block, DSQGBlock)]
-    assert all(isinstance(module, DSQGAttentionV23) for module in dsqg_layers)
-    assert all(not hasattr(module, "j_large") for module in dsqg_layers)
-    assert all(not hasattr(module, "movt_enabled") for module in dsqg_layers)
-    assert all(not hasattr(module, "npci_theta_k") for module in dsqg_layers)
-    assert all(not hasattr(module, "npci_theta_v") for module in dsqg_layers)
-    assert not any(
-        token in name
-        for name, _ in model.named_parameters()
-        for token in ("phase_base", "phase_gain", "phase_gate", "query_probes", "key_probes")
+        attention = global_mixer.attn
+        _require(
+            attention.chunk_selection_scope == "token",
+            "canonical HISA routing scope changed",
+        )
+        _require(
+            attention.token_routing_pack_size == 4,
+            "canonical HISA routing pack changed",
+        )
+        _require(
+            attention.route_aux_weight == model.config.hisa_route_aux_weight,
+            "canonical HISA auxiliary weight changed",
+        )
+        _require(
+            attention.exploration_probability
+            == model.config.hisa_exploration_probability,
+            "canonical HISA exploration probability changed",
+        )
+        _require(
+            attention.global_adapter_rank == model.config.hisa_global_adapter_rank,
+            "canonical HISA global adapter rank changed",
+        )
+        _require(
+            attention.binding_rank == model.config.hisa_binding_rank,
+            "canonical HISA binding rank changed",
+        )
+        _require(
+            attention.backend == model.config.hisa_backend,
+            "canonical HISA backend changed",
+        )
+        _require(
+            attention.token_selection_mode == model.config.hisa_token_selection_mode,
+            "canonical HISA token selection mode changed",
+        )
+        _require(
+            attention.local_backend == model.config.hisa_local_backend,
+            "canonical HISA local backend changed",
+        )
+        _require(
+            attention.triton_block_q == model.config.hisa_triton_block_q,
+            "canonical HISA Triton geometry changed",
+        )
+        _require(
+            attention.backward_impl == model.config.hisa_backward_impl,
+            "canonical HISA backward implementation changed",
+        )
+        _require(
+            attention.global_k_down is not None,
+            "canonical HISA global adapter is absent",
+        )
+    _require(
+        sum(isinstance(block, DSQGBlock) for block in model.blocks) == 10,
+        "canonical DSQG layer count changed",
+    )
+    dsqg_layers = [
+        block.attn for block in model.blocks if isinstance(block, DSQGBlock)
+    ]
+    _require(
+        all(module.backend == model.config.dsqg_backend for module in dsqg_layers),
+        "canonical DSQG backend is not explicit",
+    )
+    _require(
+        all(not module.support_crop_projections for module in dsqg_layers),
+        "dead canonical DSQG projection cropping is still enabled",
+    )
+    _require(
+        not any(
+            token in name
+            for name, _ in model.named_parameters()
+            for token in (
+                "phase_base",
+                "phase_gain",
+                "phase_gate",
+                "query_probes",
+                "key_probes",
+            )
+        ),
+        "retired parameter families reappeared",
     )
     groups = make_parameter_groups(model, RECIPE)
-    assert [item["name"] for item in groups["muon"]] == ["muon_linear_weights"]
-    assert [item["name"] for item in groups["adamw"]] == [
-        "adam_decay",
-        "adam_no_decay",
-        "adam_scale_embed",
-        "adam_null",
-        "adam_npci",
-        "adam_route",
-        "adam_ema",
-        "adam_positional",
-    ]
-    print(json.dumps({"status": "PASS", **metadata}, sort_keys=True))
+    _require(
+        [item["name"] for item in groups["muon"]]
+        == ["muon_linear_weights"],
+        "Muon optimizer partition changed",
+    )
+    _require(
+        [item["name"] for item in groups["adamw"]]
+        == [
+            "adam_decay",
+            "adam_no_decay",
+            "adam_scale_embed",
+            "adam_null",
+            "adam_npci",
+            "adam_route",
+            "adam_ema",
+            "adam_positional",
+        ],
+        "AdamW optimizer partition changed",
+    )
+    _require(
+        metadata["complexity"]["selector"]
+        == "quadratic_in_sequence_length_at_fixed_chunk_size",
+        "release metadata overstates HISA selector complexity",
+    )
+    _require(
+        metadata["cache"]["model_level_o1_kv_cache"] is False,
+        "release metadata overstates model-level O(1) KV caching",
+    )
+    print(
+        json.dumps(
+            {
+                "status": "PASS",
+                "parameters": metadata["parameters"],
+                "trainable_parameters": metadata["trainable_parameters"],
+                "state_fingerprint": EXPECTED_STATE_FINGERPRINT,
+                "sources": metadata["sources"],
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -2049,13 +2979,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir")
     parser.add_argument(
         "--tokenizer",
-        default=str(SCRIPT_DIR.parent / "tokenizers" / "dwarf_bpe_v32768_tokenizer.json"),
+        default=str(
+            SCRIPT_DIR.parent / "tokenizers" / "dwarf_bpe_v32768_tokenizer.json"
+        ),
     )
     parser.add_argument("--dataset-id")
     parser.add_argument("--dataset-sha256")
     parser.add_argument("--trust-dataset-sha256", action="store_true")
     parser.add_argument("--resume")
-
+    parser.add_argument(
+        "--allow-source-mismatch",
+        action="store_true",
+        help="allow resume after an explicitly reviewed source-only change",
+    )
+    parser.add_argument(
+        "--allow-environment-mismatch",
+        action="store_true",
+        help="allow resume after an explicitly reviewed runtime ABI change",
+    )
+    parser.add_argument(
+        "--allow-legacy-v1-resume",
+        action="store_true",
+        help=(
+            "allow a reviewed pre-hardening v1 checkpoint; state is compatible "
+            "but the optimized exploration RNG stream is not bitwise identical"
+        ),
+    )
+    parser.add_argument(
+        "--export-weights",
+        help="write a weights-only release artifact after the requested final step",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--stop-after", type=int)
     parser.add_argument("--save-every", type=int, default=0)
@@ -2065,6 +3018,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dataset and --output-dir are required for training")
     if args.trust_dataset_sha256 and not args.dataset_sha256:
         parser.error("--trust-dataset-sha256 requires --dataset-sha256")
+    if args.allow_source_mismatch and not args.resume:
+        parser.error("--allow-source-mismatch requires --resume")
+    if args.allow_environment_mismatch and not args.resume:
+        parser.error("--allow-environment-mismatch requires --resume")
+    if args.allow_legacy_v1_resume and not args.resume:
+        parser.error("--allow-legacy-v1-resume requires --resume")
     return args
 
 
