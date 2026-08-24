@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Self-contained public trainer for the canonical DWARF-v2 architecture.
 
-The model is D512/H8/L12/FFN2048 with bounded-routing DSQG V23 blocks and
-strict-causal HISA V19 global mixers at layers 3 and 9. The first global mixer
-receives the causal-EMA interference packet; both mixers include the learned
-semantic binder used by the current DWARF lineage.
+The model is D512/H8/L24/FFN2048 with bounded-routing DSQG V23 blocks and
+strict-causal HISA V19 global mixers at layers 3, 10, and 17. Independent
+causal-EMA K/V packets live at L3 and L17; L10 is ordinary HISA. At L17 only,
+base global K supplies representatives, hard top-k routes, selected route
+priors, and router auxiliary/oracle targets while packet-rotated K/V remain in
+global token attention.
 
 The trainer accepts packed token rows and includes Muon+AdamW, WSD, deterministic
 row selection, atomic resumable checkpoints, and the complete model definition.
@@ -80,30 +82,36 @@ from hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
     hisa_runtime_capabilities,
 )
 
-CHECKPOINT_KIND = "dwarf-58m-dsqgv23-hisav19-resume-v2"
-LEGACY_CHECKPOINT_KIND = "dwarf-58m-dsqgv23-hisav19-resume-v1"
-RELEASE_KIND = "dwarf-58m-dsqgv23-hisav19-weights-v1"
+CHECKPOINT_KIND = "dwarf-l24-l17-basek-route-public-packed-dsqgv23-hisav19-resume-v1"
+CANONICAL_PARENT_CHECKPOINT_KIND = (
+    "dwarf-l24-l17-basek-route-appendable-prefix-stable-dsqgv23-hisav19-resume-v1"
+)
+RELEASE_KIND = "dwarf-l24-l17-basek-route-dsqgv23-hisav19-weights-v1"
 ROUTE_AUX_RECIPE_SEED = 20_260_809
-EXPECTED_PARAMETERS = 58_591_773
-EXPECTED_TRAINABLE_PARAMETERS = 58_591_757
+EXPECTED_PARAMETERS = 100_179_313
+EXPECTED_TRAINABLE_PARAMETERS = 100_179_297
 EXPECTED_STATE_FINGERPRINT = (
-    "60db70dabe13746b81bbbd7256be0a7e34aa7e6d0e3ed3c7fb9ccc8b5250a69e"
+    "5219e76a32c32db3b59697a0230eca730969d17b82696b23148a5bf9b935b06a"
 )
 EXPECTED_SEEDED_RNG_FINGERPRINT = (
-    "366b83cd1650cf2de8ccd2ffe5fb3ef27344c37e53c9ee57bd6c0914dd44c9b6"
+    "799d503b1b60a6fcd0d39e034521df4c10c4eee699551f781bf9c9c20f573010"
+)
+CANONICAL_TOKENIZER_SHA256 = (
+    "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
 )
 
 
 @dataclass(frozen=True)
 class TrainRecipe:
     learning_rate: float = 3.0e-4
-    batch_size: int = 15
-    grad_accum_steps: int = 14
-    steps: int = 4653
-    warmup_steps: int = 233
-    stable_steps: int = 3722
-    decay_steps: int = 698
-    min_lr_ratio: float = 0.1
+    batch_size: int = 16
+    grad_accum_steps: int = 8
+    # One schedule identity spans the complete appendable 20B stable-LR trunk.
+    steps: int = 76_331
+    warmup_steps: int = 1_527
+    stable_steps: int = 74_804
+    decay_steps: int = 0
+    min_lr_ratio: float = 1.0
     weight_decay: float = 0.1
     grad_clip_muon: float = 1.0
     grad_clip_adamw: float = 1.0
@@ -118,13 +126,7 @@ class TrainRecipe:
 
     @property
     def checkpoint_steps(self) -> set[int]:
-        return {
-            self.warmup_steps,
-            math.ceil(self.steps * 0.25),
-            math.ceil(self.steps * 0.50),
-            math.ceil(self.steps * 0.75),
-            self.steps,
-        }
+        return {1_909, 3_817, 5_725, 7_633, 19_083, 38_166, 76_331}
 
 
 @dataclass(frozen=True)
@@ -134,8 +136,11 @@ class DwarfConfig:
     num_heads: int = 8
     ffn_dim: int = 2048
     seq_len: int = 2048
-    num_layers: int = 12
-    global_mixer_layers: tuple[int, ...] = (3, 9)
+    num_layers: int = 24
+    global_mixer_layers: tuple[int, ...] = (3, 10, 17)
+    ema_packet_layers: tuple[int, ...] = (3, 17)
+    base_k_routing_layers: tuple[int, ...] = (17,)
+    ema_packet_initial_coupling_fractions: tuple[float, ...] = (1.0, 0.3)
     dropout: float = 0.05
     min_offset_support: int = 64
     dsqg_backend: str = "triton"
@@ -183,6 +188,26 @@ class DwarfConfig:
         ):
             raise ValueError(
                 "global_mixer_layers must be sorted unique in-range block indices"
+            )
+        if (
+            tuple(sorted(set(self.ema_packet_layers))) != self.ema_packet_layers
+            or not set(self.ema_packet_layers).issubset(self.global_mixer_layers)
+        ):
+            raise ValueError("EMA packet layers must be sorted unique HISA layers")
+        if (
+            tuple(sorted(set(self.base_k_routing_layers)))
+            != self.base_k_routing_layers
+            or not set(self.base_k_routing_layers).issubset(self.ema_packet_layers)
+        ):
+            raise ValueError("base-K routing layers must be sorted packet-enabled HISA layers")
+        if len(self.ema_packet_initial_coupling_fractions) != len(
+            self.ema_packet_layers
+        ) or any(
+            not math.isfinite(value) or not 0.0 < value <= 1.0
+            for value in self.ema_packet_initial_coupling_fractions
+        ):
+            raise ValueError(
+                "EMA packet coupling fractions must align with packet layers and be in (0,1]"
             )
         if self.seq_len < 65:
             raise ValueError("seq_len must be at least 65")
@@ -337,7 +362,7 @@ def _load_liger_loss_class():
 def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
     environment: dict[str, Any] = {
         "python": sys.version.split()[0],
-        "pytorch": torch.__version__,
+        "pytorch": str(torch.__version__),
         "cuda_runtime": torch.version.cuda,
         "cudnn": (
             None if not torch.backends.cudnn.is_available()
@@ -468,39 +493,6 @@ def validate_checkpoint_architecture(
             "checkpoint source manifest does not match; pass "
             "--allow-source-mismatch only after reviewing the source diff"
         )
-
-
-def validate_legacy_v1_architecture(
-    saved: dict[str, Any], current: dict[str, Any]
-) -> None:
-    """Validate a pre-hardening v1 checkpoint without trusting stale source hashes."""
-    if not isinstance(saved, dict) or saved.get("format") != (
-        "dwarf-58m-dsqgv23-hisav19-v1"
-    ):
-        raise ValueError("legacy checkpoint architecture format does not match")
-    if saved.get("parameters") != current.get("parameters") or saved.get(
-        "trainable_parameters"
-    ) != current.get("trainable_parameters"):
-        raise ValueError("legacy checkpoint parameter counts do not match")
-    current_config = copy.deepcopy(current.get("config"))
-    if not isinstance(current_config, dict):
-        raise ValueError("current architecture config is invalid")
-    current_config.pop("dsqg_backend", None)
-    if saved.get("config") != current_config:
-        raise ValueError("legacy checkpoint model config does not match")
-    saved_topology = saved.get("topology")
-    current_topology = current.get("topology")
-    if not isinstance(saved_topology, dict) or not isinstance(current_topology, dict):
-        raise ValueError("legacy checkpoint topology is invalid")
-    for key in (
-        "layers",
-        "global_mixer_layers",
-        "dsqg",
-        "hisa",
-        "offset_groups",
-    ):
-        if saved_topology.get(key) != current_topology.get(key):
-            raise ValueError(f"legacy checkpoint topology does not match: {key}")
 
 
 def _require(condition: bool, message: str) -> None:
@@ -901,7 +893,14 @@ class DSQGBlock(nn.Module):
 
 
 class GlobalMixerBlock(nn.Module):
-    def __init__(self, config: DwarfConfig, *, use_packet: bool) -> None:
+    def __init__(
+        self,
+        config: DwarfConfig,
+        *,
+        use_packet: bool,
+        packet_initial_coupling_fraction: float | None,
+        route_from_base_global_key: bool,
+    ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(config.embedding_dim)
         self.norm2 = RMSNorm(config.embedding_dim)
@@ -937,13 +936,29 @@ class GlobalMixerBlock(nn.Module):
             backward_impl=config.hisa_backward_impl,
             collect_routing_diagnostics=config.hisa_collect_routing_diagnostics,
             diagnostic_max_queries=config.hisa_diagnostic_max_queries,
+            route_from_base_global_key=route_from_base_global_key,
         )
         self.packet = InterferencePacket(config) if use_packet else None
+        self.packet_initial_coupling_fraction = packet_initial_coupling_fraction
+        if (self.packet is None) != (packet_initial_coupling_fraction is None):
+            raise ValueError("packet presence and coupling fraction must agree")
         if self.packet is None:
             self.attn.npci_theta_k.requires_grad_(False)
             self.attn.npci_theta_v.requires_grad_(False)
         self.ffn = SwiGLUFFN(config)
         self.dropout = nn.Dropout(config.dropout)
+
+    @torch.no_grad()
+    def reset_packet_coupling_(self) -> None:
+        if self.packet is None:
+            return
+        fraction = float(self.packet_initial_coupling_fraction)
+        physical_rotation = 0.01 * fraction
+        raw = math.atanh(
+            min(physical_rotation / max(self.attn.npci_theta_max, 1e-6), 0.99)
+        )
+        self.attn.npci_theta_k.fill_(raw)
+        self.attn.npci_theta_v.fill_(raw)
 
     def forward(
         self,
@@ -983,12 +998,27 @@ class DwarfForCausalLM(nn.Module):
             else:
                 layout.append(next_group)
                 next_group = (next_group + 1) % len(self.offset_groups)
+        packet_fractions = dict(
+            zip(
+                config.ema_packet_layers,
+                config.ema_packet_initial_coupling_fractions,
+                strict=True,
+            )
+        )
         blocks: list[nn.Module] = []
-        global_index = 0
-        for group_index in layout:
+        for layer_index, group_index in enumerate(layout):
             if group_index is None:
-                blocks.append(GlobalMixerBlock(config, use_packet=global_index == 0))
-                global_index += 1
+                fraction = packet_fractions.get(layer_index)
+                blocks.append(
+                    GlobalMixerBlock(
+                        config,
+                        use_packet=fraction is not None,
+                        packet_initial_coupling_fraction=fraction,
+                        route_from_base_global_key=(
+                            layer_index in config.base_k_routing_layers
+                        ),
+                    )
+                )
                 continue
             blocks.append(DSQGBlock(config, self.offset_groups[group_index]))
         self.blocks = nn.ModuleList(blocks)
@@ -1028,6 +1058,9 @@ class DwarfForCausalLM(nn.Module):
                 elif isinstance(module, InterferencePacket):
                     with torch.no_grad():
                         module.gate_proj.bias.fill_(-2.0)
+            for block in self.blocks:
+                if isinstance(block, GlobalMixerBlock):
+                    block.reset_packet_coupling_()
         finally:
             torch.random.set_rng_state(state)
 
@@ -1145,7 +1178,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
         for block in model.blocks
     ]
     return {
-        "format": "dwarf-58m-dsqgv23-hisav19-v2",
+        "format": "dwarf-l24-l17-basek-route-dsqgv23-hisav19-v1",
         "config": asdict(model.config),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameters": sum(
@@ -1156,6 +1189,26 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
         "topology": {
             "layers": ",".join(layer_names),
             "global_mixer_layers": tuple(index for index, _ in global_mixers),
+            "ema_packet_layers": tuple(
+                index for index, block in global_mixers if block.packet is not None
+            ),
+            "base_k_routing_layers": tuple(
+                index
+                for index, block in global_mixers
+                if block.attn.route_from_base_global_key
+            ),
+            "routing_key_source_by_hisa_layer": {
+                str(index): block.attn.route_source for index, block in global_mixers
+            },
+            "l17_route_contract": {
+                "representatives": "base_global_k_after_ordinary_global_adapter",
+                "hard_top_k": "base_global_k",
+                "selected_route_priors": "base_global_k",
+                "router_auxiliary": "base_global_k",
+                "router_oracle": "base_global_k",
+                "global_token_attention_key": "post_packet_rotated_global_k",
+                "global_token_attention_value": "post_packet_rotated_global_v",
+            },
             "dsqg": "v23-bounded-routing-null-candidate",
             "hisa": "v19-accessible-routing-semantic-binder",
             "offset_groups": model.offset_groups,
@@ -1182,6 +1235,9 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
             {
                 "layer": index,
                 "ema_packet": block.packet is not None,
+                "ema_initial_coupling_fraction": (
+                    block.packet_initial_coupling_fraction
+                ),
                 "semantic": block.attn.semantic_config(),
                 "execution": block.attn.execution_config(),
             }
@@ -2290,6 +2346,123 @@ def release_payload(
     }
 
 
+def _stable_reconstruction_architecture(value: dict[str, Any]) -> dict[str, Any]:
+    """Return model-defining metadata, excluding execution/source-only drift."""
+    if not isinstance(value, dict):
+        raise ValueError("checkpoint architecture metadata is invalid")
+    topology = value.get("topology")
+    if not isinstance(topology, dict):
+        raise ValueError("checkpoint architecture topology is invalid")
+    required_topology = (
+        "layers",
+        "global_mixer_layers",
+        "ema_packet_layers",
+        "base_k_routing_layers",
+        "routing_key_source_by_hisa_layer",
+        "l17_route_contract",
+        "dsqg",
+        "hisa",
+        "offset_groups",
+    )
+    return {
+        "config": copy.deepcopy(value.get("config")),
+        "parameters": value.get("parameters"),
+        "trainable_parameters": value.get("trainable_parameters"),
+        "topology": {key: copy.deepcopy(topology.get(key)) for key in required_topology},
+    }
+
+
+def reconstruct_model_from_checkpoint(
+    path: str | Path,
+    *,
+    expected_sha256: str | None = None,
+    allow_source_mismatch: bool = False,
+) -> tuple[DwarfForCausalLM, dict[str, Any]]:
+    """Strictly reconstruct model weights without resuming private training state."""
+    if allow_source_mismatch and expected_sha256 is None:
+        raise ValueError("allow_source_mismatch requires expected_sha256")
+    checkpoint_path = Path(path).resolve()
+    checkpoint_sha256 = _sha256(checkpoint_path)
+    if expected_sha256 is not None and checkpoint_sha256 != expected_sha256:
+        raise ValueError("checkpoint SHA-256 does not match")
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
+    )
+    if not isinstance(checkpoint, dict) or checkpoint.get("kind") not in {
+        CHECKPOINT_KIND,
+        CANONICAL_PARENT_CHECKPOINT_KIND,
+        RELEASE_KIND,
+    }:
+        raise ValueError("not a reconstructable canonical DWARF checkpoint")
+    saved_architecture = checkpoint.get("architecture")
+    if not isinstance(saved_architecture, dict):
+        raise ValueError("checkpoint architecture metadata is invalid")
+    config_payload = copy.deepcopy(saved_architecture.get("config"))
+    if not isinstance(config_payload, dict):
+        raise ValueError("checkpoint model config is invalid")
+    tuple_fields = (
+        "global_mixer_layers",
+        "ema_packet_layers",
+        "base_k_routing_layers",
+        "ema_packet_initial_coupling_fractions",
+        "ema_timescales",
+    )
+    for field in tuple_fields:
+        if isinstance(config_payload.get(field), list):
+            config_payload[field] = tuple(config_payload[field])
+    try:
+        config = DwarfConfig(**config_payload)
+    except (TypeError, ValueError) as error:
+        raise ValueError("checkpoint model config is invalid") from error
+    model = DwarfForCausalLM(config)
+    current_architecture = model_metadata(model)
+    if _stable_reconstruction_architecture(saved_architecture) != (
+        _stable_reconstruction_architecture(current_architecture)
+    ):
+        raise ValueError("checkpoint semantic architecture does not match")
+    if (
+        saved_architecture.get("sources") != current_architecture.get("sources")
+        and not allow_source_mismatch
+    ):
+        raise ValueError(
+            "checkpoint source manifest does not match; pass "
+            "allow_source_mismatch only after reviewing the source diff"
+        )
+    saved_model = checkpoint.get("model")
+    expected_model = model.state_dict()
+    if not isinstance(saved_model, dict) or saved_model.keys() != expected_model.keys():
+        raise ValueError("checkpoint model keys do not match")
+    for name, expected in expected_model.items():
+        saved = saved_model[name]
+        if (
+            not torch.is_tensor(saved)
+            or saved.shape != expected.shape
+            or saved.dtype != expected.dtype
+        ):
+            raise ValueError(f"checkpoint model tensor does not match: {name}")
+    model.load_state_dict(saved_model, strict=True)
+    model.eval()
+    step = checkpoint.get("step")
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError("checkpoint step is invalid")
+    receipt = {
+        "status": "PASS",
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha256,
+        "kind": checkpoint["kind"],
+        "step": step,
+        "loaded_tensors": len(saved_model),
+        "parameters": current_architecture["parameters"],
+        "trainable_parameters": current_architecture["trainable_parameters"],
+        "architecture_format": current_architecture["format"],
+        "source_mismatch_allowed": bool(allow_source_mismatch),
+    }
+    return model, receipt
+
+
 def restore_checkpoint(
     path: str | Path,
     *,
@@ -2301,35 +2474,23 @@ def restore_checkpoint(
     environment: dict[str, Any] | None = None,
     allow_source_mismatch: bool = False,
     allow_environment_mismatch: bool = False,
-    allow_legacy_v1: bool = False,
 ) -> int:
     checkpoint = torch.load(Path(path), map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise ValueError("not a canonical DWARF resumable checkpoint")
     kind = checkpoint.get("kind")
-    legacy = kind == LEGACY_CHECKPOINT_KIND
-    if kind not in {CHECKPOINT_KIND, LEGACY_CHECKPOINT_KIND}:
+    if kind != CHECKPOINT_KIND:
         raise ValueError("not a canonical DWARF resumable checkpoint")
-    if legacy and not allow_legacy_v1:
-        raise ValueError(
-            "this is a pre-hardening v1 checkpoint; pass "
-            "--allow-legacy-v1-resume after reviewing compatibility"
-        )
-    if legacy:
-        validate_legacy_v1_architecture(
-            checkpoint.get("architecture"), architecture
-        )
-    else:
-        validate_checkpoint_architecture(
-            checkpoint.get("architecture"),
-            architecture,
-            allow_source_mismatch=allow_source_mismatch,
-        )
-        validate_checkpoint_environment(
-            checkpoint.get("environment"),
-            runtime_environment(device) if environment is None else environment,
-            allow_mismatch=allow_environment_mismatch,
-        )
+    validate_checkpoint_architecture(
+        checkpoint.get("architecture"),
+        architecture,
+        allow_source_mismatch=allow_source_mismatch,
+    )
+    validate_checkpoint_environment(
+        checkpoint.get("environment"),
+        runtime_environment(device) if environment is None else environment,
+        allow_mismatch=allow_environment_mismatch,
+    )
     if checkpoint.get("recipe") != asdict(RECIPE):
         raise ValueError("checkpoint recipe does not match")
     step = checkpoint.get("step")
@@ -2354,15 +2515,6 @@ def restore_checkpoint(
             raise ValueError(f"checkpoint model tensor does not match: {name}")
     resolved = _resolved_cuda_device(device)
     cuda_rng = checkpoint.get("cuda_rng")
-    if legacy:
-        if not isinstance(cuda_rng, list) or not cuda_rng:
-            raise ValueError("legacy checkpoint CUDA RNG state is invalid")
-        logical_index = int(resolved.index)
-        if logical_index >= len(cuda_rng):
-            raise ValueError(
-                "legacy checkpoint does not contain RNG state for the selected device"
-            )
-        cuda_rng = cuda_rng[logical_index]
     if not torch.is_tensor(cuda_rng) or cuda_rng.dtype != torch.uint8:
         raise ValueError("checkpoint CUDA RNG state is invalid")
     if not torch.is_tensor(checkpoint.get("torch_rng")):
@@ -2487,6 +2639,22 @@ def collect_model_diagnostics(
             for key, value in values.items():
                 if torch.is_tensor(value) and value.numel() == 1:
                     metrics[prefix + key] = float(value)
+            if isinstance(block, GlobalMixerBlock) and block.packet is not None:
+                factors = bounded_ema_factor(block.packet.ema_raw.detach())
+                mix = block.packet.mix_logits.detach().softmax(-1)
+                entropy = -(mix * mix.clamp_min(1e-12).log()).sum(-1).mean()
+                metrics[prefix + "ema_factor_fast"] = float(factors[0])
+                metrics[prefix + "ema_factor_medium"] = float(factors[1])
+                metrics[prefix + "ema_factor_slow"] = float(factors[2])
+                metrics[prefix + "ema_mix_entropy"] = float(entropy)
+                metrics[prefix + "npci_k_mean"] = float(
+                    torch.tanh(block.attn.npci_theta_k.detach()).mean()
+                    * block.attn.npci_theta_max
+                )
+                metrics[prefix + "npci_v_mean"] = float(
+                    torch.tanh(block.attn.npci_theta_v.detach()).mean()
+                    * block.attn.npci_theta_max
+                )
         allocated = torch.cuda.max_memory_allocated(device)
         reserved = torch.cuda.max_memory_reserved(device)
         return metrics, elapsed, allocated, reserved
@@ -2574,7 +2742,6 @@ def train(args: argparse.Namespace) -> None:
                 environment=environment,
                 allow_source_mismatch=args.allow_source_mismatch,
                 allow_environment_mismatch=args.allow_environment_mismatch,
-                allow_legacy_v1=args.allow_legacy_v1_resume,
             )
         if start_step >= stop_step:
             raise ValueError("checkpoint is already at or beyond --stop-after")
@@ -2823,7 +2990,7 @@ def self_test() -> None:
         seeded_rng_fingerprint == EXPECTED_SEEDED_RNG_FINGERPRINT,
         "canonical DWARF seeded RNG lineage changed",
     )
-    _require(len(model.blocks) == 12, "canonical DWARF layer count changed")
+    _require(len(model.blocks) == 24, "L24 DWARF layer count changed")
     global_mixers = [
         block for block in model.blocks if isinstance(block, GlobalMixerBlock)
     ]
@@ -2833,21 +3000,56 @@ def self_test() -> None:
             for index, block in enumerate(model.blocks)
             if isinstance(block, GlobalMixerBlock)
         ]
-        == [3, 9],
-        "canonical HISA layer placement changed",
+        == [3, 10, 17],
+        "L24 HISA layer placement changed",
+    )
+    packet_layers = [
+        index
+        for index, block in enumerate(model.blocks)
+        if isinstance(block, GlobalMixerBlock) and block.packet is not None
+    ]
+    _require(packet_layers == [3, 17], "dual internal EMA packet placement changed")
+    _require(
+        [block.attn.route_source for block in global_mixers]
+        == ["rotated_global_k", "rotated_global_k", "base_global_k"],
+        "L3/L10/L17 routing-key source contract changed",
     )
     _require(
-        isinstance(global_mixers[0].packet, InterferencePacket),
-        "first HISA mixer lost its EMA interference packet",
+        RECIPE.steps == 76_331
+        and RECIPE.effective_batch == 128
+        and RECIPE.warmup_steps == 1_527
+        and RECIPE.stable_steps == 74_804
+        and RECIPE.decay_steps == 0
+        and {1_909, 3_817, 5_725, 7_633}.issubset(RECIPE.checkpoint_steps),
+        "canonical 20B stable-LR trunk schedule contract changed",
     )
-    _require(global_mixers[1].packet is None, "second HISA mixer gained a packet")
+    _require(global_mixers[1].packet is None, "L10 HISA gained an EMA packet")
     _require(
-        global_mixers[0].attn.npci_theta_k.requires_grad,
+        global_mixers[0].packet is not global_mixers[2].packet,
+        "L3 and L17 EMA packets became weight-tied",
+    )
+    _require(
+        global_mixers[0].attn.npci_theta_k.requires_grad
+        and global_mixers[2].attn.npci_theta_k.requires_grad,
         "packet-enabled NPCI parameter is frozen",
     )
     _require(
         not global_mixers[1].attn.npci_theta_k.requires_grad,
-        "packet-disabled NPCI parameter is trainable",
+        "packet-disabled L10 NPCI parameter is trainable",
+    )
+    _require_close(
+        torch.tanh(global_mixers[0].attn.npci_theta_k),
+        torch.full_like(global_mixers[0].attn.npci_theta_k, 0.04),
+        atol=1e-7,
+        rtol=0.0,
+        message="L3 initial NPCI coupling changed",
+    )
+    _require_close(
+        torch.tanh(global_mixers[2].attn.npci_theta_k),
+        torch.full_like(global_mixers[2].attn.npci_theta_k, 0.012),
+        atol=1e-7,
+        rtol=0.0,
+        message="L17 low initial NPCI coupling changed",
     )
     for global_mixer in global_mixers:
         attention = global_mixer.attn
@@ -2901,8 +3103,8 @@ def self_test() -> None:
             "canonical HISA global adapter is absent",
         )
     _require(
-        sum(isinstance(block, DSQGBlock) for block in model.blocks) == 10,
-        "canonical DSQG layer count changed",
+        sum(isinstance(block, DSQGBlock) for block in model.blocks) == 21,
+        "L24 DSQG layer count changed",
     )
     dsqg_layers = [
         block.attn for block in model.blocks if isinstance(block, DSQGBlock)
@@ -2997,14 +3199,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="allow resume after an explicitly reviewed runtime ABI change",
     )
-    parser.add_argument(
-        "--allow-legacy-v1-resume",
-        action="store_true",
-        help=(
-            "allow a reviewed pre-hardening v1 checkpoint; state is compatible "
-            "but the optimized exploration RNG stream is not bitwise identical"
-        ),
-    )
+
     parser.add_argument(
         "--export-weights",
         help="write a weights-only release artifact after the requested final step",
@@ -3022,8 +3217,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--allow-source-mismatch requires --resume")
     if args.allow_environment_mismatch and not args.resume:
         parser.error("--allow-environment-mismatch requires --resume")
-    if args.allow_legacy_v1_resume and not args.resume:
-        parser.error("--allow-legacy-v1-resume requires --resume")
     return args
 
 
