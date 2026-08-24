@@ -233,6 +233,37 @@ def _magnitude_aware_rotate(
     return torch.where(active, rotated, xf).to(x.dtype)
 
 
+@torch.no_grad()
+def _rotation_diagnostics(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    theta_h: torch.Tensor,
+    *,
+    label: str,
+    strength_tau: float = 0.25,
+) -> dict[str, torch.Tensor]:
+    """Measure the actual tokenwise NPCI rotation on diagnostic forwards only."""
+    xf, df = x.float(), delta.float()
+    norm = xf.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    unit = xf / norm
+    perpendicular = df - (df * unit).sum(-1, keepdim=True) * unit
+    perpendicular_norm = perpendicular.norm(dim=-1, keepdim=True)
+    strength = torch.tanh(
+        perpendicular_norm / (float(strength_tau) * norm + 1e-12)
+    ).squeeze(-1)
+    physical_abs = theta_h.detach().float().abs()
+    actual_abs = physical_abs.reshape(1, -1, 1) * strength
+    metrics = {
+        f"npci_{label}_actual_abs_angle_p50": torch.quantile(actual_abs, 0.50),
+        f"npci_{label}_actual_abs_angle_p90": torch.quantile(actual_abs, 0.90),
+        f"npci_{label}_actual_abs_angle_p99": torch.quantile(actual_abs, 0.99),
+        f"npci_{label}_strength_saturation_fraction": (strength > 0.9).float().mean(),
+    }
+    for head, value in enumerate(physical_abs):
+        metrics[f"npci_{label}_physical_abs_theta_head{head:02d}"] = value
+    return {name: value.detach() for name, value in metrics.items()}
+
+
 @dataclass(frozen=True)
 class HISAMetadata:
     top_chunk_idx: torch.Tensor          # int32 [B,H,T,K]
@@ -1559,6 +1590,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         backward_impl: str | None = None,
         collect_routing_diagnostics: bool | None = None,
         diagnostic_max_queries: int | None = None,
+        route_from_base_global_key: bool = False,
     ) -> None:
         super().__init__()
         D, H, hd = int(D), int(H), int(hd)
@@ -1615,6 +1647,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise TypeError("boundary_bridge must be bool")
         if not boundary_bridge:
             raise ValueError("boundary_bridge must be enabled")
+        if not isinstance(route_from_base_global_key, bool):
+            raise TypeError("route_from_base_global_key must be bool")
         if max_seq_len is not None and int(max_seq_len) < 1:
             raise ValueError("max_seq_len must be positive when supplied")
 
@@ -1712,6 +1746,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.global_adapter_rank = int(global_adapter_rank)
         self.binding_rank = int(binding_rank)
         self.npci_theta_max = float(npci_theta_max)
+        self.route_from_base_global_key = route_from_base_global_key
+        self.route_source = (
+            "base_global_k" if route_from_base_global_key else "rotated_global_k"
+        )
         self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
         self.local_backend = local_backend
         self.boundary_bridge = boundary_bridge
@@ -1830,6 +1868,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "routing_temperature_applies_to": (
                 "selected_route_priors_and_sampled_router_auxiliary"
             ),
+            "routing_key_source": self.route_source,
+            "global_attention_key_source": "post_packet_rotated_global_k",
+            "router_auxiliary_oracle_key_source": self.route_source,
             "representative_mode": self.representative_mode,
             "representative_blend_alpha_initial_mean": (
                 self.representative_blend_alpha
@@ -2034,6 +2075,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             self.hisa_evidence_capture = None
             self._routing_auxiliary_loss = None
             self._routing_diagnostics = {}
+        rotation_diagnostics: dict[str, torch.Tensor] = {}
+        route_comparison_diagnostics: dict[str, torch.Tensor] = {}
 
         use_triton = _resolve_attention_execution(
             backend=self.backend,
@@ -2090,6 +2133,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 self.H,
                 self.hd,
             )
+        base_global_key = global_key
         if kv_inject is not None:
             key_delta, value_delta = kv_inject
             if (
@@ -2097,19 +2141,33 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 or value_delta.shape != global_value.shape
             ):
                 raise ValueError("kv_inject must contain [B,H,N,HD] tensors")
+            physical_theta_k = self.npci_theta_max * torch.tanh(self.npci_theta_k)
+            physical_theta_v = self.npci_theta_max * torch.tanh(self.npci_theta_v)
+            if emit_diagnostics:
+                rotation_diagnostics.update(
+                    _rotation_diagnostics(
+                        global_key, key_delta, physical_theta_k, label="k"
+                    )
+                )
+                rotation_diagnostics.update(
+                    _rotation_diagnostics(
+                        global_value, value_delta, physical_theta_v, label="v"
+                    )
+                )
             global_key = _magnitude_aware_rotate(
                 global_key,
                 key_delta,
-                self.npci_theta_max * torch.tanh(self.npci_theta_k),
+                physical_theta_k,
             )
             global_value = _magnitude_aware_rotate(
                 global_value,
                 value_delta,
-                self.npci_theta_max * torch.tanh(self.npci_theta_v),
+                physical_theta_v,
             )
 
+        routing_key = base_global_key if self.route_from_base_global_key else global_key
         representatives = _completed_chunk_representatives(
-            global_key,
+            routing_key,
             chunk_size=self.chunk_size,
             valid_lengths=lengths,
             blend_alpha=self.representative_mix,
@@ -2142,6 +2200,57 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             ),
             preserve_anchor_logits=retain_selection_logits,
         )
+        if emit_diagnostics and self.route_from_base_global_key:
+            with torch.no_grad():
+                attention_representatives = _completed_chunk_representatives(
+                    global_key,
+                    chunk_size=self.chunk_size,
+                    valid_lengths=lengths,
+                    blend_alpha=self.representative_mix,
+                )
+                attention_logits = torch.matmul(
+                    selection_query.float(),
+                    attention_representatives.float().transpose(-2, -1),
+                )
+                route_deterministic = _build_causal_tile_metadata(
+                    selection_query.float()
+                    @ representatives.float().transpose(-2, -1),
+                    chunk_size=self.chunk_size,
+                    top_k_chunks=self.top_k_chunks,
+                    selector_tile_size=1,
+                    local_window=self.local_window,
+                    valid_lengths=lengths,
+                    exploration_probability=0.0,
+                ).top_chunk_idx
+                attention_deterministic = _build_causal_tile_metadata(
+                    attention_logits,
+                    chunk_size=self.chunk_size,
+                    top_k_chunks=self.top_k_chunks,
+                    selector_tile_size=1,
+                    local_window=self.local_window,
+                    valid_lengths=lengths,
+                    exploration_probability=0.0,
+                ).top_chunk_idx
+                route_valid = route_deterministic >= 0
+                attention_valid = attention_deterministic >= 0
+                intersection = (
+                    (
+                        route_deterministic[..., :, None]
+                        == attention_deterministic[..., None, :]
+                    )
+                    & route_valid[..., :, None]
+                    & attention_valid[..., None, :]
+                ).any(-1).sum(-1).float()
+                union = (
+                    route_valid.sum(-1).float()
+                    + attention_valid.sum(-1).float()
+                    - intersection
+                )
+                route_comparison_diagnostics["route_vs_rotated_topk_jaccard"] = (
+                    torch.where(union > 0, intersection / union.clamp_min(1.0), 1.0)
+                    .mean()
+                    .detach()
+                )
         analysis_selection_logits = (
             selection_logits if retain_selection_logits else None
         )
@@ -2168,13 +2277,15 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
 
         # Correct the lane prior for the number of available local/global keys.
-        positions = torch.arange(seq_len, device=x.device, dtype=torch.int32)
-        local_count = positions.clamp(max=self.local_window).float()
+        # Values are exact integers below 2**24. Float32 avoids a PyTorch
+        # 2.13 Inductor symbolic-range bug on integer arange/subtraction.
+        positions = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+        local_count = positions.clamp(max=float(self.local_window))
         if self.boundary_bridge:
-            cutoff = (positions - self.local_window).clamp_min(0)
+            cutoff = (positions - float(self.local_window)).clamp_min(0.0)
             local_count = local_count + torch.remainder(
-                cutoff, self.chunk_size
-            ).float()
+                cutoff, float(self.chunk_size)
+            )
         tokens_per_chunk = (
             self.chunk_size
             if metadata.enumerate_all
@@ -2202,7 +2313,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 _router_auxiliary_loss(
                     selection_query,
                     representatives,
-                    global_key,
+                    routing_key,
                     selection_metadata,
                     self.route_prior_scale,
                     samples=self.route_aux_samples,
@@ -2292,6 +2403,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     / physical_valid.sum().clamp_min(1)
                 )
                 self._routing_diagnostics = {
+                    "route_source_base_global_k": torch.tensor(
+                        float(self.route_from_base_global_key), device=x.device
+                    ),
+                    **rotation_diagnostics,
+                    **route_comparison_diagnostics,
                     "routing_entropy": self._routing_entropy,
                     "routing_entropy_queries": torch.tensor(
                         float(diagnostic_count), device=x.device
