@@ -4,31 +4,25 @@
 
 # DWARF-v2
 
-DWARF-v2 is an experimental causal language-model architecture built around sparse token mixing. It combines local Dynamic Sparse Query-Gather (DSQG) blocks with strict-causal Hierarchical Sparse Attention (HISA) global mixers.
+DWARF-v2 is an experimental causal language-model architecture that combines sparse local token mixing with routed global attention. Its goal is to give a model access to distant context without using dense attention in every block.
 
-This repository contains the architecture and training source required to train your own DWARF model. It does not include a trained model, model weights, checkpoints, or training data.
+This repository contains the model definition, CUDA/Triton kernels, tokenizer, and a self-contained trainer. It does not include pretrained weights or training data.
 
-The included trainer provides a working reference configuration, but the source is intended to be adapted. Users can choose their own model width (D), depth (L), head count (H), feed-forward width (FFN), context length, and training recipe.
+The bundled profile is a starting point. Model dimensions, context length, and the training recipe are configurable in `train/train_dwarf.py`.
 
-## Architecture
+## How it works
 
-DWARF interleaves DSQG blocks with HISA global mixers. HISA combines a strict-causal local lane with routed global context, while a causal exponential-moving-average summary can provide additional context to a global mixer. All selection and mixing paths preserve autoregressive causality.
+DWARF interleaves two kinds of blocks:
 
-The bundled reference configuration uses:
+- **DSQG** gathers information from a bounded set of causal offsets instead of attending to every earlier token.
+- **HISA** combines a causal local window with a small set of routed chunks from earlier in the sequence.
+- **Causal EMA packets** give selected HISA layers a compressed view of prior state. In the final mixer, base keys decide where to look while packet-adjusted keys and values determine how the selected content is read.
 
-- Model width: 512
-- Attention heads: 8
-- Blocks: 12 (10 DSQG, 2 HISA)
-- Feed-forward width: 2,048 with a 1,344-unit SwiGLU hidden layer
-- Context length: 2,047 input tokens from 2,048-token packed rows
-- Vocabulary: 32,768 tokens
-- Parameters: 58,591,773 total; 58,591,757 trainable
+All routing and mixing paths are autoregressive. The reference profile is D512/H8/L24 with 21 DSQG blocks, 3 HISA mixers, a 2,048-wide FFN, a 2,047-token training context, a 32,768-token vocabulary, and about 100 million parameters.
 
-Its HISA mixers appear at block indices 3 and 9 and use a 64-token local lane. Model and recipe defaults are defined by `DwarfConfig` and `TrainRecipe` in `train/train_dwarf.py`. The checked-in self-test fingerprints this reference configuration, so intentional configuration changes must update the corresponding contract values.
+## Quick start
 
-## Installation
-
-Training requires Linux, an NVIDIA GPU, CUDA-enabled PyTorch, and Triton. Create a virtual environment, install the appropriate PyTorch build using the [official selector](https://pytorch.org/get-started/locally/), and install the remaining dependencies:
+Training requires Linux, an NVIDIA GPU, CUDA-enabled PyTorch, and Triton. Install PyTorch using the [official selector](https://pytorch.org/get-started/locally/), then install the remaining dependencies:
 
 ```bash
 python -m venv .venv
@@ -43,21 +37,21 @@ Verify the bundled architecture and kernel contracts before starting a run:
 python train/train_dwarf.py --self-test
 ```
 
-## Dataset format
+## Data
 
-The trainer reads a local `torch.save` artifact containing an `int32` or `int64` tensor shaped `[rows, sequence_length]`. The tensor may also be stored in a dictionary under `train`, `input_ids`, `tokens`, or `data`. The bundled configuration uses a sequence length of 2,048.
+The trainer reads a local `torch.save` artifact containing an `int32` or `int64` tensor shaped `[rows, sequence_length]`. The tensor may also be stored in a dictionary under `train`, `input_ids`, `tokens`, or `data`. The reference profile expects 2,048-token rows, which provide 2,047 next-token targets each.
 
-Pack the data with the included tokenizer:
+Use the included tokenizer when preparing rows:
 
 ```text
 tokenizers/dwarf_bpe_v32768_tokenizer.json
 ```
 
-With the included tokenizer, token IDs must be in `[0, 32768)`. The trainer validates the tensor shape, dtype, token range, tokenizer identity, and dataset hash before training. Rows are consumed in deterministic sequential order. A different vocabulary requires a matching tokenizer and configuration.
+Rows should be shuffled before they are saved; the trainer consumes them sequentially. Before training, it checks the tensor shape, dtype, token range, tokenizer identity, and dataset hash.
 
 ## Training
 
-For the bundled configuration, run a one-update smoke test with at least 210 packed rows:
+For the bundled configuration, run a one-update smoke test with at least 128 packed rows:
 
 ```bash
 python train/train_dwarf.py \
@@ -66,24 +60,18 @@ python train/train_dwarf.py \
   --stop-after 1
 ```
 
-Omit `--stop-after` to use the bundled reference training recipe:
+The default recipe uses Muon and AdamW, an effective batch of 128 rows, and a 20-billion-target horizon. Smaller runs can use `--stop-after`; `--save-every N` adds checkpoint intervals.
 
-| Learning rate | Batch × accumulation | Updates | Packed rows | Input tokens |
-|---:|---:|---:|---:|---:|
-| `3.0e-4` | `15 × 14` | 4,653 | 977,130 | 2,001,162,240 |
-
-The trainer uses Muon and AdamW with a warmup-stable-decay schedule. It writes resumable checkpoints after warmup, at 25%, 50%, 75%, and at the end of the run. Use `--save-every N` for additional intervals.
-
-Resume from a checkpoint with the same dataset and output directory:
+Checkpoints contain the model, optimizer, RNG state, source hashes, tokenizer identity, and dataset identity. Resume with the same dataset and output directory:
 
 ```bash
 python train/train_dwarf.py \
   --dataset /absolute/path/to/packed_tokens.pt \
   --output-dir runs/dwarf-train \
-  --resume runs/dwarf-train/dwarf_step_0001164.pt
+  --resume runs/dwarf-train/dwarf_step_0001909.pt
 ```
 
-Checkpoints include the model, optimizer, training configuration, random-number-generator state, source hashes, tokenizer identity, and dataset identity. Resume validation rejects incompatible state rather than partially loading it.
+Run `python train/train_dwarf.py --help` for the full command-line interface.
 
 > [!NOTE]
 > DWARF-v2 is research software. Model quality depends heavily on the training corpus, packing strategy, source mixture, and evaluation protocol.
