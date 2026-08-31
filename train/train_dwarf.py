@@ -36,6 +36,7 @@ from typing import Any, Iterable, Iterator
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _activation_checkpoint
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 KERNEL_FILES = (
@@ -138,7 +139,7 @@ EXPECTED_SEEDED_RNG_FINGERPRINT = (
     "9b349eec24e6c72fc0e50c23bc8310e0c970bb1db9fe1cdeb49ffc072a49ccfe"
 )
 EXPECTED_HISA_SOURCE_SHA256 = (
-    "ae4e86101a71a84e392f9f4806cf341069e5c4babc1b24fc93cd695419a71fd2"
+    "09ccc592835e247e1596563e994e04b650248122ee423a9351597a3f4ee31d22"
 )
 CANONICAL_TOKENIZER_SHA256 = (
     "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
@@ -148,8 +149,8 @@ CANONICAL_TOKENIZER_SHA256 = (
 @dataclass(frozen=True)
 class TrainRecipe:
     learning_rate: float = 3.0e-4
-    batch_size: int = 16
-    grad_accum_steps: int = 8
+    batch_size: int = 8
+    grad_accum_steps: int = 16
     # One schedule identity spans the complete appendable 20B stable-LR trunk.
     steps: int = 76_331
     warmup_steps: int = 1_527
@@ -248,6 +249,7 @@ class DwarfConfig:
     hisa_source_block_size: int = 8
     hisa_collect_routing_diagnostics: bool = False
     hisa_diagnostic_max_queries: int = 8
+    hisa_training_activation_checkpointing: bool = False
     ema_timescales: tuple[float, ...] = (16.0, 64.0, 256.0)
     eos_token_id: int = 1
     pad_token_id: int = 2
@@ -366,6 +368,8 @@ class DwarfConfig:
             raise TypeError("HISA auxiliary-return contract flag must be bool")
         if not self.hisa_require_auxiliary_return:
             raise ValueError("canonical HISA must require explicit auxiliary return")
+        if not isinstance(self.hisa_training_activation_checkpointing, bool):
+            raise TypeError("HISA training activation-checkpoint flag must be bool")
         for name, value in {
             "route auxiliary temperature": self.hisa_route_aux_temperature,
             "route oracle temperature": self.hisa_route_aux_oracle_temperature,
@@ -1479,7 +1483,7 @@ class DwarfForCausalLM(nn.Module):
         auxiliary = x.new_zeros((), dtype=torch.float32)
         for block in self.blocks:
             if isinstance(block, GlobalMixerBlock):
-                x, block_auxiliary = block(
+                mixer_args = (
                     x,
                     valid_lengths,
                     route_aux_tile_ids,
@@ -1487,6 +1491,20 @@ class DwarfForCausalLM(nn.Module):
                     input_ids if collect_diagnostics else None,
                     exploration_step,
                 )
+                if (
+                    self.config.hisa_training_activation_checkpointing
+                    and self.training
+                    and torch.is_grad_enabled()
+                    and not collect_diagnostics
+                ):
+                    x, block_auxiliary = _activation_checkpoint(
+                        block,
+                        *mixer_args,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
+                else:
+                    x, block_auxiliary = block(*mixer_args)
                 auxiliary = auxiliary + block_auxiliary.float()
             else:
                 x = block(x, collect_diagnostics=collect_diagnostics)

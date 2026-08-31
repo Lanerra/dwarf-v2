@@ -1217,6 +1217,45 @@ def _gather_chunk_values(values: torch.Tensor, chunk_idx: torch.Tensor) -> torch
     raise ValueError("chunk values must be rank 4 or 5")
 
 
+_SELECTED_ROUTING_TEMPORARY_BUDGET_BYTES = 256 * 1024 * 1024
+
+
+def _selected_routing_query_block_size(
+    values: torch.Tensor,
+    chunk_idx: torch.Tensor,
+    *,
+    temporary_budget_bytes: int = _SELECTED_ROUTING_TEMPORARY_BUDGET_BYTES,
+) -> int:
+    if values.ndim not in (4, 5):
+        raise ValueError("chunk values must be rank 4 or 5")
+    if chunk_idx.ndim != 4:
+        raise ValueError("chunk indices must be rank 4")
+    if temporary_budget_bytes <= 0:
+        raise ValueError("selected-routing temporary budget must be positive")
+
+    batch_size, heads, seq_len, slots = chunk_idx.shape
+    addresses_per_chunk = values.shape[-2] if values.ndim == 5 else 1
+    head_dim = values.shape[-1]
+    selected_elements_per_query = (
+        batch_size * heads * slots * addresses_per_chunk * head_dim
+    )
+    address_scores_per_query = batch_size * heads * slots * addresses_per_chunk
+    slot_scores_per_query = batch_size * heads * slots
+    query_elements_per_query = batch_size * heads * head_dim
+
+    # The canonical path can hold the gathered source tensor, its FP32 cast,
+    # and the FP32 pointwise product at the same time. Include the reduced
+    # address scores, final slot scores/coherence, and FP32 query slice too.
+    bytes_per_query = (
+        selected_elements_per_query * (values.element_size() + 8)
+        + address_scores_per_query * 4
+        + slot_scores_per_query * 12
+        + query_elements_per_query * 4
+    )
+    planned = temporary_budget_bytes // max(1, bytes_per_query)
+    return max(1, min(seq_len, planned))
+
+
 def _selected_routing_scores(
     query_normalized: torch.Tensor,
     addresses: HISAChunkAddresses,
@@ -1225,33 +1264,70 @@ def _selected_routing_scores(
     reduction: str,
     temperature: float,
     coherence_weight: torch.Tensor | float,
+    query_block_size: int | None = None,
 ) -> torch.Tensor:
-    selected = _gather_chunk_values(addresses.values, chunk_idx)
-    if selected.ndim == 5:
-        scores = (query_normalized.float()[..., None, :] * selected.float()).sum(-1)
+    batch_size, heads, seq_len, slots = chunk_idx.shape
+    if query_block_size is None:
+        block_size = _selected_routing_query_block_size(
+            addresses.values,
+            chunk_idx,
+        )
     else:
-        per_address = (
-            query_normalized.float()[..., None, None, :] * selected.float()
-        ).sum(-1)
-        if reduction == "max":
-            scores = per_address.max(-1).values
-        elif reduction == "logsumexp":
-            address_count = max(1, selected.shape[-2])
-            scores = float(temperature) * (
-                torch.logsumexp(per_address / float(temperature), dim=-1)
-                - math.log(address_count)
-            )
+        if query_block_size <= 0:
+            raise ValueError("selected-routing query block size must be positive")
+        block_size = min(seq_len, int(query_block_size))
+
+    scores = torch.empty(
+        (batch_size, heads, seq_len, slots),
+        device=query_normalized.device,
+        dtype=torch.float32,
+    )
+    for start in range(0, seq_len, block_size):
+        end = min(start + block_size, seq_len)
+        block_indices = chunk_idx[:, :, start:end]
+        selected = _gather_chunk_values(addresses.values, block_indices)
+        block_query = query_normalized[:, :, start:end].float()
+        if selected.ndim == 5:
+            block_scores = (
+                block_query[..., None, :] * selected.float()
+            ).sum(-1)
         else:
-            raise ValueError("representative_score_reduction must be max or logsumexp")
-    expanded_coherence = addresses.coherence[:, :, None].expand(
-        query_normalized.shape[0], query_normalized.shape[1],
-        query_normalized.shape[2], addresses.coherence.shape[-1]
-    )
-    selected_coherence = torch.gather(
-        expanded_coherence, -1, chunk_idx.clamp_min(0).long()
-    )
-    scores = scores + _coherence_score_correction(selected_coherence, coherence_weight)
-    return scores.masked_fill(chunk_idx < 0, float("-inf"))
+            per_address = (
+                block_query[..., None, None, :] * selected.float()
+            ).sum(-1)
+            if reduction == "max":
+                block_scores = per_address.max(-1).values
+            elif reduction == "logsumexp":
+                address_count = max(1, selected.shape[-2])
+                block_scores = float(temperature) * (
+                    torch.logsumexp(per_address / float(temperature), dim=-1)
+                    - math.log(address_count)
+                )
+            else:
+                raise ValueError(
+                    "representative_score_reduction must be max or logsumexp"
+                )
+
+        expanded_coherence = addresses.coherence[:, :, None].expand(
+            batch_size,
+            heads,
+            end - start,
+            addresses.coherence.shape[-1],
+        )
+        selected_coherence = torch.gather(
+            expanded_coherence,
+            -1,
+            block_indices.clamp_min(0).long(),
+        )
+        block_scores = block_scores + _coherence_score_correction(
+            selected_coherence,
+            coherence_weight,
+        )
+        scores[:, :, start:end] = block_scores.masked_fill(
+            block_indices < 0,
+            float("-inf"),
+        )
+    return scores
 
 
 def _representative_diagnostics(addresses: HISAChunkAddresses) -> dict[str, torch.Tensor]:
