@@ -2,11 +2,11 @@
 """Self-contained public trainer for the canonical DWARF-v2 architecture.
 
 The model is D512/H8/L24/FFN2048 with bounded-routing DSQG V23 blocks and
-strict-causal HISA V19 global mixers at layers 3, 10, and 17. Independent
-causal-EMA K/V packets live at L3 and L17; L10 is ordinary HISA. At L17 only,
-base global K supplies representatives, hard top-k routes, selected route
-priors, and router auxiliary/oracle targets while packet-rotated K/V remain in
-global token attention.
+strict-causal optimized HISA V19 global mixers at layers 3, 10, and 17.
+Independent causal-EMA K/V packets live at L3 and L17; L10 is ordinary HISA.
+At L17, base global K owns coarse routing scores and selected route priors,
+while base/post-packet candidate sets are unioned and exact post-packet page
+LSE selects the final routes used by global token attention.
 
 The trainer accepts packed token rows and includes Muon+AdamW, WSD, deterministic
 row selection, atomic resumable checkpoints, and the complete model definition.
@@ -16,6 +16,7 @@ Dataset preparation and evaluation remain out of scope.
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import hashlib
 import importlib.metadata
@@ -62,7 +63,11 @@ if KERNEL_DIR is None:
     raise FileNotFoundError(
         "canonical DWARF kernel files were not found together; searched: " + searched
     )
-for directory in (SCRIPT_DIR, KERNEL_DIR):
+REPO_KERNEL_LAYOUT = KERNEL_DIR.resolve() == (SCRIPT_DIR.parent / "kernels").resolve()
+kernel_import_directories = [SCRIPT_DIR, KERNEL_DIR]
+if REPO_KERNEL_LAYOUT:
+    kernel_import_directories.append(SCRIPT_DIR.parent)
+for directory in kernel_import_directories:
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
@@ -77,24 +82,49 @@ from dsqg_attention_v23 import (  # noqa: E402
     DSQGAttentionV23,
     dsqg_triton_available,
 )
-from hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
-    HierarchicalSparseAttentionV19HISACausal,
-    hisa_runtime_capabilities,
-)
+if REPO_KERNEL_LAYOUT:
+    from kernels.hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
+        HierarchicalSparseAttentionV19HISACausal,
+        TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
+        hisa_integration_contract,
+        hisa_runtime_capabilities,
+    )
+else:
+    from hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
+        HierarchicalSparseAttentionV19HISACausal,
+        TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
+        hisa_integration_contract,
+        hisa_runtime_capabilities,
+    )
 
-CHECKPOINT_KIND = "dwarf-l24-l17-basek-route-public-packed-dsqgv23-hisav19-resume-v1"
+CHECKPOINT_KIND = (
+    "dwarf-l24-l17-basek-dualsource-public-packed-"
+    "dsqgv23-hisav19qv3-resume-v1"
+)
 CANONICAL_PARENT_CHECKPOINT_KIND = (
     "dwarf-l24-l17-basek-route-appendable-prefix-stable-dsqgv23-hisav19-resume-v1"
 )
-RELEASE_KIND = "dwarf-l24-l17-basek-route-dsqgv23-hisav19-weights-v1"
+RELEASE_KIND = (
+    "dwarf-l24-l17-basek-dualsource-dsqgv23-hisav19qv3-weights-v1"
+)
+LEGACY_HISA_V2_CHECKPOINT_KINDS = frozenset(
+    {
+        "dwarf-l24-l17-basek-route-public-packed-dsqgv23-hisav19-resume-v1",
+        CANONICAL_PARENT_CHECKPOINT_KIND,
+        "dwarf-l24-l17-basek-route-dsqgv23-hisav19-weights-v1",
+    }
+)
 ROUTE_AUX_RECIPE_SEED = 20_260_809
-EXPECTED_PARAMETERS = 100_179_313
-EXPECTED_TRAINABLE_PARAMETERS = 100_179_297
+EXPECTED_PARAMETERS = 100_093_813
+EXPECTED_TRAINABLE_PARAMETERS = 100_093_773
 EXPECTED_STATE_FINGERPRINT = (
-    "5219e76a32c32db3b59697a0230eca730969d17b82696b23148a5bf9b935b06a"
+    "cd6e6d1ea9b8e25f8b4b601a3c043c530df1d6d4f3ae93e6f07b51043b68f78d"
 )
 EXPECTED_SEEDED_RNG_FINGERPRINT = (
-    "799d503b1b60a6fcd0d39e034521df4c10c4eee699551f781bf9c9c20f573010"
+    "9b349eec24e6c72fc0e50c23bc8310e0c970bb1db9fe1cdeb49ffc072a49ccfe"
+)
+EXPECTED_HISA_AST_SHA256 = (
+    "69d1d49fa08cbb8b752ce71002f1dd6f18b3caf42bbd36e9b478a27fe3033e74"
 )
 CANONICAL_TOKENIZER_SHA256 = (
     "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
@@ -151,19 +181,56 @@ class DwarfConfig:
     hisa_selector_tile: int = 16
     hisa_chunk_selection_scope: str = "token"
     hisa_token_routing_pack_size: int = 4
+    hisa_temperature: float = 1.0
+    hisa_route_prior_scale: float = 0.1
+    hisa_route_prior_max_scale: float = 2.0
+    hisa_global_lane_bias_limit: float = 4.0
     hisa_global_adapter_rank: int = 64
     hisa_binding_rank: int = 64
+    hisa_global_route_confidence_limit: float = 2.0
+    hisa_count_correction_scale_limit: float = 2.0
+    hisa_npci_theta_max: float = 0.25
+    hisa_rerank_selected_priors_with_post_packet_representatives: bool = False
     hisa_route_aux_weight: float = 0.02
     hisa_route_aux_samples: int = 8
     hisa_route_aux_temperature: float = 0.5
     hisa_route_aux_oracle_temperature: float = 0.3
+    hisa_route_aux_teacher: str = "dense_attention"
+    hisa_route_aux_coverage_weight: float = 0.0
+    hisa_global_mass_aux_weight: float = 0.01
+    hisa_binding_null_aux_weight: float = 0.002
+    hisa_require_auxiliary_return: bool = True
+    hisa_representative_mode: str = "multi_landmark"
+    hisa_representative_blend_alpha: float = 0.5
+    hisa_representative_score_reduction: str = "logsumexp"
+    hisa_representative_lse_temperature: float = 0.5
+    hisa_coherence_score_max_weight: float = 1.0
+    hisa_coherence_score_initial_weight: float = 0.25
+    hisa_routing_candidate_multiplier: int = 2
+    hisa_routing_stream_block_size: int = 16
+    hisa_hierarchical_routing: bool = True
+    hisa_hierarchy_group_size: int = 4
+    hisa_parent_top_k: int = 3
+    hisa_exact_page_rerank: bool = True
+    hisa_dual_source_candidate_union: bool = True
     hisa_exploration_probability: float = 0.10
+    hisa_exploration_policy: str = "tail_softmax"
+    hisa_exploration_temperature: float = 1.0
+    hisa_exploration_final_probability: float = 0.0
+    hisa_exploration_anneal_steps: int = 10_000
+    hisa_global_key_calibration: str = "none"
     hisa_backend: str = "triton"
     hisa_token_selection_mode: str = "auto"
     hisa_local_backend: str = "flex"
     hisa_boundary_bridge: bool = True
+    hisa_local_block_size: int = 128
+    hisa_local_mask_cache_size: int = 4
     hisa_triton_block_q: int = 16
-    hisa_backward_impl: str = "atomic_masked"
+    hisa_triton_query_pack_specialization: str | None = (
+        TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION
+    )
+    hisa_backward_impl: str = "source_block_stable"
+    hisa_source_block_size: int = 8
     hisa_collect_routing_diagnostics: bool = False
     hisa_diagnostic_max_queries: int = 8
     ema_timescales: tuple[float, ...] = (16.0, 64.0, 256.0)
@@ -216,6 +283,13 @@ class DwarfConfig:
             raise ValueError("HISA requires a power-of-two head dimension")
         if self.dsqg_backend not in {"auto", "eager", "triton"}:
             raise ValueError("DSQG backend must be auto, eager, or triton")
+        if min(
+            self.hisa_chunk_size,
+            self.hisa_local_window,
+            self.hisa_selector_tile,
+            self.top_k_chunks,
+        ) < 1:
+            raise ValueError("HISA chunk, local, selector, and route widths must be positive")
         if self.hisa_top_m_tokens != self.hisa_chunk_size:
             raise ValueError(
                 "canonical HISA enumerates complete chunks; top-M must equal chunk size"
@@ -224,18 +298,157 @@ class DwarfConfig:
             raise ValueError("canonical HISA chunk selection scope must be token")
         if self.hisa_token_routing_pack_size not in {1, 2, 4, 8, 16}:
             raise ValueError("HISA token routing pack size must be 1, 2, 4, 8, or 16")
+        if not math.isfinite(self.hisa_temperature) or self.hisa_temperature <= 0:
+            raise ValueError("HISA routing temperature must be finite and positive")
+        if (
+            not math.isfinite(self.hisa_route_prior_scale)
+            or self.hisa_route_prior_scale <= 0
+            or not math.isfinite(self.hisa_route_prior_max_scale)
+            or self.hisa_route_prior_max_scale <= self.hisa_route_prior_scale
+        ):
+            raise ValueError("HISA route-prior bounds are invalid")
+        for name, value in {
+            "global lane bias limit": self.hisa_global_lane_bias_limit,
+            "global route confidence limit": self.hisa_global_route_confidence_limit,
+            "count correction scale limit": self.hisa_count_correction_scale_limit,
+            "NPCI theta limit": self.hisa_npci_theta_max,
+        }.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"HISA {name} must be finite and positive")
+        if self.hisa_global_adapter_rank < 0 or self.hisa_binding_rank < 0:
+            raise ValueError("HISA adapter and binding ranks must be non-negative")
+        if not isinstance(
+            self.hisa_rerank_selected_priors_with_post_packet_representatives, bool
+        ):
+            raise TypeError("HISA selected-prior rerank flag must be bool")
         if self.hisa_backend not in {"auto", "eager", "triton"}:
             raise ValueError("HISA backend must be auto, eager, or triton")
         if self.hisa_token_selection_mode != "auto":
             raise ValueError("canonical HISA token selection mode must be auto")
+        if self.hisa_route_aux_teacher not in {
+            "dense_attention",
+            "cosine_ablation",
+        }:
+            raise ValueError("HISA route auxiliary teacher is invalid")
+        for name, value in {
+            "route auxiliary": self.hisa_route_aux_weight,
+            "route coverage auxiliary": self.hisa_route_aux_coverage_weight,
+            "global-mass auxiliary": self.hisa_global_mass_aux_weight,
+            "binding-null auxiliary": self.hisa_binding_null_aux_weight,
+        }.items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"HISA {name} weight must be finite and non-negative")
+        if self.hisa_route_aux_samples < 0:
+            raise ValueError("HISA route auxiliary sample count must be non-negative")
+        if self.hisa_route_aux_samples == 0 and (
+            self.hisa_route_aux_weight > 0 or self.hisa_global_mass_aux_weight > 0
+        ):
+            raise ValueError("HISA teacher auxiliaries require sampled routing rows")
+        if not isinstance(self.hisa_require_auxiliary_return, bool):
+            raise TypeError("HISA auxiliary-return contract flag must be bool")
+        if not self.hisa_require_auxiliary_return:
+            raise ValueError("canonical HISA must require explicit auxiliary return")
+        for name, value in {
+            "route auxiliary temperature": self.hisa_route_aux_temperature,
+            "route oracle temperature": self.hisa_route_aux_oracle_temperature,
+        }.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"HISA {name} must be finite and positive")
+        if self.hisa_representative_mode not in {
+            "mean_max_blend",
+            "mean_max_blend_ablation",
+            "multi_address",
+            "multi_landmark",
+        }:
+            raise ValueError("HISA representative mode is invalid")
+        if not 0.0 <= self.hisa_representative_blend_alpha <= 1.0:
+            raise ValueError("HISA representative blend alpha must be in [0,1]")
+        if self.hisa_representative_score_reduction not in {"max", "logsumexp"}:
+            raise ValueError("HISA representative score reduction is invalid")
+        if (
+            not math.isfinite(self.hisa_representative_lse_temperature)
+            or self.hisa_representative_lse_temperature <= 0
+        ):
+            raise ValueError("HISA representative LSE temperature must be positive")
+        if (
+            not math.isfinite(self.hisa_coherence_score_max_weight)
+            or self.hisa_coherence_score_max_weight <= 0
+            or not math.isfinite(self.hisa_coherence_score_initial_weight)
+            or not 0.0
+            <= self.hisa_coherence_score_initial_weight
+            <= self.hisa_coherence_score_max_weight
+        ):
+            raise ValueError("HISA coherence calibration bounds are invalid")
+        if (
+            self.hisa_routing_candidate_multiplier < 1
+            or self.hisa_routing_stream_block_size < 1
+            or self.hisa_hierarchy_group_size < 1
+            or self.hisa_parent_top_k < 1
+        ):
+            raise ValueError("HISA hierarchical routing geometry must be positive")
+        for name, value in {
+            "hierarchical routing": self.hisa_hierarchical_routing,
+            "exact page rerank": self.hisa_exact_page_rerank,
+            "dual-source candidate union": self.hisa_dual_source_candidate_union,
+        }.items():
+            if not isinstance(value, bool):
+                raise TypeError(f"HISA {name} flag must be bool")
+        if not self.hisa_hierarchical_routing or not self.hisa_exact_page_rerank:
+            raise ValueError(
+                "canonical optimized HISA requires hierarchy and exact page reranking"
+            )
+        if self.hisa_exploration_policy not in {
+            "tail_softmax",
+            "uniform_unseen_ablation",
+        }:
+            raise ValueError("HISA exploration policy is invalid")
+        if (
+            not math.isfinite(self.hisa_exploration_temperature)
+            or self.hisa_exploration_temperature <= 0
+        ):
+            raise ValueError("HISA exploration temperature must be positive")
+        if not 0.0 <= self.hisa_exploration_probability <= 1.0:
+            raise ValueError("HISA initial exploration probability must be in [0,1]")
+        if not 0.0 <= self.hisa_exploration_final_probability <= 1.0:
+            raise ValueError("HISA final exploration probability must be in [0,1]")
+        if self.hisa_exploration_anneal_steps < 0:
+            raise ValueError("HISA exploration anneal steps must be non-negative")
+        if self.hisa_global_key_calibration not in {"none", "rms_match_local"}:
+            raise ValueError("HISA global key calibration is invalid")
         if self.hisa_local_backend != "flex":
             raise ValueError("canonical HISA local backend must be flex")
-        if self.hisa_triton_block_q < 16 or self.hisa_triton_block_q & (
+        if (
+            self.hisa_local_block_size < 16
+            or self.hisa_local_block_size & (self.hisa_local_block_size - 1)
+        ):
+            raise ValueError("HISA local block size must be a power of two >=16")
+        if self.hisa_local_mask_cache_size < 1:
+            raise ValueError("HISA local mask cache size must be positive")
+        if self.hisa_triton_block_q < 1 or self.hisa_triton_block_q & (
             self.hisa_triton_block_q - 1
         ):
-            raise ValueError("HISA Triton BLOCK_Q must be a power of two >=16")
-        if self.hisa_backward_impl not in {"atomic", "atomic_masked"}:
-            raise ValueError("HISA backward implementation must be atomic or atomic_masked")
+            raise ValueError("HISA Triton BLOCK_Q must be a positive power of two")
+        if self.hisa_triton_query_pack_specialization not in {
+            None,
+            TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
+        }:
+            raise ValueError("unsupported HISA query-pack specialization")
+        if self.hisa_backward_impl not in {
+            "source_owned",
+            "source_block_stable",
+            "source_block_counting",
+            "atomic",
+            "atomic_masked",
+        }:
+            raise ValueError(
+                "HISA backward implementation is not supported by the optimized kernel"
+            )
+        if (
+            self.hisa_source_block_size < 1
+            or self.hisa_source_block_size > 32
+            or self.hisa_source_block_size & (self.hisa_source_block_size - 1)
+        ):
+            raise ValueError("HISA source block size must be a power of two in [1,32]")
         if not isinstance(self.hisa_collect_routing_diagnostics, bool):
             raise TypeError("HISA routing diagnostics flag must be bool")
         if self.hisa_diagnostic_max_queries < 1:
@@ -278,12 +491,15 @@ def route_aux_tile_ids_for_update(
     device: torch.device | str,
     config: DwarfConfig | None = None,
 ) -> torch.Tensor:
-    """Derive one deterministic auxiliary sample shared by an optimizer update."""
+    """Derive deterministic rows where more than K chunks compete for K slots."""
     config = config or DwarfConfig()
     if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 1:
         raise ValueError("global optimizer step must be a positive integer")
-    first_useful = math.ceil(config.hisa_chunk_size + config.hisa_local_window)
-    candidate_count = config.model_length - first_useful
+    first_competitive = (
+        (config.top_k_chunks + 1) * config.hisa_chunk_size
+        + config.hisa_local_window
+    )
+    candidate_count = config.model_length - first_competitive
     sample_count = min(config.hisa_route_aux_samples, candidate_count)
     if sample_count != config.hisa_route_aux_samples:
         raise ValueError("production sequence has too few route-auxiliary tiles")
@@ -291,7 +507,9 @@ def route_aux_tile_ids_for_update(
     seed = int.from_bytes(hashlib.sha256(material).digest()[:8], "little") % (2**63)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     ids = torch.randperm(candidate_count, generator=generator)[:sample_count]
-    return (ids + first_useful).to(device=torch.device(device), dtype=torch.int64)
+    return (ids + first_competitive).to(
+        device=torch.device(device), dtype=torch.int64
+    )
 
 
 def _consume_retired_movt_rng(
@@ -338,6 +556,28 @@ def source_manifest() -> dict[str, str]:
         ).resolve(),
     }
     return {name: _sha256(path) for name, path in locations.items()}
+
+
+def validate_canonical_kernel_sources() -> dict[str, str]:
+    """Require the CUDA-validated HISA code while ignoring formatting-only drift."""
+    observed = source_manifest()
+    hisa_path = Path(
+        sys.modules["hierarchical_sparse_attn_v19_hisa"].__file__
+    ).resolve()
+    tree = ast.parse(hisa_path.read_text(encoding="utf-8"), filename=str(hisa_path))
+    normalized = ast.dump(
+        tree,
+        annotate_fields=True,
+        include_attributes=False,
+    ).encode("utf-8")
+    observed_ast_sha256 = hashlib.sha256(normalized).hexdigest()
+    if observed_ast_sha256 != EXPECTED_HISA_AST_SHA256:
+        raise RuntimeError(
+            "canonical CUDA-validated HISA source does not match; "
+            f"expected normalized AST {EXPECTED_HISA_AST_SHA256}, "
+            f"observed {observed_ast_sha256}"
+        )
+    return observed
 
 
 def _package_version(name: str) -> str | None:
@@ -394,6 +634,66 @@ def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
     return environment
 
 
+def validate_optimized_hisa_contract(
+    capabilities: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Reject legacy or partially copied HISA kernels before model construction."""
+    observed_capabilities = (
+        hisa_runtime_capabilities() if capabilities is None else capabilities
+    )
+    required_capabilities = (
+        "streaming_selector",
+        "hierarchical_parent_child_selector",
+        "exact_page_reranker",
+        "incremental_exact_page_cache",
+        "aggregate_only_global_kernel",
+        "source_block_and_atomic_backward",
+        "triton_library_operator",
+    )
+    missing = [
+        name for name in required_capabilities
+        if observed_capabilities.get(name) is not True
+    ]
+    if missing:
+        raise RuntimeError(
+            "optimized HISA runtime capabilities are missing: " + ", ".join(missing)
+        )
+
+    contract = hisa_integration_contract()
+    expected = {
+        "hard_selector": "detached_streaming_top_m",
+        "selector_autograd": "selected_K_plus_sampled_auxiliary_rows_only",
+        "hierarchical_routing": "completed_parent_groups_then_child_candidates",
+        "exact_page_rerank": "token_level_lse_over_top_m_candidates",
+        "aggregate_only_specialization": True,
+    }
+    mismatches = {
+        name: {"expected": value, "observed": contract.get(name)}
+        for name, value in expected.items()
+        if contract.get(name) != value
+    }
+    backward_variants = contract.get("backward_variants")
+    if backward_variants != (
+        "source_block_stable",
+        "source_block_counting",
+        "atomic",
+    ):
+        mismatches["backward_variants"] = {
+            "expected": (
+                "source_block_stable",
+                "source_block_counting",
+                "atomic",
+            ),
+            "observed": backward_variants,
+        }
+    if mismatches:
+        raise RuntimeError(
+            "optimized HISA integration contract does not match: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    return {"capabilities": observed_capabilities, "contract": contract}
+
+
 def validate_training_runtime(
     device: torch.device, config: DwarfConfig
 ) -> tuple[type, dict[str, Any]]:
@@ -418,6 +718,7 @@ def validate_training_runtime(
     if not causal_ema_triton_available():
         raise RuntimeError("canonical CUDA causal EMA execution requires Triton")
     hisa = hisa_runtime_capabilities()
+    validate_optimized_hisa_contract(hisa)
     if not hisa["flex_attention"]:
         raise RuntimeError("canonical CUDA HISA execution requires FlexAttention")
     if config.hisa_backend != "eager" and not hisa["triton"]:
@@ -668,15 +969,34 @@ def assert_public_kernel_contracts() -> None:
             "route_aux_samples": 2,
             "route_aux_temperature": 0.5,
             "route_aux_oracle_temperature": 0.3,
+            "global_mass_aux_weight": 0.01,
+            "binding_null_aux_weight": 0.002,
+            "require_auxiliary_return": True,
+            "representative_mode": "multi_landmark",
+            "representative_score_reduction": "logsumexp",
+            "representative_lse_temperature": 0.5,
+            "coherence_score_max_weight": 1.0,
+            "coherence_score_initial_weight": 0.25,
+            "routing_candidate_multiplier": 2,
+            "routing_stream_block_size": 8,
+            "hierarchical_routing": True,
+            "hierarchy_group_size": 2,
+            "parent_top_k": 3,
+            "exact_page_rerank": True,
+            "dual_source_candidate_union": True,
             "global_adapter_rank": 8,
             "binding_rank": 8,
+            "count_correction_scale_limit": 2.0,
             "max_seq_len": 64,
             "backend": "eager",
+            "backward_impl": "source_block_stable",
+            "source_block_size": 4,
             "diagnostic_max_queries": 4,
         }
         hisa = HierarchicalSparseAttentionV19HISACausal(**hisa_kwargs).train()
+        hisa.representative_mix_raw.requires_grad_(False)
         hisa_input = torch.randn(2, 64, 64, requires_grad=True)
-        auxiliary_ids = torch.tensor((24, 47), dtype=torch.int64)
+        auxiliary_ids = torch.tensor((40, 47), dtype=torch.int64)
         hisa_output, hisa_auxiliary = hisa(
             hisa_input,
             route_aux_tile_ids=auxiliary_ids,
@@ -691,7 +1011,13 @@ def assert_public_kernel_contracts() -> None:
             torch.equal(hisa_output[:, :1], torch.zeros_like(hisa_output[:, :1])),
             "strict-causal HISA position zero is not exactly zero",
         )
-        (hisa_output.square().mean() + hisa_auxiliary).backward()
+        hisa_total_loss = hisa_output.square().mean() + hisa_auxiliary
+        assert_hisa_auxiliary_gradient_contract(
+            total_loss=hisa_total_loss,
+            auxiliary=hisa_auxiliary,
+            attention_modules=(hisa,),
+        )
+        hisa_total_loss.backward()
         _require(
             hisa_input.grad is not None and torch.isfinite(hisa_input.grad).all(),
             "HISA CPU backward produced an absent or non-finite input gradient",
@@ -745,12 +1071,20 @@ def assert_public_kernel_contracts() -> None:
         )
         mean_low = float(
             HierarchicalSparseAttentionV19HISACausal(
-                **hisa_kwargs, representative_blend_alpha=0.2
+                **{
+                    **hisa_kwargs,
+                    "representative_mode": "mean_max_blend",
+                    "representative_blend_alpha": 0.2,
+                }
             ).representative_mix.detach().mean()
         )
         mean_high = float(
             HierarchicalSparseAttentionV19HISACausal(
-                **hisa_kwargs, representative_blend_alpha=0.8
+                **{
+                    **hisa_kwargs,
+                    "representative_mode": "mean_max_blend",
+                    "representative_blend_alpha": 0.8,
+                }
             ).representative_mix.detach().mean()
         )
         _require(
@@ -915,29 +1249,83 @@ class GlobalMixerBlock(nn.Module):
             selector_tile_size=config.hisa_selector_tile,
             chunk_selection_scope=config.hisa_chunk_selection_scope,
             token_routing_pack_size=config.hisa_token_routing_pack_size,
-            representative_mode="mean_max_blend",
-            representative_blend_alpha=0.5,
-            route_prior_scale=0.1,
-            route_prior_max_scale=2.0,
+            temperature=config.hisa_temperature,
+            representative_mode=config.hisa_representative_mode,
+            representative_blend_alpha=config.hisa_representative_blend_alpha,
+            representative_score_reduction=(
+                config.hisa_representative_score_reduction
+            ),
+            representative_lse_temperature=(
+                config.hisa_representative_lse_temperature
+            ),
+            coherence_score_max_weight=config.hisa_coherence_score_max_weight,
+            coherence_score_initial_weight=(
+                config.hisa_coherence_score_initial_weight
+            ),
+            routing_candidate_multiplier=config.hisa_routing_candidate_multiplier,
+            routing_stream_block_size=config.hisa_routing_stream_block_size,
+            hierarchical_routing=config.hisa_hierarchical_routing,
+            hierarchy_group_size=config.hisa_hierarchy_group_size,
+            parent_top_k=config.hisa_parent_top_k,
+            exact_page_rerank=config.hisa_exact_page_rerank,
+            dual_source_candidate_union=config.hisa_dual_source_candidate_union,
+            route_prior_scale=config.hisa_route_prior_scale,
+            route_prior_max_scale=config.hisa_route_prior_max_scale,
+            global_lane_bias_limit=config.hisa_global_lane_bias_limit,
+            global_route_confidence_limit=(
+                config.hisa_global_route_confidence_limit
+            ),
             route_aux_weight=config.hisa_route_aux_weight,
             route_aux_samples=config.hisa_route_aux_samples,
             route_aux_temperature=config.hisa_route_aux_temperature,
             route_aux_oracle_temperature=config.hisa_route_aux_oracle_temperature,
+            route_aux_teacher=config.hisa_route_aux_teacher,
+            route_aux_coverage_weight=config.hisa_route_aux_coverage_weight,
+            global_mass_aux_weight=config.hisa_global_mass_aux_weight,
+            binding_null_aux_weight=config.hisa_binding_null_aux_weight,
+            require_auxiliary_return=config.hisa_require_auxiliary_return,
             exploration_probability=config.hisa_exploration_probability,
+            exploration_policy=config.hisa_exploration_policy,
+            exploration_temperature=config.hisa_exploration_temperature,
+            exploration_final_probability=(
+                config.hisa_exploration_final_probability
+            ),
+            exploration_anneal_steps=config.hisa_exploration_anneal_steps,
             global_adapter_rank=config.hisa_global_adapter_rank,
+            global_key_calibration=config.hisa_global_key_calibration,
             binding_rank=config.hisa_binding_rank,
-            npci_theta_max=0.25,
+            count_correction_scale_limit=(
+                config.hisa_count_correction_scale_limit
+            ),
+            rerank_selected_priors_with_post_packet_representatives=(
+                config.hisa_rerank_selected_priors_with_post_packet_representatives
+            ),
+            npci_theta_max=config.hisa_npci_theta_max,
             max_seq_len=config.model_length,
             backend=config.hisa_backend,
             token_selection_mode=config.hisa_token_selection_mode,
             local_backend=config.hisa_local_backend,
             boundary_bridge=config.hisa_boundary_bridge,
+            local_block_size=config.hisa_local_block_size,
+            local_mask_cache_size=config.hisa_local_mask_cache_size,
             triton_block_q=config.hisa_triton_block_q,
+            triton_query_pack_specialization=(
+                config.hisa_triton_query_pack_specialization
+            ),
             backward_impl=config.hisa_backward_impl,
+            source_block_size=config.hisa_source_block_size,
             collect_routing_diagnostics=config.hisa_collect_routing_diagnostics,
             diagnostic_max_queries=config.hisa_diagnostic_max_queries,
             route_from_base_global_key=route_from_base_global_key,
         )
+        if config.hisa_representative_mode in {
+            "mean_max_blend_ablation",
+            "multi_address",
+            "multi_landmark",
+        }:
+            # The optimized kernel retains this vector for checkpoint structure,
+            # but these representative modes do not consume it in the forward.
+            self.attn.representative_mix_raw.requires_grad_(False)
         self.packet = InterferencePacket(config) if use_packet else None
         self.packet_initial_coupling_fraction = packet_initial_coupling_fraction
         if (self.packet is None) != (packet_initial_coupling_fraction is None):
@@ -966,6 +1354,8 @@ class GlobalMixerBlock(nn.Module):
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
+        token_ids: torch.Tensor | None = None,
+        exploration_step: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = self.norm1(x)
         kv_inject = self.packet(normalized) if self.packet is not None else None
@@ -974,6 +1364,8 @@ class GlobalMixerBlock(nn.Module):
             kv_inject=kv_inject,
             valid_lengths=valid_lengths,
             route_aux_tile_ids=route_aux_tile_ids,
+            token_ids=token_ids,
+            exploration_step=exploration_step,
             collect_diagnostics=collect_diagnostics,
             return_auxiliary=True,
         )
@@ -1054,7 +1446,8 @@ class DwarfForCausalLM(nn.Module):
                     with torch.no_grad():
                         module.scale_embed.sub_(module.scale_embed.mean(0, keepdim=True))
                 elif isinstance(module, HierarchicalSparseAttentionV19HISACausal):
-                    module.reset_global_adapters_()
+                    module.initialize_global_adapter_up_()
+                    module.reset_binding_parameters_()
                 elif isinstance(module, InterferencePacket):
                     with torch.no_grad():
                         module.gate_proj.bias.fill_(-2.0)
@@ -1075,6 +1468,7 @@ class DwarfForCausalLM(nn.Module):
         *,
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
+        exploration_step: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_auxiliary: bool = False,
     ):
@@ -1090,6 +1484,8 @@ class DwarfForCausalLM(nn.Module):
                     valid_lengths,
                     route_aux_tile_ids,
                     collect_diagnostics,
+                    input_ids if collect_diagnostics else None,
+                    exploration_step,
                 )
                 auxiliary = auxiliary + block_auxiliary.float()
             else:
@@ -1105,12 +1501,14 @@ class DwarfForCausalLM(nn.Module):
         *,
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
+        exploration_step: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_auxiliary: bool = False,
     ):
         kwargs = {
             "valid_lengths": valid_lengths,
             "route_aux_tile_ids": route_aux_tile_ids,
+            "exploration_step": exploration_step,
             "collect_diagnostics": collect_diagnostics,
             "return_auxiliary": return_auxiliary,
         }
@@ -1125,6 +1523,7 @@ class DwarfForCausalLM(nn.Module):
         *,
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
+        exploration_step: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_hidden: bool = False,
         return_auxiliary: bool = False,
@@ -1133,6 +1532,7 @@ class DwarfForCausalLM(nn.Module):
             input_ids,
             valid_lengths=valid_lengths,
             route_aux_tile_ids=route_aux_tile_ids,
+            exploration_step=exploration_step,
             collect_diagnostics=collect_diagnostics,
             return_auxiliary=True,
         )
@@ -1145,6 +1545,7 @@ class DwarfForCausalLM(nn.Module):
         *,
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
+        exploration_step: torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_hidden: bool = False,
         return_auxiliary: bool = False,
@@ -1152,6 +1553,7 @@ class DwarfForCausalLM(nn.Module):
         kwargs = {
             "valid_lengths": valid_lengths,
             "route_aux_tile_ids": route_aux_tile_ids,
+            "exploration_step": exploration_step,
             "collect_diagnostics": collect_diagnostics,
             "return_hidden": return_hidden,
             "return_auxiliary": return_auxiliary,
@@ -1177,8 +1579,9 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
         "HISA" if isinstance(block, GlobalMixerBlock) else "DSQG"
         for block in model.blocks
     ]
+    l17_attention = global_mixers[-1][1].attn
     return {
-        "format": "dwarf-l24-l17-basek-route-dsqgv23-hisav19-v1",
+        "format": "dwarf-l24-l17-basek-dualsource-dsqgv23-hisav19qv3-v1",
         "config": asdict(model.config),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameters": sum(
@@ -1201,28 +1604,57 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
                 str(index): block.attn.route_source for index, block in global_mixers
             },
             "l17_route_contract": {
-                "representatives": "base_global_k_after_ordinary_global_adapter",
-                "hard_top_k": "base_global_k",
-                "selected_route_priors": "base_global_k",
-                "router_auxiliary": "base_global_k",
-                "router_oracle": "base_global_k",
+                "coarse_representatives": (
+                    "base_global_k_after_ordinary_global_adapter"
+                ),
+                "coarse_candidate_sources": (
+                    ("base_global_k", "post_packet_rotated_global_k")
+                    if l17_attention.dual_source_candidate_union
+                    else ("base_global_k",)
+                ),
+                "candidate_union": l17_attention.dual_source_candidate_union,
+                "final_hard_top_k": (
+                    "post_packet_exact_token_page_lse_over_candidate_union"
+                    if l17_attention.exact_page_rerank
+                    else "coarse_representative_scores"
+                ),
+                "selected_route_priors": (
+                    "post_packet_rotated_global_k"
+                    if l17_attention.rerank_selected_priors_with_post_packet_representatives
+                    else "base_global_k"
+                ),
+                "router_auxiliary_scores": "base_global_k",
+                "router_oracle": (
+                    "post_packet_rotated_global_k"
+                    if l17_attention.route_aux_teacher == "dense_attention"
+                    else "base_global_k"
+                ),
                 "global_token_attention_key": "post_packet_rotated_global_k",
                 "global_token_attention_value": "post_packet_rotated_global_v",
             },
             "dsqg": "v23-bounded-routing-null-candidate",
-            "hisa": "v19-accessible-routing-semantic-binder",
+            "hisa": "v19-streaming-hierarchical-exact-rerank-binder-v3",
             "offset_groups": model.offset_groups,
         },
         "complexity": {
             "dsqg_attention": "linear_in_sequence_length_for_fixed_offsets",
             "hisa_selected_attention": "linear_in_sequence_length_for_fixed_routing",
-            "selector": "quadratic_in_sequence_length_at_fixed_chunk_size",
+            "selector_compute": (
+                "quadratic_at_fixed_chunk_size_with_parent_group_reduction"
+            ),
+            "selector_workspace": (
+                "bounded_streaming_top_m_without_full_differentiable_surface"
+            ),
+            "hierarchical_route_level": "one_level_completed_parent_to_child",
         },
         "cache": {
             "bounded_dsqg_history": True,
             "model_level_o1_kv_cache": False,
-            "incremental_generation_api": False,
+            "model_incremental_generation_api": False,
+            "kernel_incremental_hisa_cache": True,
+            "kernel_incremental_hisa_cache_complexity": "exact_O_N_KV",
         },
+        "hisa_integration_contract": hisa_integration_contract(),
         "dsqg": [
             {
                 "layer": index,
@@ -1277,6 +1709,7 @@ def make_parameter_groups(
         "null": [],
         "npci": [],
         "route": [],
+        "binding_calibration": [],
         "ema": [],
         "positional": [],
     }
@@ -1291,12 +1724,32 @@ def make_parameter_groups(
             special["route"].extend(
                 (
                     module.route_prior_raw,
-                    module.representative_mix_raw,
+                    module.representative_coherence_raw,
                     module.global_lane_logit_bias,
+                    module.global_route_confidence_weight,
+                    module.global_route_confidence_bias,
+                    module.count_correction_raw,
                 )
             )
+            if module.representative_mix_raw.requires_grad:
+                special["route"].append(module.representative_mix_raw)
             if module.binding_gain_raw is not None:
                 special["route"].append(module.binding_gain_raw)
+            if module.binding_rank:
+                if (
+                    module.bind_route_score is None
+                    or module.bind_abstention is None
+                    or module.bind_null_prior is None
+                ):
+                    raise RuntimeError("HISA binder calibration modules are incomplete")
+                special["binding_calibration"].extend(
+                    (
+                        module.bind_route_score.weight,
+                        module.bind_null_prior,
+                        module.bind_abstention.weight,
+                        module.bind_abstention.bias,
+                    )
+                )
             special["npci"].extend((module.npci_theta_k, module.npci_theta_v))
         elif isinstance(module, InterferencePacket):
             special["ema"].extend((module.ema_raw, module.mix_logits))
@@ -1358,6 +1811,12 @@ def make_parameter_groups(
         group("adam_null", special["null"], recipe.learning_rate, 0.0),
         group("adam_npci", special["npci"], recipe.learning_rate, 0.0),
         group("adam_route", special["route"], recipe.learning_rate * 2.0, 0.0),
+        group(
+            "adam_binding_calibration",
+            special["binding_calibration"],
+            recipe.learning_rate * 2.0,
+            0.0,
+        ),
         group("adam_ema", special["ema"], recipe.learning_rate, 0.0),
         group(
             "adam_positional",
@@ -1970,11 +2429,13 @@ class _TrainingForwardCallable(nn.Module):
         self,
         input_ids: torch.Tensor,
         route_aux_tile_ids: torch.Tensor,
+        exploration_step: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model._forward_impl(
             input_ids,
             valid_lengths=None,
             route_aux_tile_ids=route_aux_tile_ids,
+            exploration_step=exploration_step,
             collect_diagnostics=self.diagnostics,
             return_hidden=True,
             return_auxiliary=True,
@@ -2391,9 +2852,16 @@ def reconstruct_model_from_checkpoint(
         weights_only=True,
         mmap=True,
     )
+    if (
+        isinstance(checkpoint, dict)
+        and checkpoint.get("kind") in LEGACY_HISA_V2_CHECKPOINT_KINDS
+    ):
+        raise ValueError(
+            "legacy HISA binder-v2 checkpoints cannot be reconstructed as the "
+            "optimized binder-v3 model without an explicit warm-start migration"
+        )
     if not isinstance(checkpoint, dict) or checkpoint.get("kind") not in {
         CHECKPOINT_KIND,
-        CANONICAL_PARENT_CHECKPOINT_KIND,
         RELEASE_KIND,
     }:
         raise ValueError("not a reconstructable canonical DWARF checkpoint")
@@ -2479,6 +2947,11 @@ def restore_checkpoint(
     if not isinstance(checkpoint, dict):
         raise ValueError("not a canonical DWARF resumable checkpoint")
     kind = checkpoint.get("kind")
+    if kind in LEGACY_HISA_V2_CHECKPOINT_KINDS:
+        raise ValueError(
+            "legacy HISA binder-v2 checkpoints cannot resume into binder v3; "
+            "start a new run or use a separately audited warm-start migration"
+        )
     if kind != CHECKPOINT_KIND:
         raise ValueError("not a canonical DWARF resumable checkpoint")
     validate_checkpoint_architecture(
@@ -2556,6 +3029,223 @@ def _assert_finite(value: torch.Tensor, message: str) -> None:
     torch._assert_async(torch.isfinite(value).all(), message)
 
 
+def assert_hisa_auxiliary_gradient_contract(
+    *,
+    total_loss: torch.Tensor,
+    auxiliary: torch.Tensor,
+    attention_modules: Iterable[HierarchicalSparseAttentionV19HISACausal],
+) -> dict[str, float | int]:
+    """Synchronously prove the optimized HISA auxiliary graph on one step."""
+    modules = tuple(attention_modules)
+    _require(bool(modules), "HISA auxiliary diagnostic has no attention modules")
+    _require(
+        torch.is_tensor(auxiliary) and auxiliary.numel() == 1,
+        "HISA auxiliary is absent or non-scalar",
+    )
+    _require(torch.isfinite(auxiliary).all(), "HISA auxiliary is non-finite")
+    _require(auxiliary.requires_grad, "HISA auxiliary does not require grad")
+    total_to_auxiliary = torch.autograd.grad(
+        total_loss,
+        auxiliary,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    _require(
+        total_to_auxiliary is not None
+        and torch.isfinite(total_to_auxiliary).all()
+        and bool(torch.count_nonzero(total_to_auxiliary)),
+        "HISA auxiliary is absent from the total-loss graph",
+    )
+
+    parameters: list[nn.Parameter] = []
+    layouts: list[
+        tuple[HierarchicalSparseAttentionV19HISACausal, dict[str, int]]
+    ] = []
+
+    def add(layout: dict[str, int], name: str, parameter: nn.Parameter) -> None:
+        layout[name] = len(parameters)
+        parameters.append(parameter)
+
+    for module in modules:
+        layout: dict[str, int] = {}
+        add(layout, "route_prior_raw", module.route_prior_raw)
+        add(layout, "representative_coherence_raw", module.representative_coherence_raw)
+        add(layout, "qkvg_proj_weight", module.qkvg_proj.weight)
+        add(layout, "global_lane_logit_bias", module.global_lane_logit_bias)
+        add(
+            layout,
+            "global_route_confidence_weight",
+            module.global_route_confidence_weight,
+        )
+        add(
+            layout,
+            "global_route_confidence_bias",
+            module.global_route_confidence_bias,
+        )
+        add(layout, "count_correction_raw", module.count_correction_raw)
+
+        if module.representative_mode == "mean_max_blend":
+            _require(
+                module.representative_mix_raw.requires_grad,
+                "active HISA representative mixture is frozen",
+            )
+            add(layout, "representative_mix_raw", module.representative_mix_raw)
+        else:
+            _require(
+                not module.representative_mix_raw.requires_grad,
+                "inactive HISA representative mixture remains trainable",
+            )
+
+        if module.global_adapter_rank:
+            if module.global_k_down is None or module.global_k_up is None:
+                raise AssertionError("HISA representative K adapter is incomplete")
+            add(layout, "representative_k_down", module.global_k_down.weight)
+            add(layout, "representative_k_up", module.global_k_up.weight)
+
+        if module.binding_rank and module.binding_null_aux_weight > 0.0:
+            if (
+                module.bind_route_score is None
+                or module.bind_null_prior is None
+                or module.bind_abstention is None
+            ):
+                raise AssertionError("HISA binder calibration modules are incomplete")
+            add(layout, "bind_route_score", module.bind_route_score.weight)
+            add(layout, "bind_null_prior", module.bind_null_prior)
+            add(layout, "bind_abstention_weight", module.bind_abstention.weight)
+            add(layout, "bind_abstention_bias", module.bind_abstention.bias)
+        layouts.append((module, layout))
+
+    gradients = torch.autograd.grad(
+        auxiliary,
+        tuple(parameters),
+        retain_graph=True,
+        allow_unused=True,
+    )
+    magnitudes: dict[str, float] = {
+        "route_prior_raw": 0.0,
+        "representative_mix_raw": 0.0,
+        "representative_coherence_raw": 0.0,
+        "routing_q_rows": 0.0,
+        "representative_k_rows": 0.0,
+        "representative_k_down": 0.0,
+        "representative_k_up": 0.0,
+        "lane_calibration": 0.0,
+        "binder_null_calibration": 0.0,
+    }
+
+    def record(
+        name: str,
+        gradient: torch.Tensor | None,
+        *,
+        require_nonzero: bool,
+    ) -> float:
+        _require(gradient is not None, f"HISA auxiliary gradient is absent: {name}")
+        assert gradient is not None
+        _require(
+            torch.isfinite(gradient).all(),
+            f"HISA auxiliary gradient is non-finite: {name}",
+        )
+        magnitude = float(gradient.detach().float().abs().sum())
+        if require_nonzero:
+            _require(magnitude > 0.0, f"HISA auxiliary gradient is zero: {name}")
+        return magnitude
+
+    for module, layout in layouts:
+        route_magnitude = record(
+            "route_prior_raw",
+            gradients[layout["route_prior_raw"]],
+            require_nonzero=True,
+        )
+        magnitudes["route_prior_raw"] += route_magnitude
+
+        coherence_magnitude = record(
+            "representative_coherence_raw",
+            gradients[layout["representative_coherence_raw"]],
+            require_nonzero=True,
+        )
+        magnitudes["representative_coherence_raw"] += coherence_magnitude
+
+        if "representative_mix_raw" in layout:
+            magnitudes["representative_mix_raw"] += record(
+                "representative_mix_raw",
+                gradients[layout["representative_mix_raw"]],
+                require_nonzero=True,
+            )
+
+        projection_gradient = gradients[layout["qkvg_proj_weight"]]
+        _require(
+            projection_gradient is not None,
+            "HISA auxiliary qkvg projection gradient is absent",
+        )
+        assert projection_gradient is not None
+        magnitudes["routing_q_rows"] += record(
+            "routing_q_rows",
+            projection_gradient[: module.D],
+            require_nonzero=True,
+        )
+        magnitudes["representative_k_rows"] += record(
+            "representative_k_rows",
+            projection_gradient[module.D : 2 * module.D],
+            require_nonzero=True,
+        )
+
+        if module.global_adapter_rank:
+            magnitudes["representative_k_down"] += record(
+                "representative_k_down",
+                gradients[layout["representative_k_down"]],
+                require_nonzero=True,
+            )
+            magnitudes["representative_k_up"] += record(
+                "representative_k_up",
+                gradients[layout["representative_k_up"]],
+                require_nonzero=True,
+            )
+
+        lane_magnitude = 0.0
+        for name in (
+            "global_lane_logit_bias",
+            "global_route_confidence_weight",
+            "global_route_confidence_bias",
+            "count_correction_raw",
+        ):
+            lane_magnitude += record(
+                name,
+                gradients[layout[name]],
+                require_nonzero=False,
+            )
+        if module.global_mass_aux_weight > 0.0:
+            _require(
+                lane_magnitude > 0.0,
+                "HISA global-mass auxiliary does not reach lane calibration",
+            )
+        magnitudes["lane_calibration"] += lane_magnitude
+
+        binder_magnitude = 0.0
+        for name in (
+            "bind_route_score",
+            "bind_null_prior",
+            "bind_abstention_weight",
+            "bind_abstention_bias",
+        ):
+            if name in layout:
+                binder_magnitude += record(
+                    name,
+                    gradients[layout[name]],
+                    require_nonzero=False,
+                )
+        if module.binding_rank and module.binding_null_aux_weight > 0.0:
+            _require(
+                binder_magnitude > 0.0,
+                "HISA binding-null auxiliary does not reach binder calibration",
+            )
+        magnitudes["binder_null_calibration"] += binder_magnitude
+
+    return {
+        "attention_modules": len(modules),
+        "total_loss_to_auxiliary": float(total_to_auxiliary.detach().abs()),
+        **magnitudes,
+    }
+
 def _capture_rng_state(device: torch.device) -> tuple[Any, torch.Tensor, torch.Tensor]:
     resolved = _resolved_cuda_device(device)
     return (
@@ -2581,7 +3271,7 @@ def warm_compiled_training_step(
     loss_fn: nn.Module,
     device: torch.device,
     config: DwarfConfig,
-) -> None:
+) -> dict[str, float | int]:
     """Compile/autotune the real training graph without advancing training RNG."""
     state = _capture_rng_state(device)
     try:
@@ -2594,18 +3284,60 @@ def warm_compiled_training_step(
         )
         input_ids, labels = synthetic[:, :-1], synthetic[:, 1:]
         route_ids = route_aux_tile_ids_for_update(1, device, config)
+        exploration_step = torch.tensor(1, device=device, dtype=torch.int64)
         model.zero_grad(set_to_none=True)
         with amp_context():
-            hidden, auxiliary = compiled(input_ids, route_ids)
+            hidden, auxiliary = compiled(input_ids, route_ids, exploration_step)
             language_loss = loss_fn(
                 model.lm_head.weight, hidden.flatten(0, 1), labels.flatten()
             )
             loss = language_loss + auxiliary
+        auxiliary_gradient_contract = assert_hisa_auxiliary_gradient_contract(
+            total_loss=loss,
+            auxiliary=auxiliary,
+            attention_modules=(
+                module
+                for module in model.modules()
+                if isinstance(module, HierarchicalSparseAttentionV19HISACausal)
+            ),
+        )
         loss.backward()
         torch.cuda.synchronize(device)
         model.zero_grad(set_to_none=True)
     finally:
         _restore_rng_state(state, device)
+    return auxiliary_gradient_contract
+
+
+_HISA_VECTOR_DIAGNOSTICS_FOR_LOG = frozenset(
+    {
+        "representative_max_winner_positions",
+        "representative_max_winner_token_ids",
+        "marginal_teacher_mass_by_added_unique_chunk",
+        "global_attention_mass_by_head",
+        "local_attention_mass_by_head",
+        "global_attention_mass_by_position",
+        "local_attention_mass_by_position",
+    }
+)
+
+
+def routing_diagnostics_for_log(
+    prefix: str,
+    values: dict[str, torch.Tensor],
+    *,
+    hisa: bool,
+) -> dict[str, Any]:
+    """Serialize scalar telemetry plus the bounded HISA audit vectors."""
+    logged: dict[str, Any] = {}
+    for key, value in values.items():
+        if not torch.is_tensor(value):
+            continue
+        if value.numel() == 1:
+            logged[prefix + key] = float(value)
+        elif hisa and key in _HISA_VECTOR_DIAGNOSTICS_FOR_LOG:
+            logged[prefix + key] = value.detach().cpu().tolist()
+    return logged
 
 
 @torch.no_grad()
@@ -2615,18 +3347,19 @@ def collect_model_diagnostics(
     diagnostic: nn.Module,
     input_ids: torch.Tensor,
     route_aux_tile_ids: torch.Tensor,
+    exploration_step: torch.Tensor,
     device: torch.device,
-) -> tuple[dict[str, float], float, int, int]:
+) -> tuple[dict[str, Any], float, int, int]:
     """Run one RNG-neutral eager diagnostic forward and collect layer-qualified data."""
     state = _capture_rng_state(device)
     torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
     try:
         with amp_context():
-            diagnostic(input_ids, route_aux_tile_ids)
+            diagnostic(input_ids, route_aux_tile_ids, exploration_step)
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - started
-        metrics: dict[str, float] = {}
+        metrics: dict[str, Any] = {}
         for layer_index, block in enumerate(model.blocks):
             if isinstance(block, DSQGBlock):
                 values = block.attn.routing_diagnostics()
@@ -2636,9 +3369,13 @@ def collect_model_diagnostics(
                 prefix = f"hisa_l{layer_index:02d}_"
             else:
                 continue
-            for key, value in values.items():
-                if torch.is_tensor(value) and value.numel() == 1:
-                    metrics[prefix + key] = float(value)
+            metrics.update(
+                routing_diagnostics_for_log(
+                    prefix,
+                    values,
+                    hisa=isinstance(block, GlobalMixerBlock),
+                )
+            )
             if isinstance(block, GlobalMixerBlock) and block.packet is not None:
                 factors = bounded_ema_factor(block.packet.ema_raw.detach())
                 mix = block.packet.mix_logits.detach().softmax(-1)
@@ -2690,6 +3427,7 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("invalid save/log interval")
 
     config = DwarfConfig()
+    validate_canonical_kernel_sources()
     loss_class, environment = validate_training_runtime(requested_device, config)
     device = _resolved_cuda_device(requested_device)
     compile_policy = configure_compiled_backward_autocast()
@@ -2757,7 +3495,7 @@ def train(args: argparse.Namespace) -> None:
 
         compiled.train()
         diagnostic.train()
-        warm_compiled_training_step(
+        auxiliary_gradient_contract = warm_compiled_training_step(
             model=model,
             compiled=compiled,
             loss_fn=loss_fn,
@@ -2779,6 +3517,9 @@ def train(args: argparse.Namespace) -> None:
                     "compiled": True,
                     "compile_policy": compile_policy,
                     "compile_warmup": "complete_rng_neutral",
+                    "compile_warmup_auxiliary_gradient_contract": (
+                        auxiliary_gradient_contract
+                    ),
                     "liger_fused_cross_entropy": True,
                 },
                 sort_keys=True,
@@ -2804,12 +3545,15 @@ def train(args: argparse.Namespace) -> None:
             language_accumulator = torch.zeros((), device=device, dtype=torch.float32)
             auxiliary_accumulator = torch.zeros((), device=device, dtype=torch.float32)
             route_aux_tile_ids = route_aux_tile_ids_for_update(step, device, config)
+            exploration_step = torch.tensor(step, device=device, dtype=torch.int64)
             last_input_ids: torch.Tensor | None = None
             for batch in stager.batches(update):
                 input_ids, labels = batch[:, :-1], batch[:, 1:]
                 last_input_ids = input_ids
                 with amp_context():
-                    hidden, auxiliary = compiled(input_ids, route_aux_tile_ids)
+                    hidden, auxiliary = compiled(
+                        input_ids, route_aux_tile_ids, exploration_step
+                    )
                     language_loss = loss_fn(
                         model.lm_head.weight,
                         hidden.flatten(0, 1),
@@ -2872,13 +3616,14 @@ def train(args: argparse.Namespace) -> None:
                     diagnostic=diagnostic,
                     input_ids=last_input_ids,
                     route_aux_tile_ids=route_aux_tile_ids,
+                    exploration_step=exploration_step,
                     device=device,
                 )
                 event: dict[str, Any] = {
                     "step": step,
                     "loss": float(loss_accumulator),
                     "language_loss": float(language_accumulator),
-                    "routing_auxiliary_loss": float(auxiliary_accumulator),
+                    "hisa_auxiliary_loss": float(auxiliary_accumulator),
                     "lr_factor": factor,
                     "learning_rates": {
                         str(group["name"]): float(group["lr"])
@@ -2965,6 +3710,7 @@ def train(args: argparse.Namespace) -> None:
 
 def self_test() -> None:
     """Run deterministic CPU release checks for public model and kernel contracts."""
+    validate_canonical_kernel_sources()
     assert_public_kernel_contracts()
     rng_state = torch.random.get_rng_state()
     torch.manual_seed(1234)
@@ -3013,6 +3759,13 @@ def self_test() -> None:
         [block.attn.route_source for block in global_mixers]
         == ["rotated_global_k", "rotated_global_k", "base_global_k"],
         "L3/L10/L17 routing-key source contract changed",
+    )
+    _require(
+        metadata["hisa_integration_contract"]["hierarchical_routing"]
+        == "completed_parent_groups_then_child_candidates"
+        and metadata["hisa_integration_contract"]["exact_page_rerank"]
+        == "token_level_lse_over_top_m_candidates",
+        "optimized HISA integration contract changed",
     )
     _require(
         RECIPE.steps == 76_331
@@ -3066,6 +3819,14 @@ def self_test() -> None:
             "canonical HISA auxiliary weight changed",
         )
         _require(
+            attention.global_mass_aux_weight
+            == model.config.hisa_global_mass_aux_weight
+            and attention.binding_null_aux_weight
+            == model.config.hisa_binding_null_aux_weight
+            and attention.require_auxiliary_return,
+            "canonical HISA auxiliary calibration contract changed",
+        )
+        _require(
             attention.exploration_probability
             == model.config.hisa_exploration_probability,
             "canonical HISA exploration probability changed",
@@ -3077,6 +3838,28 @@ def self_test() -> None:
         _require(
             attention.binding_rank == model.config.hisa_binding_rank,
             "canonical HISA binding rank changed",
+        )
+        _require(
+            int(attention.binding_state_version) == 3,
+            "canonical HISA binder state version changed",
+        )
+        _require(
+            attention.representative_mode == "multi_landmark"
+            and attention.representative_score_reduction == "logsumexp"
+            and attention.representative_lse_temperature == 0.5,
+            "canonical HISA representative design changed",
+        )
+        _require(
+            not attention.representative_mix_raw.requires_grad,
+            "inactive HISA representative mixture is trainable",
+        )
+        _require(
+            attention.hierarchical_routing
+            and attention.exact_page_rerank
+            and attention.dual_source_candidate_union
+            and attention.routing_candidate_multiplier
+            == model.config.hisa_routing_candidate_multiplier,
+            "canonical HISA hierarchical selection changed",
         )
         _require(
             attention.backend == model.config.hisa_backend,
@@ -3091,11 +3874,23 @@ def self_test() -> None:
             "canonical HISA local backend changed",
         )
         _require(
+            attention.local_block_size == model.config.hisa_local_block_size
+            and attention.local_mask_cache_size
+            == model.config.hisa_local_mask_cache_size,
+            "canonical HISA local Flex geometry changed",
+        )
+        _require(
             attention.triton_block_q == model.config.hisa_triton_block_q,
             "canonical HISA Triton geometry changed",
         )
         _require(
-            attention.backward_impl == model.config.hisa_backward_impl,
+            attention.triton_query_pack_specialization
+            == model.config.hisa_triton_query_pack_specialization,
+            "canonical HISA query-pack specialization changed",
+        )
+        _require(
+            attention.resolved_backward_impl == "source_block_stable"
+            and attention.source_block_size == model.config.hisa_source_block_size,
             "canonical HISA backward implementation changed",
         )
         _require(
@@ -3146,19 +3941,33 @@ def self_test() -> None:
             "adam_null",
             "adam_npci",
             "adam_route",
+            "adam_binding_calibration",
             "adam_ema",
             "adam_positional",
         ],
         "AdamW optimizer partition changed",
     )
     _require(
-        metadata["complexity"]["selector"]
-        == "quadratic_in_sequence_length_at_fixed_chunk_size",
-        "release metadata overstates HISA selector complexity",
+        metadata["complexity"]["selector_compute"]
+        == "quadratic_at_fixed_chunk_size_with_parent_group_reduction"
+        and metadata["complexity"]["selector_workspace"]
+        == "bounded_streaming_top_m_without_full_differentiable_surface",
+        "release metadata misstates HISA selector complexity",
     )
     _require(
         metadata["cache"]["model_level_o1_kv_cache"] is False,
         "release metadata overstates model-level O(1) KV caching",
+    )
+    _require(
+        metadata["cache"]["kernel_incremental_hisa_cache"] is True
+        and metadata["cache"]["model_incremental_generation_api"] is False,
+        "release metadata misstates incremental HISA support",
+    )
+    _require(
+        metadata["topology"]["l17_route_contract"]["candidate_union"] is True
+        and metadata["topology"]["l17_route_contract"]["final_hard_top_k"]
+        == "post_packet_exact_token_page_lse_over_candidate_union",
+        "L17 dual-source exact-rerank contract changed",
     )
     print(
         json.dumps(
@@ -3226,3 +4035,4 @@ if __name__ == "__main__":
         self_test()
     else:
         train(arguments)
+
