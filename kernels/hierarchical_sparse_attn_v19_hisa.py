@@ -273,6 +273,153 @@ def hisa_integration_contract() -> dict[str, object]:
     }
 
 
+HISA_ROUTE_SOURCE_POLICY_POST_PACKET = "post_packet_single_source"
+HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE = "frozen_base_route_decoupled"
+HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE = "root_hybrid_dual_source"
+
+
+@dataclass(frozen=True)
+class HISARouteSourcePolicy:
+    """Own every key/value source decision in the routed global lane."""
+
+    name: str
+    coarse_candidate_sources: tuple[str, ...]
+    hard_rerank_key: str
+    selected_prior_key: str
+    route_aux_teacher_key: str
+    global_attention_key: str = "post_packet_rotated_global_k"
+    global_attention_value: str = "post_packet_rotated_global_v"
+
+    @property
+    def route_from_base_global_key(self) -> bool:
+        return self.coarse_candidate_sources[0] == "base_global_k"
+
+    @property
+    def dual_source_candidate_union(self) -> bool:
+        return len(self.coarse_candidate_sources) == 2
+
+    @property
+    def rerank_selected_priors_with_post_packet_representatives(self) -> bool:
+        return self.selected_prior_key == "post_packet_rotated_global_k"
+
+    def contract(self) -> dict[str, object]:
+        return {
+            "coarse_candidate_sources": self.coarse_candidate_sources,
+            "hard_rerank_key": self.hard_rerank_key,
+            "selected_prior_key": self.selected_prior_key,
+            "route_aux_teacher_key": self.route_aux_teacher_key,
+            "global_attention_key": self.global_attention_key,
+            "global_attention_value": self.global_attention_value,
+        }
+
+
+HISA_ROUTE_SOURCE_POLICIES = {
+    HISA_ROUTE_SOURCE_POLICY_POST_PACKET: HISARouteSourcePolicy(
+        name=HISA_ROUTE_SOURCE_POLICY_POST_PACKET,
+        coarse_candidate_sources=("post_packet_rotated_global_k",),
+        hard_rerank_key="post_packet_rotated_global_k",
+        selected_prior_key="post_packet_rotated_global_k",
+        route_aux_teacher_key="post_packet_rotated_global_k",
+    ),
+    HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE: HISARouteSourcePolicy(
+        name=HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
+        coarse_candidate_sources=("base_global_k",),
+        hard_rerank_key="base_global_k",
+        selected_prior_key="base_global_k",
+        route_aux_teacher_key="base_global_k",
+    ),
+    HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE: HISARouteSourcePolicy(
+        name=HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE,
+        coarse_candidate_sources=(
+            "base_global_k",
+            "post_packet_rotated_global_k",
+        ),
+        hard_rerank_key="post_packet_rotated_global_k",
+        selected_prior_key="base_global_k",
+        route_aux_teacher_key="post_packet_rotated_global_k",
+    ),
+}
+
+
+def _resolve_route_source_policy(
+    route_source_policy: str | None,
+    *,
+    route_from_base_global_key: bool | None,
+    dual_source_candidate_union: bool | None,
+    rerank_selected_priors_with_post_packet_representatives: bool | None,
+) -> HISARouteSourcePolicy:
+    """Resolve the new explicit policy while preserving the legacy constructor."""
+    if route_source_policy is None:
+        route_from_base = (
+            False
+            if route_from_base_global_key is None
+            else route_from_base_global_key
+        )
+        dual_source = (
+            True
+            if dual_source_candidate_union is None
+            else dual_source_candidate_union
+        )
+        rerank_priors = (
+            False
+            if rerank_selected_priors_with_post_packet_representatives is None
+            else rerank_selected_priors_with_post_packet_representatives
+        )
+        if not route_from_base:
+            return HISA_ROUTE_SOURCE_POLICIES[
+                HISA_ROUTE_SOURCE_POLICY_POST_PACKET
+            ]
+        if dual_source and not rerank_priors:
+            return HISA_ROUTE_SOURCE_POLICIES[
+                HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE
+            ]
+        return HISARouteSourcePolicy(
+            name="legacy_base_route_custom",
+            coarse_candidate_sources=(
+                ("base_global_k", "post_packet_rotated_global_k")
+                if dual_source
+                else ("base_global_k",)
+            ),
+            hard_rerank_key="post_packet_rotated_global_k",
+            selected_prior_key=(
+                "post_packet_rotated_global_k"
+                if rerank_priors
+                else "base_global_k"
+            ),
+            route_aux_teacher_key="post_packet_rotated_global_k",
+        )
+
+    policy = HISA_ROUTE_SOURCE_POLICIES.get(str(route_source_policy))
+    if policy is None:
+        choices = ", ".join(sorted(HISA_ROUTE_SOURCE_POLICIES))
+        raise ValueError(f"route_source_policy must be one of: {choices}")
+    expected = {
+        "route_from_base_global_key": policy.route_from_base_global_key,
+        "dual_source_candidate_union": policy.dual_source_candidate_union,
+        "rerank_selected_priors_with_post_packet_representatives": (
+            policy.rerank_selected_priors_with_post_packet_representatives
+        ),
+    }
+    supplied = {
+        "route_from_base_global_key": route_from_base_global_key,
+        "dual_source_candidate_union": dual_source_candidate_union,
+        "rerank_selected_priors_with_post_packet_representatives": (
+            rerank_selected_priors_with_post_packet_representatives
+        ),
+    }
+    conflicts = [
+        name
+        for name, value in supplied.items()
+        if value is not None and value != expected[name]
+    ]
+    if conflicts:
+        raise ValueError(
+            "route source policy conflicts with legacy flags: "
+            + ", ".join(conflicts)
+        )
+    return policy
+
+
 def _next_pow2(value: int) -> int:
     return 1 if value <= 1 else 1 << (int(value) - 1).bit_length()
 
@@ -4001,7 +4148,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         hierarchy_group_size: int = 4,
         parent_top_k: int | None = None,
         exact_page_rerank: bool = True,
-        dual_source_candidate_union: bool = True,
+        dual_source_candidate_union: bool | None = None,
         exploration_probability: float = 0.05,
         exploration_policy: str = "tail_softmax",
         exploration_temperature: float = 1.0,
@@ -4034,8 +4181,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         source_block_size: int = 8,
         collect_routing_diagnostics: bool | None = None,
         diagnostic_max_queries: int | None = None,
-        route_from_base_global_key: bool = False,
-        rerank_selected_priors_with_post_packet_representatives: bool = False,
+        route_from_base_global_key: bool | None = None,
+        rerank_selected_priors_with_post_packet_representatives: bool | None = None,
+        route_source_policy: str | None = None,
     ) -> None:
         super().__init__()
         D, H, hd = int(D), int(H), int(hd)
@@ -4093,14 +4241,20 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         for name, value in {
             "hierarchical_routing": hierarchical_routing,
             "exact_page_rerank": exact_page_rerank,
-            "dual_source_candidate_union": dual_source_candidate_union,
             "require_auxiliary_return": require_auxiliary_return,
             "boundary_bridge": boundary_bridge,
-            "route_from_base_global_key": route_from_base_global_key,
-            "rerank_selected_priors_with_post_packet_representatives": rerank_selected_priors_with_post_packet_representatives,
         }.items():
             if not isinstance(value, bool):
                 raise TypeError(f"{name} must be bool")
+        for name, value in {
+            "dual_source_candidate_union": dual_source_candidate_union,
+            "route_from_base_global_key": route_from_base_global_key,
+            "rerank_selected_priors_with_post_packet_representatives": (
+                rerank_selected_priors_with_post_packet_representatives
+            ),
+        }.items():
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool or None")
         if not boundary_bridge:
             raise ValueError("boundary_bridge must remain enabled for complete causal coverage")
         if exploration_final_probability is None:
@@ -4190,7 +4344,31 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         self.parent_top_k = default_parent_top_k if parent_top_k is None else int(parent_top_k)
         self.exact_page_rerank = bool(exact_page_rerank)
-        self.dual_source_candidate_union = bool(dual_source_candidate_union)
+        resolved_route_policy = _resolve_route_source_policy(
+            route_source_policy,
+            route_from_base_global_key=route_from_base_global_key,
+            dual_source_candidate_union=dual_source_candidate_union,
+            rerank_selected_priors_with_post_packet_representatives=(
+                rerank_selected_priors_with_post_packet_representatives
+            ),
+        )
+        self.route_source_policy = resolved_route_policy.name
+        self.route_source_contract = resolved_route_policy.contract()
+        self.route_from_base_global_key = (
+            resolved_route_policy.route_from_base_global_key
+        )
+        self.dual_source_candidate_union = (
+            resolved_route_policy.dual_source_candidate_union
+        )
+        self.hard_rerank_from_base_global_key = (
+            resolved_route_policy.hard_rerank_key == "base_global_k"
+        )
+        self.route_aux_teacher_from_base_global_key = (
+            resolved_route_policy.route_aux_teacher_key == "base_global_k"
+        )
+        self.rerank_selected_priors_with_post_packet_representatives = (
+            resolved_route_policy.rerank_selected_priors_with_post_packet_representatives
+        )
 
         self.exploration_probability = float(exploration_probability)
         self.exploration_policy = exploration_policy
@@ -4219,10 +4397,6 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             persistent=bool(self.binding_rank),
         )
         self.npci_theta_max = float(npci_theta_max)
-        self.route_from_base_global_key = bool(route_from_base_global_key)
-        self.rerank_selected_priors_with_post_packet_representatives = bool(
-            rerank_selected_priors_with_post_packet_representatives
-        )
         self.route_source = "base_global_k" if self.route_from_base_global_key else "rotated_global_k"
         self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
         self.local_backend = local_backend
@@ -4280,6 +4454,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         mix_shift = _representative_mix_shift(H, self.representative_blend_alpha)
         self.representative_mix_raw = nn.Parameter(torch.linspace(-2.0, 2.0, H) + mix_shift)
+        if self.representative_mode != "mean_max_blend":
+            self.representative_mix_raw.requires_grad_(False)
         coherence_fraction = min(
             max(float(coherence_score_initial_weight) / self.coherence_score_max_weight, 1e-4),
             1.0 - 1e-4,
@@ -4477,6 +4653,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "top_k_chunks": self.top_k_chunks,
             "local_window": self.local_window,
             "boundary_bridge": self.boundary_bridge,
+            "route_source_policy": self.route_source_policy,
+            "route_source_contract": self.route_source_contract,
             "routing_key_source": self.route_source,
             "routing_temperature": self.temperature,
             "routing_candidate_count": self.routing_candidate_count,
@@ -4532,6 +4710,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "selector_autograd": "selected_K_plus_sampled_aux_rows_only",
             "representative_coherence": "pre_normalized_mean_norm_monotonic_penalty",
             "global_attention_key_source": "post_packet_rotated_global_k",
+            "route_source_contract": self.route_source_contract,
             "route_auxiliary_target": "conditional_global_chunk_mass_plus_total_global_mass",
             "route_auxiliary_transport": "explicit_forward_return_required",
             "binding_source": "per_head_per_route_normalized_low_rank_evidence",
@@ -4750,7 +4929,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         route_log_mass: torch.Tensor,
         route_identity_features: torch.Tensor,
         absolute_route_summary: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mass-grounded slot binding with separate scoring and payload paths."""
         if (
             self.bind_query is None or self.bind_route_identity is None
@@ -4812,6 +4991,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         all_weights = torch.softmax(all_logits, dim=-1)
         route_weights = all_weights[..., :-1]
         null_probability = all_weights[..., -1]
+        null_log_odds = null_logits - torch.logsumexp(route_logits, dim=-1)
 
         payload = evidence * (1.0 + 0.1 * query_features[..., None, :]) + identity
         per_head = (
@@ -4822,7 +5002,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         bound = self.bind_output(combined)
         correction = torch.sigmoid(self.binding_gain_raw).to(bound.dtype) * bound
-        return correction, null_probability
+        return correction, null_probability, null_log_odds
 
     def forward(
         self,
@@ -5044,9 +5224,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 selector_tile_size=1,
             )
 
+        hard_rerank_key = (
+            base_global_key
+            if self.hard_rerank_from_base_global_key
+            else global_key
+        )
         deterministic_metadata, exact_candidate_lse = _rerank_candidate_metadata(
             query,
-            global_key,
+            hard_rerank_key,
             deterministic_candidates,
             top_k=self.top_k_chunks,
             local_window=self.local_window,
@@ -5145,11 +5330,16 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         auxiliary = torch.zeros((), device=x.device, dtype=torch.float32)
         router_auxiliary: HISARouterAuxiliary | None = None
         if teacher_aux_active:
+            route_aux_teacher_key = (
+                base_global_key
+                if self.route_aux_teacher_from_base_global_key
+                else global_key
+            )
             router_auxiliary = _router_auxiliary_loss(
                 query_normalized,
                 routing_addresses,
                 query,
-                global_key if self.route_aux_teacher == "dense_attention" else routing_key,
+                route_aux_teacher_key,
                 deterministic_metadata,
                 self.route_prior_scale,
                 samples=self.route_aux_samples,
@@ -5237,9 +5427,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             sampled_ids = router_auxiliary.sampled_tile_ids
             if sampled_ids.numel() > 0:
                 predicted_global = head_global_mass[:, :, sampled_ids].float().clamp(1e-6, 1.0 - 1e-6)
+                predicted_global_logits = torch.logit(predicted_global)
                 target_global = router_auxiliary.teacher_global_mass.detach().float().clamp(0.0, 1.0)
-                global_mass_loss = F.binary_cross_entropy(
-                    predicted_global, target_global, reduction="mean"
+                global_mass_loss = F.binary_cross_entropy_with_logits(
+                    predicted_global_logits, target_global, reduction="mean"
                 )
                 auxiliary = auxiliary + self.global_mass_aux_weight * global_mass_loss
             else:
@@ -5251,6 +5442,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         projected = self.W_o(merged)
         binding_correction = torch.zeros_like(projected)
         null_probability: torch.Tensor | None = None
+        null_log_odds: torch.Tensor | None = None
         if self.binding_rank:
             if route_evidence is None:
                 # Prefixes with no complete global page have an exact null binder.
@@ -5258,6 +5450,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     batch_size, self.H, seq_len,
                     device=x.device, dtype=torch.float32,
                 )
+                null_log_odds = torch.full_like(null_probability, 20.0)
             else:
                 route_log_mass = torch.where(
                     torch.isfinite(route_evidence.lse)
@@ -5265,7 +5458,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     route_evidence.lse.float() - combined_lse.float()[..., None],
                     torch.full_like(route_evidence.lse.float(), float("-inf")),
                 )
-                binding_correction, null_probability = self._binding_correction(
+                binding_correction, null_probability, null_log_odds = self._binding_correction(
                     x,
                     route_evidence.output,
                     route_log_mass,
@@ -5274,13 +5467,16 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 )
             if (
                 self.training and self.binding_null_aux_weight > 0.0
-                and null_probability is not None
+                and null_log_odds is not None
             ):
                 positions = torch.arange(seq_len, device=x.device).reshape(1, 1, -1)
                 valid_rows = (positions > 0) & (positions < lengths.reshape(batch_size, 1, 1))
                 target_null = (1.0 - head_global_mass.detach().float()).clamp(0.0, 1.0)
-                per_row_null = F.binary_cross_entropy(
-                    null_probability.float().clamp(1e-6, 1.0 - 1e-6),
+                safe_null_log_odds = torch.nan_to_num(
+                    null_log_odds.float(), nan=0.0, posinf=20.0, neginf=-20.0
+                ).clamp(-20.0, 20.0)
+                per_row_null = F.binary_cross_entropy_with_logits(
+                    safe_null_log_odds,
                     target_null,
                     reduction="none",
                 )

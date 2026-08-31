@@ -4,9 +4,9 @@
 The model is D512/H8/L24/FFN2048 with bounded-routing DSQG V23 blocks and
 strict-causal optimized HISA V19 global mixers at layers 3, 10, and 17.
 Independent causal-EMA K/V packets live at L3 and L17; L10 is ordinary HISA.
-At L17, base global K owns coarse routing scores and selected route priors,
-while base/post-packet candidate sets are unioned and exact post-packet page
-LSE selects the final routes used by global token attention.
+At L17, base global K owns candidates, exact page reranking, route priors, and
+router supervision. Packet-rotated K/V are consumed only after hard route
+membership is fixed; the prior dual-source route remains an explicit ablation.
 
 The trainer accepts packed token rows and includes Muon+AdamW, WSD, deterministic
 row selection, atomic resumable checkpoints, and the complete model definition.
@@ -16,7 +16,6 @@ Dataset preparation and evaluation remain out of scope.
 from __future__ import annotations
 
 import argparse
-import ast
 import copy
 import hashlib
 import importlib.metadata
@@ -84,6 +83,9 @@ from dsqg_attention_v23 import (  # noqa: E402
 )
 if REPO_KERNEL_LAYOUT:
     from kernels.hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
+        HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
+        HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE,
+        HISA_ROUTE_SOURCE_POLICY_POST_PACKET,
         HierarchicalSparseAttentionV19HISACausal,
         TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
         hisa_integration_contract,
@@ -91,6 +93,9 @@ if REPO_KERNEL_LAYOUT:
     )
 else:
     from hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
+        HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
+        HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE,
+        HISA_ROUTE_SOURCE_POLICY_POST_PACKET,
         HierarchicalSparseAttentionV19HISACausal,
         TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
         hisa_integration_contract,
@@ -98,20 +103,29 @@ else:
     )
 
 CHECKPOINT_KIND = (
-    "dwarf-l24-l17-basek-dualsource-public-packed-"
+    "dwarf-l24-l17-basek-routepolicy-public-packed-"
     "dsqgv23-hisav19qv3-resume-v1"
 )
 CANONICAL_PARENT_CHECKPOINT_KIND = (
     "dwarf-l24-l17-basek-route-appendable-prefix-stable-dsqgv23-hisav19-resume-v1"
 )
 RELEASE_KIND = (
-    "dwarf-l24-l17-basek-dualsource-dsqgv23-hisav19qv3-weights-v1"
+    "dwarf-l24-l17-basek-routepolicy-dsqgv23-hisav19qv3-weights-v1"
 )
 LEGACY_HISA_V2_CHECKPOINT_KINDS = frozenset(
     {
         "dwarf-l24-l17-basek-route-public-packed-dsqgv23-hisav19-resume-v1",
         CANONICAL_PARENT_CHECKPOINT_KIND,
         "dwarf-l24-l17-basek-route-dsqgv23-hisav19-weights-v1",
+    }
+)
+INCOMPATIBLE_HISA_V3_CHECKPOINT_POLICIES = frozenset(
+    {HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE}
+)
+INCOMPATIBLE_HISA_V3_CHECKPOINT_KINDS = frozenset(
+    {
+        "dwarf-l24-l17-basek-dualsource-public-packed-dsqgv23-hisav19qv3-resume-v1",
+        "dwarf-l24-l17-basek-dualsource-dsqgv23-hisav19qv3-weights-v1",
     }
 )
 ROUTE_AUX_RECIPE_SEED = 20_260_809
@@ -123,8 +137,8 @@ EXPECTED_STATE_FINGERPRINT = (
 EXPECTED_SEEDED_RNG_FINGERPRINT = (
     "9b349eec24e6c72fc0e50c23bc8310e0c970bb1db9fe1cdeb49ffc072a49ccfe"
 )
-EXPECTED_HISA_AST_SHA256 = (
-    "69d1d49fa08cbb8b752ce71002f1dd6f18b3caf42bbd36e9b478a27fe3033e74"
+EXPECTED_HISA_SOURCE_SHA256 = (
+    "ae4e86101a71a84e392f9f4806cf341069e5c4babc1b24fc93cd695419a71fd2"
 )
 CANONICAL_TOKENIZER_SHA256 = (
     "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
@@ -190,7 +204,9 @@ class DwarfConfig:
     hisa_global_route_confidence_limit: float = 2.0
     hisa_count_correction_scale_limit: float = 2.0
     hisa_npci_theta_max: float = 0.25
-    hisa_rerank_selected_priors_with_post_packet_representatives: bool = False
+    hisa_base_k_route_source_policy: str = (
+        HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE
+    )
     hisa_route_aux_weight: float = 0.02
     hisa_route_aux_samples: int = 8
     hisa_route_aux_temperature: float = 0.5
@@ -212,7 +228,6 @@ class DwarfConfig:
     hisa_hierarchy_group_size: int = 4
     hisa_parent_top_k: int = 3
     hisa_exact_page_rerank: bool = True
-    hisa_dual_source_candidate_union: bool = True
     hisa_exploration_probability: float = 0.10
     hisa_exploration_policy: str = "tail_softmax"
     hisa_exploration_temperature: float = 1.0
@@ -317,10 +332,13 @@ class DwarfConfig:
                 raise ValueError(f"HISA {name} must be finite and positive")
         if self.hisa_global_adapter_rank < 0 or self.hisa_binding_rank < 0:
             raise ValueError("HISA adapter and binding ranks must be non-negative")
-        if not isinstance(
-            self.hisa_rerank_selected_priors_with_post_packet_representatives, bool
-        ):
-            raise TypeError("HISA selected-prior rerank flag must be bool")
+        if self.hisa_base_k_route_source_policy not in {
+            HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
+            HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE,
+        }:
+            raise ValueError(
+                "base-K HISA route policy must be frozen-base or hybrid dual-source"
+            )
         if self.hisa_backend not in {"auto", "eager", "triton"}:
             raise ValueError("HISA backend must be auto, eager, or triton")
         if self.hisa_token_selection_mode != "auto":
@@ -389,7 +407,6 @@ class DwarfConfig:
         for name, value in {
             "hierarchical routing": self.hisa_hierarchical_routing,
             "exact page rerank": self.hisa_exact_page_rerank,
-            "dual-source candidate union": self.hisa_dual_source_candidate_union,
         }.items():
             if not isinstance(value, bool):
                 raise TypeError(f"HISA {name} flag must be bool")
@@ -559,23 +576,16 @@ def source_manifest() -> dict[str, str]:
 
 
 def validate_canonical_kernel_sources() -> dict[str, str]:
-    """Require the CUDA-validated HISA code while ignoring formatting-only drift."""
+    """Require the exact CUDA-validated HISA source across Python runtimes."""
     observed = source_manifest()
-    hisa_path = Path(
-        sys.modules["hierarchical_sparse_attn_v19_hisa"].__file__
-    ).resolve()
-    tree = ast.parse(hisa_path.read_text(encoding="utf-8"), filename=str(hisa_path))
-    normalized = ast.dump(
-        tree,
-        annotate_fields=True,
-        include_attributes=False,
-    ).encode("utf-8")
-    observed_ast_sha256 = hashlib.sha256(normalized).hexdigest()
-    if observed_ast_sha256 != EXPECTED_HISA_AST_SHA256:
+    observed_source_sha256 = observed[
+        "kernels/hierarchical_sparse_attn_v19_hisa.py"
+    ]
+    if observed_source_sha256 != EXPECTED_HISA_SOURCE_SHA256:
         raise RuntimeError(
             "canonical CUDA-validated HISA source does not match; "
-            f"expected normalized AST {EXPECTED_HISA_AST_SHA256}, "
-            f"observed {observed_ast_sha256}"
+            f"expected exact source {EXPECTED_HISA_SOURCE_SHA256}, "
+            f"observed {observed_source_sha256}"
         )
     return observed
 
@@ -1233,7 +1243,7 @@ class GlobalMixerBlock(nn.Module):
         *,
         use_packet: bool,
         packet_initial_coupling_fraction: float | None,
-        route_from_base_global_key: bool,
+        route_source_policy: str,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(config.embedding_dim)
@@ -1268,7 +1278,6 @@ class GlobalMixerBlock(nn.Module):
             hierarchy_group_size=config.hisa_hierarchy_group_size,
             parent_top_k=config.hisa_parent_top_k,
             exact_page_rerank=config.hisa_exact_page_rerank,
-            dual_source_candidate_union=config.hisa_dual_source_candidate_union,
             route_prior_scale=config.hisa_route_prior_scale,
             route_prior_max_scale=config.hisa_route_prior_max_scale,
             global_lane_bias_limit=config.hisa_global_lane_bias_limit,
@@ -1297,9 +1306,6 @@ class GlobalMixerBlock(nn.Module):
             count_correction_scale_limit=(
                 config.hisa_count_correction_scale_limit
             ),
-            rerank_selected_priors_with_post_packet_representatives=(
-                config.hisa_rerank_selected_priors_with_post_packet_representatives
-            ),
             npci_theta_max=config.hisa_npci_theta_max,
             max_seq_len=config.model_length,
             backend=config.hisa_backend,
@@ -1316,16 +1322,8 @@ class GlobalMixerBlock(nn.Module):
             source_block_size=config.hisa_source_block_size,
             collect_routing_diagnostics=config.hisa_collect_routing_diagnostics,
             diagnostic_max_queries=config.hisa_diagnostic_max_queries,
-            route_from_base_global_key=route_from_base_global_key,
+            route_source_policy=route_source_policy,
         )
-        if config.hisa_representative_mode in {
-            "mean_max_blend_ablation",
-            "multi_address",
-            "multi_landmark",
-        }:
-            # The optimized kernel retains this vector for checkpoint structure,
-            # but these representative modes do not consume it in the forward.
-            self.attn.representative_mix_raw.requires_grad_(False)
         self.packet = InterferencePacket(config) if use_packet else None
         self.packet_initial_coupling_fraction = packet_initial_coupling_fraction
         if (self.packet is None) != (packet_initial_coupling_fraction is None):
@@ -1406,8 +1404,10 @@ class DwarfForCausalLM(nn.Module):
                         config,
                         use_packet=fraction is not None,
                         packet_initial_coupling_fraction=fraction,
-                        route_from_base_global_key=(
-                            layer_index in config.base_k_routing_layers
+                        route_source_policy=(
+                            config.hisa_base_k_route_source_policy
+                            if layer_index in config.base_k_routing_layers
+                            else HISA_ROUTE_SOURCE_POLICY_POST_PACKET
                         ),
                     )
                 )
@@ -1581,7 +1581,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
     ]
     l17_attention = global_mixers[-1][1].attn
     return {
-        "format": "dwarf-l24-l17-basek-dualsource-dsqgv23-hisav19qv3-v1",
+        "format": "dwarf-l24-l17-basek-routepolicy-dsqgv23-hisav19qv3-v1",
         "config": asdict(model.config),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameters": sum(
@@ -1603,35 +1603,11 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
             "routing_key_source_by_hisa_layer": {
                 str(index): block.attn.route_source for index, block in global_mixers
             },
-            "l17_route_contract": {
-                "coarse_representatives": (
-                    "base_global_k_after_ordinary_global_adapter"
-                ),
-                "coarse_candidate_sources": (
-                    ("base_global_k", "post_packet_rotated_global_k")
-                    if l17_attention.dual_source_candidate_union
-                    else ("base_global_k",)
-                ),
-                "candidate_union": l17_attention.dual_source_candidate_union,
-                "final_hard_top_k": (
-                    "post_packet_exact_token_page_lse_over_candidate_union"
-                    if l17_attention.exact_page_rerank
-                    else "coarse_representative_scores"
-                ),
-                "selected_route_priors": (
-                    "post_packet_rotated_global_k"
-                    if l17_attention.rerank_selected_priors_with_post_packet_representatives
-                    else "base_global_k"
-                ),
-                "router_auxiliary_scores": "base_global_k",
-                "router_oracle": (
-                    "post_packet_rotated_global_k"
-                    if l17_attention.route_aux_teacher == "dense_attention"
-                    else "base_global_k"
-                ),
-                "global_token_attention_key": "post_packet_rotated_global_k",
-                "global_token_attention_value": "post_packet_rotated_global_v",
+            "route_source_policy_by_hisa_layer": {
+                str(index): block.attn.route_source_policy
+                for index, block in global_mixers
             },
+            "l17_route_contract": l17_attention.route_source_contract,
             "dsqg": "v23-bounded-routing-null-candidate",
             "hisa": "v19-streaming-hierarchical-exact-rerank-binder-v3",
             "offset_groups": model.offset_groups,
@@ -2860,6 +2836,14 @@ def reconstruct_model_from_checkpoint(
             "legacy HISA binder-v2 checkpoints cannot be reconstructed as the "
             "optimized binder-v3 model without an explicit warm-start migration"
         )
+    if (
+        isinstance(checkpoint, dict)
+        and checkpoint.get("kind") in INCOMPATIBLE_HISA_V3_CHECKPOINT_KINDS
+    ):
+        raise ValueError(
+            "binder-v3 dual-source route-policy checkpoints cannot be reconstructed "
+            "as the base-owned canonical policy without an explicit model-only migration"
+        )
     if not isinstance(checkpoint, dict) or checkpoint.get("kind") not in {
         CHECKPOINT_KIND,
         RELEASE_KIND,
@@ -2951,6 +2935,11 @@ def restore_checkpoint(
         raise ValueError(
             "legacy HISA binder-v2 checkpoints cannot resume into binder v3; "
             "start a new run or use a separately audited warm-start migration"
+        )
+    if kind in INCOMPATIBLE_HISA_V3_CHECKPOINT_KINDS:
+        raise ValueError(
+            "binder-v3 dual-source route-policy checkpoints cannot strict-resume "
+            "into the base-owned canonical route policy"
         )
     if kind != CHECKPOINT_KIND:
         raise ValueError("not a canonical DWARF resumable checkpoint")
@@ -3123,7 +3112,6 @@ def assert_hisa_auxiliary_gradient_contract(
     )
     magnitudes: dict[str, float] = {
         "route_prior_raw": 0.0,
-        "representative_mix_raw": 0.0,
         "representative_coherence_raw": 0.0,
         "routing_q_rows": 0.0,
         "representative_k_rows": 0.0,
@@ -3166,6 +3154,7 @@ def assert_hisa_auxiliary_gradient_contract(
         magnitudes["representative_coherence_raw"] += coherence_magnitude
 
         if "representative_mix_raw" in layout:
+            magnitudes.setdefault("representative_mix_raw", 0.0)
             magnitudes["representative_mix_raw"] += record(
                 "representative_mix_raw",
                 gradients[layout["representative_mix_raw"]],
@@ -3761,6 +3750,15 @@ def self_test() -> None:
         "L3/L10/L17 routing-key source contract changed",
     )
     _require(
+        [block.attn.route_source_policy for block in global_mixers]
+        == [
+            HISA_ROUTE_SOURCE_POLICY_POST_PACKET,
+            HISA_ROUTE_SOURCE_POLICY_POST_PACKET,
+            HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
+        ],
+        "L3/L10/L17 route-source policy contract changed",
+    )
+    _require(
         metadata["hisa_integration_contract"]["hierarchical_routing"]
         == "completed_parent_groups_then_child_candidates"
         and metadata["hisa_integration_contract"]["exact_page_rerank"]
@@ -3856,7 +3854,6 @@ def self_test() -> None:
         _require(
             attention.hierarchical_routing
             and attention.exact_page_rerank
-            and attention.dual_source_candidate_union
             and attention.routing_candidate_multiplier
             == model.config.hisa_routing_candidate_multiplier,
             "canonical HISA hierarchical selection changed",
@@ -3964,10 +3961,16 @@ def self_test() -> None:
         "release metadata misstates incremental HISA support",
     )
     _require(
-        metadata["topology"]["l17_route_contract"]["candidate_union"] is True
-        and metadata["topology"]["l17_route_contract"]["final_hard_top_k"]
-        == "post_packet_exact_token_page_lse_over_candidate_union",
-        "L17 dual-source exact-rerank contract changed",
+        metadata["topology"]["l17_route_contract"]
+        == {
+            "coarse_candidate_sources": ("base_global_k",),
+            "hard_rerank_key": "base_global_k",
+            "selected_prior_key": "base_global_k",
+            "route_aux_teacher_key": "base_global_k",
+            "global_attention_key": "post_packet_rotated_global_k",
+            "global_attention_value": "post_packet_rotated_global_v",
+        },
+        "L17 base-owned route-source contract changed",
     )
     print(
         json.dumps(
