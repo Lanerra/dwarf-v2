@@ -243,6 +243,11 @@ def hisa_runtime_capabilities() -> dict[str, bool | str]:
         "exact_page_reranker": True,
         "incremental_exact_page_cache": True,
         "aggregate_only_global_kernel": True,
+        "direct_selected_address_score_kernel": True,
+        "captured_mass_lane_teacher": True,
+        "parent_route_auxiliary": True,
+        "router_adapter_isolation": True,
+        "candidate_tail_exploration": True,
         "source_block_and_atomic_backward": True,
         "selector_tile_size_role": "compatibility_and_diagnostics_only",
         "token_routing_pack_size_role": "compatibility_only",
@@ -257,11 +262,16 @@ def hisa_integration_contract() -> dict[str, object]:
         "global_lane_autotune_default": _DIRECT_GLOBAL_AUTOTUNE_ENABLED,
         "aggregate_only_specialization": True,
         "flex_empty_row_policy": _FLEX_EMPTY_ROW_POLICY,
-        "hard_selector": "detached_streaming_top_m",
-        "selector_autograd": "selected_K_plus_sampled_auxiliary_rows_only",
+        "hard_selector": "detached_parent_child_top_m_exact_lse_top_k",
+        "selector_autograd": (
+            "direct_selected_address_scores_plus_sampled_auxiliary_rows"
+        ),
         "selector_workspace": "bounded_by_stream_block_and_candidate_width",
         "hierarchical_routing": "completed_parent_groups_then_child_candidates",
         "exact_page_rerank": "token_level_lse_over_top_m_candidates",
+        "lane_teacher": "executed_local_global_streams_selected_captured_mass",
+        "binder_null_teacher": "one_minus_selected_captured_mass",
+        "exploration": "top_m_tail_with_uniform_global_escape",
         "incremental_kv_cache": "exact_completed_pages_and_cached_addresses_O(N)",
         "backward_variants": (
             "source_block_stable",
@@ -688,13 +698,19 @@ class HISAChunkAddresses:
 
 @dataclass(frozen=True)
 class HISARouterAuxiliary:
+    """Sampled route/lane teacher products used by explicit HISA losses."""
+
     loss: torch.Tensor
     cross_entropy: torch.Tensor
+    parent_cross_entropy: torch.Tensor
     coverage_loss: torch.Tensor
     sampled_anchor_logits: torch.Tensor
     sampled_tile_ids: torch.Tensor
     teacher_mass: torch.Tensor
-    teacher_global_mass: torch.Tensor
+    teacher_actual_chunk_mass: torch.Tensor
+    teacher_full_global_mass: torch.Tensor
+    teacher_selected_global_mass: torch.Tensor
+    teacher_capture_fraction: torch.Tensor
     eligible: torch.Tensor
 
 
@@ -721,9 +737,11 @@ class HISAIncrementalState:
     pending_base_global_key: torch.Tensor
     pending_global_key: torch.Tensor
     pending_global_value: torch.Tensor
+    pending_routing_key: torch.Tensor
     completed_base_global_key: torch.Tensor
     completed_global_key: torch.Tensor
     completed_global_value: torch.Tensor
+    completed_routing_key: torch.Tensor
     completed_routing_addresses: HISAChunkAddresses
     completed_attention_addresses: HISAChunkAddresses
 
@@ -1136,12 +1154,27 @@ def _score_chunk_addresses(
     *,
     reduction: str,
     temperature: float,
+    coherence: torch.Tensor | None = None,
+    coherence_weight: torch.Tensor | float = 0.0,
+    coherence_log_floor: float = -2.0,
 ) -> torch.Tensor:
+    """Score page addresses, applying coherence only to the mean landmark."""
+    correction: torch.Tensor | None = None
+    if coherence is not None:
+        correction = _coherence_score_correction(
+            coherence, coherence_weight, log_floor=coherence_log_floor
+        )
     if addresses.ndim == 4:
-        return torch.matmul(query.float(), addresses.float().transpose(-2, -1))
+        scores = torch.matmul(query.float(), addresses.float().transpose(-2, -1))
+        if correction is not None:
+            scores = scores + correction[:, :, None, :]
+        return scores
     if addresses.ndim != 5:
         raise ValueError("addresses must have shape [B,H,C,D] or [B,H,C,A,D]")
     scores = torch.einsum("bhsd,bhcad->bhsca", query.float(), addresses.float())
+    if correction is not None:
+        scores = scores.clone()
+        scores[..., 0] = scores[..., 0] + correction[:, :, None, :]
     if reduction == "max":
         return scores.max(-1).values
     if reduction == "logsumexp":
@@ -1160,13 +1193,24 @@ def _normalized_routing_query(query: torch.Tensor) -> torch.Tensor:
 def _coherence_score_correction(
     coherence: torch.Tensor,
     coherence_weight: torch.Tensor | float,
+    *,
+    log_floor: float = -2.0,
 ) -> torch.Tensor:
+    """Return a bounded monotonic coherence prior.
+
+    The previous unbounded log penalty could dominate cosine evidence on
+    heterogeneous but semantically useful pages.
+    """
+    if not math.isfinite(float(log_floor)) or float(log_floor) >= 0.0:
+        raise ValueError("coherence log floor must be finite and negative")
     if torch.is_tensor(coherence_weight):
         shape = (1, int(coherence_weight.numel())) + (1,) * max(1, coherence.ndim - 2)
         weight = coherence_weight.float().reshape(shape)
     else:
         weight = float(coherence_weight)
-    return weight * torch.log(coherence.float().clamp_min(1e-4))
+    return weight * torch.log(coherence.float().clamp_min(1e-4)).clamp_min(
+        float(log_floor)
+    )
 
 
 def _dense_routing_score_surface(
@@ -1177,6 +1221,7 @@ def _dense_routing_score_surface(
     temperature: float = 1.0,
     coherence: torch.Tensor | None = None,
     coherence_weight: torch.Tensor | float = 0.0,
+    coherence_log_floor: float = -2.0,
 ) -> torch.Tensor:
     if isinstance(addresses, HISAChunkAddresses):
         address_values = addresses.values
@@ -1184,15 +1229,12 @@ def _dense_routing_score_surface(
     else:
         address_values = addresses
     with torch.autocast(device_type=query_normalized.device.type, enabled=False):
-        scores = _score_chunk_addresses(
+        return _score_chunk_addresses(
             query_normalized.float(), address_values.float(),
             reduction=reduction, temperature=temperature,
+            coherence=coherence, coherence_weight=coherence_weight,
+            coherence_log_floor=coherence_log_floor,
         ).float()
-        if coherence is not None:
-            scores = scores + _coherence_score_correction(
-                coherence, coherence_weight
-            )[:, :, None, :]
-        return scores
 
 
 def _gather_chunk_values(values: torch.Tensor, chunk_idx: torch.Tensor) -> torch.Tensor:
@@ -1264,9 +1306,29 @@ def _selected_routing_scores(
     reduction: str,
     temperature: float,
     coherence_weight: torch.Tensor | float,
+    coherence_log_floor: float = -2.0,
     query_block_size: int | None = None,
 ) -> torch.Tensor:
     batch_size, heads, seq_len, slots = chunk_idx.shape
+    if query_normalized.is_cuda and _TRITON_AVAILABLE:
+        weight = (
+            coherence_weight
+            if torch.is_tensor(coherence_weight)
+            else torch.full(
+                (heads,), float(coherence_weight),
+                device=query_normalized.device, dtype=torch.float32,
+            )
+        )
+        return _selected_address_score_triton_apply(
+            query_normalized,
+            addresses.values,
+            addresses.coherence,
+            weight,
+            chunk_idx,
+            reduction=reduction,
+            temperature=temperature,
+            coherence_log_floor=coherence_log_floor,
+        )
     if query_block_size is None:
         block_size = _selected_routing_query_block_size(
             addresses.values,
@@ -1287,14 +1349,25 @@ def _selected_routing_scores(
         block_indices = chunk_idx[:, :, start:end]
         selected = _gather_chunk_values(addresses.values, block_indices)
         block_query = query_normalized[:, :, start:end].float()
+        expanded_coherence = addresses.coherence[:, :, None].expand(
+            batch_size, heads, end - start, addresses.coherence.shape[-1]
+        )
+        selected_coherence = torch.gather(
+            expanded_coherence, -1, block_indices.clamp_min(0).long()
+        )
+        correction = _coherence_score_correction(
+            selected_coherence, coherence_weight, log_floor=coherence_log_floor
+        )
         if selected.ndim == 5:
             block_scores = (
                 block_query[..., None, :] * selected.float()
-            ).sum(-1)
+            ).sum(-1) + correction
         else:
             per_address = (
                 block_query[..., None, None, :] * selected.float()
             ).sum(-1)
+            per_address = per_address.clone()
+            per_address[..., 0] = per_address[..., 0] + correction
             if reduction == "max":
                 block_scores = per_address.max(-1).values
             elif reduction == "logsumexp":
@@ -1307,22 +1380,6 @@ def _selected_routing_scores(
                 raise ValueError(
                     "representative_score_reduction must be max or logsumexp"
                 )
-
-        expanded_coherence = addresses.coherence[:, :, None].expand(
-            batch_size,
-            heads,
-            end - start,
-            addresses.coherence.shape[-1],
-        )
-        selected_coherence = torch.gather(
-            expanded_coherence,
-            -1,
-            block_indices.clamp_min(0).long(),
-        )
-        block_scores = block_scores + _coherence_score_correction(
-            selected_coherence,
-            coherence_weight,
-        )
         scores[:, :, start:end] = block_scores.masked_fill(
             block_indices < 0,
             float("-inf"),
@@ -1450,10 +1507,9 @@ def _streaming_topk_address_values(
         block_scores = _score_chunk_addresses(
             query_normalized, values[:, :, start:end],
             reduction=reduction, temperature=temperature,
+            coherence=coherence[:, :, start:end],
+            coherence_weight=coherence_weight,
         ).float()
-        block_scores = block_scores + _coherence_score_correction(
-            coherence[:, :, start:end], coherence_weight
-        )[:, :, None, :]
         block_scores = block_scores.masked_fill(
             ~eligibility[:, None, :, start:end], float("-inf")
         )
@@ -1501,6 +1557,7 @@ def _hierarchical_candidate_metadata(
     reduction: str,
     temperature: float,
     coherence_weight: torch.Tensor | float,
+    parent_coherence_weight: torch.Tensor | float,
     hierarchical: bool,
 ) -> HISAMetadata:
     batch_size, heads, seq_len, _ = query_normalized.shape
@@ -1526,7 +1583,7 @@ def _hierarchical_candidate_metadata(
             entry_span=group * int(chunk_size), valid_lengths=valid_lengths,
             local_window=local_window, top_k=parent_top_k,
             block_size=streaming_block_size, reduction="max", temperature=1.0,
-            coherence_weight=coherence_weight,
+            coherence_weight=parent_coherence_weight,
         )
         child_offsets = torch.arange(
             group, device=query_normalized.device, dtype=torch.int64
@@ -1687,8 +1744,11 @@ def _rerank_candidate_metadata(
 
 
 @torch.no_grad()
+@torch.no_grad()
 def _inject_streaming_exploration(
     metadata: HISAMetadata,
+    candidate_metadata: HISAMetadata,
+    candidate_scores: torch.Tensor | None,
     query_normalized: torch.Tensor,
     addresses: HISAChunkAddresses,
     probability: float | torch.Tensor,
@@ -1696,185 +1756,129 @@ def _inject_streaming_exploration(
     local_window: int,
     policy: str,
     temperature: float,
+    uniform_global_fraction: float,
     block_size: int,
     reduction: str,
     representative_temperature: float,
     coherence_weight: torch.Tensor | float,
 ) -> HISAMetadata:
+    """Replace one route using the retained top-M tail by default."""
     indices = metadata.top_chunk_idx.to(torch.int64)
     valid = indices >= 0
     if indices.shape[-1] == 0 or (
         not torch.is_tensor(probability) and float(probability) <= 0.0
     ):
         return metadata
+    if not 0.0 <= float(uniform_global_fraction) <= 1.0:
+        raise ValueError("uniform_global_fraction must be in [0,1]")
+    batch_size, heads, seq_len, slots = indices.shape
+    eligible = _eligibility(
+        metadata.tile_starts, addresses.values.shape[2], metadata.chunk_size,
+        metadata.valid_lengths, int(local_window),
+    )
+
+    def uniform_unseen() -> tuple[torch.Tensor, torch.Tensor]:
+        eligible_count = eligible.sum(-1, dtype=torch.int64)[:, None].expand(
+            batch_size, heads, seq_len
+        )
+        selected_sorted = torch.where(
+            valid, indices, eligible_count[..., None]
+        ).sort(dim=-1).values
+        unseen_count = eligible_count - valid.sum(-1, dtype=torch.int64)
+        has = unseen_count > 0
+        choice = torch.floor(
+            torch.rand(batch_size, heads, seq_len, device=indices.device)
+            * unseen_count.clamp_min(1).float()
+        ).to(torch.int64)
+        for slot_index in range(slots):
+            choice = choice + (selected_sorted[..., slot_index] <= choice).to(choice.dtype)
+        return choice, has
+
     if policy == "uniform_unseen_ablation":
-        eligible = _eligibility(
-            metadata.tile_starts, addresses.values.shape[2], metadata.chunk_size,
-            metadata.valid_lengths, int(local_window),
+        choice, has_candidate = uniform_unseen()
+    elif policy == "candidate_tail":
+        candidates = candidate_metadata.top_chunk_idx.to(torch.int64)
+        if candidates.shape[:3] != indices.shape[:3]:
+            raise ValueError("candidate-tail metadata does not align with final routes")
+        if candidate_scores is None or candidate_scores.shape != candidates.shape:
+            candidate_scores = _selected_routing_scores(
+                query_normalized, addresses, candidates, reduction=reduction,
+                temperature=representative_temperature,
+                coherence_weight=coherence_weight,
+            ).detach()
+        unseen = (candidates >= 0) & ~(
+            candidates[..., None] == indices[..., None, :]
+        ).any(-1)
+        noise = torch.rand_like(candidate_scores.float()).clamp_(1e-6, 1.0 - 1e-6)
+        sampled = (
+            candidate_scores.detach().float() / float(temperature)
+            - torch.log(-torch.log(noise))
+        ).masked_fill(~unseen, float("-inf"))
+        tail_value, tail_offset = sampled.max(-1)
+        tail_choice = torch.gather(
+            candidates, -1, tail_offset[..., None]
+        ).squeeze(-1)
+        tail_has = torch.isfinite(tail_value)
+        global_choice, global_has = uniform_unseen()
+        use_global = (
+            torch.rand(batch_size, heads, seq_len, device=indices.device)
+            < float(uniform_global_fraction)
         )
-        indices, valid = _inject_exploration_slot(
-            indices, valid, eligible, probability,
-            policy=policy, temperature=temperature,
-        )
+        choice = torch.where(use_global, global_choice, tail_choice)
+        has_candidate = torch.where(use_global, global_has, tail_has)
+        fallback = torch.where(global_has, global_choice, tail_choice)
+        choice = torch.where(has_candidate, choice, fallback)
+        has_candidate = has_candidate | global_has | tail_has
     elif policy == "tail_softmax":
-        batch_size, heads, seq_len, _ = indices.shape
         best_value = torch.full(
             (batch_size, heads, seq_len), float("-inf"),
             device=indices.device, dtype=torch.float32,
         )
         best_index = torch.full_like(best_value, -1, dtype=torch.int64)
         entry_count = addresses.values.shape[2]
-        eligibility = _entry_eligibility(
-            seq_len=seq_len, entry_count=entry_count,
-            entry_span=metadata.chunk_size,
-            valid_lengths=metadata.valid_lengths, local_window=int(local_window),
-        )
-        step = max(1, int(block_size))
-        for start in range(0, entry_count, step):
-            end = min(start + step, entry_count)
+        for start in range(0, entry_count, max(1, int(block_size))):
+            end = min(start + max(1, int(block_size)), entry_count)
             scores = _score_chunk_addresses(
                 query_normalized, addresses.values[:, :, start:end],
                 reduction=reduction, temperature=representative_temperature,
+                coherence=addresses.coherence[:, :, start:end],
+                coherence_weight=coherence_weight,
             ).float()
-            scores = scores + _coherence_score_correction(
-                addresses.coherence[:, :, start:end], coherence_weight
-            )[:, :, None, :]
-            block_ids = torch.arange(
+            ids = torch.arange(
                 start, end, device=indices.device, dtype=torch.int64
             ).reshape(1, 1, 1, -1)
-            already_selected = (block_ids[..., None] == indices[..., None, :]).any(-1)
-            unseen = eligibility[:, None, :, start:end] & ~already_selected
-            uniform = torch.rand_like(scores).clamp_(1e-6, 1.0 - 1e-6)
-            gumbel = -torch.log(-torch.log(uniform))
-            sampled = (scores / float(temperature) + gumbel).masked_fill(
-                ~unseen, float("-inf")
-            )
-            block_value, block_offset = sampled.max(-1)
-            replace_best = block_value > best_value
-            best_value = torch.where(replace_best, block_value, best_value)
-            best_index = torch.where(
-                replace_best, block_offset.to(torch.int64) + start, best_index
-            )
-        has_candidate = torch.isfinite(best_value)
-        replace = (
-            torch.rand(batch_size, heads, seq_len, device=indices.device) < probability
-        ) & has_candidate
-        indices = indices.clone(); valid = valid.clone()
-        indices[..., -1] = torch.where(replace, best_index, indices[..., -1])
-        valid[..., -1] = torch.where(replace, torch.ones_like(replace), valid[..., -1])
+            unseen = eligible[:, None, :, start:end] & ~(
+                ids[..., None] == indices[..., None, :]
+            ).any(-1)
+            noise = torch.rand_like(scores).clamp_(1e-6, 1.0 - 1e-6)
+            sampled = (
+                scores / float(temperature) - torch.log(-torch.log(noise))
+            ).masked_fill(~unseen, float("-inf"))
+            value, offset = sampled.max(-1)
+            better = value > best_value
+            best_value = torch.where(better, value, best_value)
+            best_index = torch.where(better, offset.to(torch.int64) + start, best_index)
+        choice, has_candidate = best_index, torch.isfinite(best_value)
     else:
-        raise ValueError("exploration_policy must be tail_softmax or uniform_unseen_ablation")
-    indices = torch.where(valid, indices, torch.full_like(indices, -1))
-    return HISAMetadata(
-        top_chunk_idx=indices.to(torch.int32), tile_starts=metadata.tile_starts,
-        valid_lengths=metadata.valid_lengths, chunk_size=metadata.chunk_size,
-        selector_tile_size=1,
-    )
-
-
-def _inject_exploration_slot(
-    indices: torch.Tensor,
-    valid: torch.Tensor,
-    eligible: torch.Tensor,
-    probability: float | torch.Tensor,
-    *,
-    logits: torch.Tensor | None = None,
-    policy: str = "uniform_unseen_ablation",
-    temperature: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Replace the final route with an unseen eligible exploratory chunk.
-
-    ``tail_softmax`` samples the best router tail rather than treating every
-    unseen chunk identically. The released uniform policy remains available as
-    an explicitly named ablation.
-    """
-    if indices.shape[-1] == 0 or (
-        not torch.is_tensor(probability) and probability <= 0.0
-    ):
-        return indices, valid
-    if policy not in {"tail_softmax", "uniform_unseen_ablation"}:
         raise ValueError(
-            "exploration_policy must be tail_softmax or uniform_unseen_ablation"
+            "exploration_policy must be candidate_tail, tail_softmax, or "
+            "uniform_unseen_ablation"
         )
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError("exploration_temperature must be finite and positive")
-    batch_size, heads, tiles, slots = indices.shape
-    eligible_count = eligible.sum(-1, dtype=torch.int64)[:, None].expand(
-        batch_size, heads, tiles
-    )
-    selected_count = valid.sum(-1, dtype=torch.int64)
-    unseen_count = eligible_count - selected_count
-    has_candidate = unseen_count > 0
-
-    if policy == "uniform_unseen_ablation":
-        selected_sorted = torch.where(
-            valid,
-            indices.to(torch.int64),
-            eligible_count[..., None],
-        ).sort(dim=-1).values
-        random_rank = torch.floor(
-            torch.rand(batch_size, heads, tiles, device=indices.device)
-            * unseen_count.clamp_min(1).to(torch.float32)
-        ).to(torch.int64)
-        choice = random_rank
-        # Causal eligibility is a contiguous prefix. Map an unseen rank back to
-        # a chunk ID while touching only the fixed, small K selection.
-        for slot in range(slots):
-            selected_id = selected_sorted[..., slot]
-            choice = choice + (selected_id <= choice).to(choice.dtype)
-    else:
-        if logits is None or logits.shape != (
-            batch_size,
-            heads,
-            tiles,
-            eligible.shape[-1],
-        ):
-            raise ValueError("tail_softmax exploration requires matching router logits")
-        # Inductor lowers this bounded count scatter to a CUDA atomic; Triton
-        # supports int32 here but rejects int16 atomics at compile time.
-        selected_mask = torch.zeros_like(logits, dtype=torch.int32)
-        selected_mask.scatter_add_(
-            -1,
-            indices.clamp_min(0).long(),
-            valid.to(selected_mask.dtype),
-        )
-        selected_mask = selected_mask.to(torch.bool)
-        unseen = eligible[:, None].expand_as(logits) & ~selected_mask
-        tail_logits = (logits.detach().float() / float(temperature)).masked_fill(
-            ~unseen, -1e9
-        )
-        probabilities = torch.softmax(tail_logits, dim=-1) * unseen
-        probabilities = probabilities / probabilities.sum(-1, keepdim=True).clamp_min(
-            1e-12
-        )
-        safe_probabilities = torch.where(
-            has_candidate[..., None],
-            probabilities,
-            F.one_hot(
-                torch.zeros_like(has_candidate, dtype=torch.int64),
-                num_classes=eligible.shape[-1],
-            ).to(probabilities.dtype),
-        )
-        choice = torch.multinomial(
-            safe_probabilities.reshape(-1, eligible.shape[-1]), 1
-        ).reshape(batch_size, heads, tiles)
 
     replace = (
-        torch.rand(batch_size, heads, tiles, device=indices.device) < probability
+        torch.rand(batch_size, heads, seq_len, device=indices.device) < probability
     ) & has_candidate
-    result_indices = indices.clone()
-    result_valid = valid.clone()
-    result_indices[..., slots - 1] = torch.where(
-        replace,
-        choice.to(result_indices.dtype),
-        result_indices[..., slots - 1],
+    indices = indices.clone()
+    valid = valid.clone()
+    indices[..., -1] = torch.where(replace, choice, indices[..., -1])
+    valid[..., -1] = torch.where(replace, torch.ones_like(replace), valid[..., -1])
+    indices = torch.where(valid, indices, torch.full_like(indices, -1))
+    return HISAMetadata(
+        top_chunk_idx=indices.to(torch.int32),
+        tile_starts=metadata.tile_starts,
+        valid_lengths=metadata.valid_lengths,
+        chunk_size=metadata.chunk_size, selector_tile_size=1,
     )
-    result_valid[..., slots - 1] = torch.where(
-        replace,
-        torch.ones_like(result_valid[..., slots - 1]),
-        result_valid[..., slots - 1],
-    )
-    return result_indices, result_valid
 
 
 def _annealed_exploration_probability(
@@ -2096,7 +2100,10 @@ def _resolve_route_aux_tile_ids(
 
 def _sampled_router_teacher_targets(
     query: torch.Tensor,
-    teacher_key: torch.Tensor,
+    route_teacher_key: torch.Tensor,
+    local_key: torch.Tensor,
+    actual_global_key: torch.Tensor,
+    selected_chunks: torch.Tensor,
     *,
     sampled_positions: torch.Tensor,
     chunk_size: int,
@@ -2106,44 +2113,135 @@ def _sampled_router_teacher_targets(
     attention_scale: float,
     cosine_temperature: float,
     target_temperature: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return conditional global chunk mass and total global-vs-local mass."""
-    key_chunks, token_valid, _ = _chunk_tensors(teacher_key, chunk_size, valid_lengths)
+    count_normalize_lanes: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build policy route targets and executed-lane captured-mass targets."""
+    if query.ndim != 4:
+        raise ValueError("sampled teacher query must have shape [B,H,S,D]")
+    batch_size, heads, samples, _ = query.shape
+    for key in (route_teacher_key, local_key, actual_global_key):
+        if key.shape[:2] != (batch_size, heads):
+            raise ValueError("teacher keys must share query batch/head geometry")
+    if selected_chunks.shape[:3] != (batch_size, heads, samples):
+        raise ValueError("selected_chunks must have shape [B,H,S,K]")
+
+    route_chunks, route_token_valid, _ = _chunk_tensors(
+        route_teacher_key, chunk_size, valid_lengths
+    )
+    actual_chunks, actual_token_valid, _ = _chunk_tensors(
+        actual_global_key, chunk_size, valid_lengths
+    )
+    chunk_count, token_count = route_chunks.shape[2:4]
     eligible = _eligibility(
-        sampled_positions.to(torch.int32), key_chunks.shape[2], chunk_size,
+        sampled_positions.to(torch.int32), chunk_count, chunk_size,
         valid_lengths, local_window,
     )
-    chunk_count, token_count = key_chunks.shape[2], key_chunks.shape[3]
     token_positions = torch.arange(
         chunk_count * token_count, device=query.device, dtype=torch.int32
     ).reshape(1, 1, 1, chunk_count, token_count)
     query_positions = sampled_positions.to(torch.int32).reshape(1, 1, -1, 1, 1)
     query_valid = sampled_positions.reshape(1, -1) < valid_lengths.reshape(-1, 1)
-    all_past = token_valid[:, :, None] & (token_positions < query_positions) & query_valid[:, None, :, None, None]
-    global_mask = all_past & eligible[:, None, :, :, None]
+    route_mask = (
+        route_token_valid[:, :, None]
+        & (token_positions < query_positions)
+        & query_valid[:, None, :, None, None]
+        & eligible[:, None, :, :, None]
+    )
+    actual_mask = (
+        actual_token_valid[:, :, None]
+        & (token_positions < query_positions)
+        & query_valid[:, None, :, None, None]
+        & eligible[:, None, :, :, None]
+    )
+
     if mode == "dense_attention":
-        token_scores = torch.einsum("bhsd,bhcmd->bhscm", query.float(), key_chunks.float()) * float(attention_scale)
+        route_scores = torch.einsum(
+            "bhsd,bhcmd->bhscm", query.float(), route_chunks.float()
+        ) * float(attention_scale)
+        actual_scores = torch.einsum(
+            "bhsd,bhcmd->bhscm", query.float(), actual_chunks.float()
+        ) * float(attention_scale)
+        local_scores = torch.einsum(
+            "bhsd,bhnd->bhsn", query.float(), local_key.float()
+        ) * float(attention_scale)
     elif mode == "cosine_ablation":
-        query_direction = F.normalize(query.float(), dim=-1, eps=1e-6)
-        key_direction = F.normalize(key_chunks.float(), dim=-1, eps=1e-6)
-        token_scores = torch.einsum("bhsd,bhcmd->bhscm", query_direction, key_direction) / float(cosine_temperature)
+        qdir = F.normalize(query.float(), dim=-1, eps=1e-6)
+        route_scores = torch.einsum(
+            "bhsd,bhcmd->bhscm",
+            qdir, F.normalize(route_chunks.float(), dim=-1, eps=1e-6),
+        ) / float(cosine_temperature)
+        actual_scores = torch.einsum(
+            "bhsd,bhcmd->bhscm",
+            qdir, F.normalize(actual_chunks.float(), dim=-1, eps=1e-6),
+        ) / float(cosine_temperature)
+        local_scores = torch.einsum(
+            "bhsd,bhnd->bhsn",
+            qdir, F.normalize(local_key.float(), dim=-1, eps=1e-6),
+        ) / float(cosine_temperature)
     else:
         raise ValueError("route_aux_teacher must be dense_attention or cosine_ablation")
-    masked = token_scores.masked_fill(~all_past, -1e9)
-    all_probability = torch.softmax(masked.reshape(*masked.shape[:-2], -1), dim=-1).reshape_as(masked)
-    all_probability = all_probability * all_past
-    unconditional_chunk_mass = (all_probability * global_mask).sum(-1)
-    teacher_global_mass = unconditional_chunk_mass.sum(-1).clamp(0.0, 1.0)
-    conditional_mass = unconditional_chunk_mass / teacher_global_mass[..., None].clamp_min(1e-12)
-    conditional_mass = conditional_mass * eligible[:, None]
-    if target_temperature != 1.0:
-        softened = torch.log(conditional_mass.clamp_min(1e-12)) / float(target_temperature)
-        conditional_mass = torch.softmax(
-            softened.masked_fill(~eligible[:, None], -1e9), dim=-1
-        ) * eligible[:, None]
-    conditional_mass = conditional_mass / conditional_mass.sum(-1, keepdim=True).clamp_min(1e-12)
-    return conditional_mass, teacher_global_mass
 
+    route_chunk_lse = torch.logsumexp(
+        route_scores.masked_fill(~route_mask, float("-inf")), dim=-1
+    )
+    route_conditional = torch.softmax(
+        (route_chunk_lse / float(target_temperature)).masked_fill(
+            ~eligible[:, None], -1e9
+        ),
+        dim=-1,
+    ) * eligible[:, None]
+    route_conditional = route_conditional / route_conditional.sum(
+        -1, keepdim=True
+    ).clamp_min(1e-12)
+
+    actual_chunk_lse = torch.logsumexp(
+        actual_scores.masked_fill(~actual_mask, float("-inf")), dim=-1
+    )
+    actual_conditional = torch.softmax(
+        actual_chunk_lse.masked_fill(~eligible[:, None], -1e9), dim=-1
+    ) * eligible[:, None]
+    actual_conditional = actual_conditional / actual_conditional.sum(
+        -1, keepdim=True
+    ).clamp_min(1e-12)
+
+    key_positions = torch.arange(
+        local_key.shape[2], device=query.device, dtype=torch.int32
+    ).reshape(1, 1, 1, -1)
+    sampled_qpos = sampled_positions.to(torch.int32).reshape(1, 1, -1, 1)
+    local_mask = _strict_local_or_boundary_key_mask(
+        sampled_qpos, key_positions, local_window, chunk_size
+    )
+    local_mask = (
+        local_mask
+        & (key_positions < valid_lengths.reshape(batch_size, 1, 1, 1))
+        & query_valid[:, None, :, None]
+    )
+    local_lse = torch.logsumexp(
+        local_scores.masked_fill(~local_mask, float("-inf")), dim=-1
+    )
+    global_lse = torch.logsumexp(
+        actual_chunk_lse.masked_fill(~eligible[:, None], float("-inf")), dim=-1
+    )
+    if count_normalize_lanes:
+        local_lse = local_lse - local_mask.sum(-1).clamp_min(1).float().log()
+        global_lse = global_lse - actual_mask.sum((-1, -2)).clamp_min(1).float().log()
+    safe_local = torch.where(
+        torch.isfinite(local_lse), local_lse, torch.full_like(local_lse, -30.0)
+    )
+    safe_global = torch.where(
+        torch.isfinite(global_lse), global_lse, torch.full_like(global_lse, -30.0)
+    )
+    any_lane = torch.isfinite(local_lse) | torch.isfinite(global_lse)
+    full_global_mass = torch.where(
+        any_lane, torch.sigmoid(safe_global - safe_local), torch.zeros_like(safe_global)
+    ).clamp(0.0, 1.0)
+
+    selected_mass = torch.gather(
+        actual_conditional, -1, selected_chunks.clamp_min(0).long()
+    ).masked_fill(selected_chunks < 0, 0.0)
+    capture_fraction = selected_mass.sum(-1).clamp(0.0, 1.0)
+    selected_global_mass = (full_global_mass * capture_fraction).clamp(0.0, 1.0)
+    return route_conditional, actual_conditional, full_global_mass, selected_global_mass
 
 
 def _teacher_weighted_coverage_loss(
@@ -2187,8 +2285,10 @@ def _router_auxiliary_loss(
     query_normalized: torch.Tensor,
     addresses: HISAChunkAddresses,
     attention_query: torch.Tensor,
-    teacher_key: torch.Tensor,
-    metadata: HISAMetadata,
+    route_teacher_key: torch.Tensor,
+    local_key: torch.Tensor,
+    actual_global_key: torch.Tensor,
+    selected_metadata: HISAMetadata,
     route_scale_by_head: torch.Tensor,
     *,
     samples: int,
@@ -2199,70 +2299,147 @@ def _router_auxiliary_loss(
     oracle_temperature: float,
     teacher_mode: str,
     coverage_weight: float,
+    parent_aux_weight: float,
+    parent_coherence_weight: torch.Tensor | float,
     representative_reduction: str,
     representative_temperature: float,
     coherence_weight: torch.Tensor | float,
+    coherence_log_floor: float,
+    lane_count_normalization: bool,
     tile_ids: torch.Tensor | None = None,
 ) -> HISARouterAuxiliary:
     resolved_ids = _resolve_route_aux_tile_ids(
-        metadata, samples=samples, route_slots=route_slots,
+        selected_metadata, samples=samples, route_slots=route_slots,
         local_window=local_window, tile_ids=tile_ids,
         device=query_normalized.device,
     )
     chunk_count = addresses.values.shape[2]
     if resolved_ids.numel() == 0:
-        empty = query_normalized.new_empty(query_normalized.shape[0], query_normalized.shape[1], 0, chunk_count)
-        empty_global = query_normalized.new_empty(query_normalized.shape[0], query_normalized.shape[1], 0)
+        empty = query_normalized.new_empty(
+            query_normalized.shape[0], query_normalized.shape[1], 0, chunk_count
+        )
+        empty_global = query_normalized.new_empty(
+            query_normalized.shape[0], query_normalized.shape[1], 0
+        )
         zero = query_normalized.new_zeros(())
         return HISARouterAuxiliary(
-            loss=zero, cross_entropy=zero, coverage_loss=zero,
-            sampled_anchor_logits=empty, sampled_tile_ids=resolved_ids,
-            teacher_mass=empty, teacher_global_mass=empty_global,
-            eligible=torch.empty(query_normalized.shape[0], 0, chunk_count, device=query_normalized.device, dtype=torch.bool),
+            loss=zero, cross_entropy=zero, parent_cross_entropy=zero,
+            coverage_loss=zero, sampled_anchor_logits=empty,
+            sampled_tile_ids=resolved_ids, teacher_mass=empty,
+            teacher_actual_chunk_mass=empty,
+            teacher_full_global_mass=empty_global,
+            teacher_selected_global_mass=empty_global,
+            teacher_capture_fraction=empty_global,
+            eligible=torch.empty(
+                query_normalized.shape[0], 0, chunk_count,
+                device=query_normalized.device, dtype=torch.bool,
+            ),
         )
+
+    sampled_q = query_normalized[:, :, resolved_ids]
     sampled_anchor_logits = _dense_routing_score_surface(
-        query_normalized[:, :, resolved_ids], addresses,
-        reduction=representative_reduction,
+        sampled_q, addresses, reduction=representative_reduction,
         temperature=representative_temperature,
         coherence_weight=coherence_weight,
+        coherence_log_floor=coherence_log_floor,
     ).float() / float(routing_temperature)
-    sampled_tile_starts = metadata.tile_starts[resolved_ids]
+    sampled_positions = selected_metadata.tile_starts[resolved_ids]
     eligible = _eligibility(
-        sampled_tile_starts, chunk_count, metadata.chunk_size,
-        metadata.valid_lengths, local_window,
+        sampled_positions, chunk_count, selected_metadata.chunk_size,
+        selected_metadata.valid_lengths, local_window,
     )
+    selected_chunks = selected_metadata.top_chunk_idx[:, :, resolved_ids].to(torch.int64)
     with torch.no_grad():
-        target, teacher_global_mass = _sampled_router_teacher_targets(
-            attention_query[:, :, resolved_ids].detach(), teacher_key,
-            sampled_positions=sampled_tile_starts,
-            chunk_size=metadata.chunk_size,
-            valid_lengths=metadata.valid_lengths,
-            local_window=local_window, mode=teacher_mode,
-            attention_scale=1.0 / math.sqrt(attention_query.shape[-1]),
-            cosine_temperature=oracle_temperature,
-            target_temperature=target_temperature,
+        target, actual_mass, full_mass, selected_mass = (
+            _sampled_router_teacher_targets(
+                attention_query[:, :, resolved_ids].detach(),
+                route_teacher_key, local_key, actual_global_key, selected_chunks,
+                sampled_positions=sampled_positions,
+                chunk_size=selected_metadata.chunk_size,
+                valid_lengths=selected_metadata.valid_lengths,
+                local_window=local_window, mode=teacher_mode,
+                attention_scale=1.0 / math.sqrt(attention_query.shape[-1]),
+                cosine_temperature=oracle_temperature,
+                target_temperature=target_temperature,
+                count_normalize_lanes=lane_count_normalization,
+            )
         )
-    safe_anchor_logits = torch.where(
-        eligible[:, None], sampled_anchor_logits, torch.zeros_like(sampled_anchor_logits)
-    )
     route = (
-        safe_anchor_logits * route_scale_by_head.reshape(1, query_normalized.shape[1], 1, 1).float()
+        torch.where(
+            eligible[:, None], sampled_anchor_logits,
+            torch.zeros_like(sampled_anchor_logits),
+        )
+        * route_scale_by_head.reshape(1, query_normalized.shape[1], 1, 1).float()
     ).masked_fill(~eligible[:, None], -1e9)
     per_row = -(target * torch.log_softmax(route, dim=-1)).sum(-1)
-    valid_rows = (eligible.any(-1)[:, None] & (teacher_global_mass > 0.0)).expand_as(per_row)
+    valid_rows = (eligible.any(-1)[:, None] & (full_mass > 0.0)).expand_as(per_row)
     cross_entropy = (per_row * valid_rows).sum() / valid_rows.sum().clamp_min(1)
-    if float(coverage_weight) > 0.0:
-        coverage_loss = _teacher_weighted_coverage_loss(route, target, eligible, route_slots=int(route_slots))
-    else:
-        coverage_loss = route.new_zeros(())
-    loss = cross_entropy + float(coverage_weight) * coverage_loss
-    return HISARouterAuxiliary(
-        loss=loss, cross_entropy=cross_entropy, coverage_loss=coverage_loss,
-        sampled_anchor_logits=sampled_anchor_logits,
-        sampled_tile_ids=resolved_ids, teacher_mass=target,
-        teacher_global_mass=teacher_global_mass, eligible=eligible,
-    )
 
+    parent_cross_entropy = route.new_zeros(())
+    if (
+        float(parent_aux_weight) > 0.0
+        and addresses.parent_values is not None
+        and addresses.parent_coherence is not None
+        and addresses.parent_group_size > 1
+    ):
+        group = int(addresses.parent_group_size)
+        parent_count = addresses.parent_values.shape[2]
+        target_parent = F.pad(
+            target, (0, parent_count * group - target.shape[-1])
+        ).reshape(*target.shape[:-1], parent_count, group).sum(-1)
+        parent_ends = (
+            torch.arange(parent_count, device=query_normalized.device, dtype=torch.int32) + 1
+        ) * group * int(selected_metadata.chunk_size)
+        parent_eligible = (
+            parent_ends.reshape(1, 1, -1)
+            <= sampled_positions.reshape(1, -1, 1) - int(local_window)
+        ) & (
+            sampled_positions.reshape(1, -1, 1)
+            < selected_metadata.valid_lengths.reshape(-1, 1, 1)
+        )
+        expanded_parent_eligible = parent_eligible[:, None].expand_as(target_parent)
+        target_parent = target_parent * expanded_parent_eligible
+        parent_target_sum = target_parent.sum(-1, keepdim=True)
+        target_parent = target_parent / parent_target_sum.clamp_min(1e-12)
+        parent_scores = _score_chunk_addresses(
+            sampled_q, addresses.parent_values, reduction="max", temperature=1.0,
+            coherence=addresses.parent_coherence,
+            coherence_weight=parent_coherence_weight,
+            coherence_log_floor=coherence_log_floor,
+        ).float().masked_fill(~expanded_parent_eligible, -1e9)
+        parent_per_row = -(
+            target_parent * torch.log_softmax(parent_scores, dim=-1)
+        ).sum(-1)
+        parent_valid = parent_target_sum.squeeze(-1) > 0.0
+        parent_cross_entropy = (
+            parent_per_row * parent_valid
+        ).sum() / parent_valid.sum().clamp_min(1)
+
+    coverage_loss = (
+        _teacher_weighted_coverage_loss(
+            route, target, eligible, route_slots=int(route_slots)
+        )
+        if float(coverage_weight) > 0.0
+        else route.new_zeros(())
+    )
+    loss = (
+        cross_entropy
+        + float(coverage_weight) * coverage_loss
+        + float(parent_aux_weight) * parent_cross_entropy
+    )
+    capture = torch.where(
+        full_mass > 0.0, selected_mass / full_mass.clamp_min(1e-12),
+        torch.zeros_like(full_mass),
+    ).clamp(0.0, 1.0)
+    return HISARouterAuxiliary(
+        loss=loss, cross_entropy=cross_entropy,
+        parent_cross_entropy=parent_cross_entropy, coverage_loss=coverage_loss,
+        sampled_anchor_logits=sampled_anchor_logits, sampled_tile_ids=resolved_ids,
+        teacher_mass=target, teacher_actual_chunk_mass=actual_mass,
+        teacher_full_global_mass=full_mass,
+        teacher_selected_global_mass=selected_mass,
+        teacher_capture_fraction=capture, eligible=eligible,
+    )
 
 
 def _eligible_route_entropy(
@@ -2701,6 +2878,240 @@ def _merge_attention_lanes_with_mass(
 
 
 if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _selected_address_score_forward_kernel(
+        QUERY, VALUES, COHERENCE, COHERENCE_WEIGHT, CHUNKS, OUT,
+        sqb, sqh, sqn, sqd,
+        svb, svh, svc, sva, svd,
+        scob, scoh, scoc,
+        sckb, sckh, sckn, sckk,
+        sob, soh, son, sok,
+        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
+        HD: tl.constexpr, A: tl.constexpr, A_PAD: tl.constexpr,
+        K_VAL: tl.constexpr, REDUCTION: tl.constexpr,
+        TEMPERATURE: tl.constexpr, LOG_A: tl.constexpr,
+        COHERENCE_LOG_FLOOR: tl.constexpr,
+    ):
+        program = tl.program_id(0)
+        slot = program % K_VAL
+        query_program = program // K_VAL
+        qpos = query_program % N
+        batch_head = query_program // N
+        batch = batch_head // H
+        head = batch_head % H
+        chunk = tl.load(
+            CHUNKS + batch * sckb + head * sckh + qpos * sckn + slot * sckk
+        ).to(tl.int32)
+        valid = chunk >= 0
+        dims = tl.arange(0, HD)
+        address_ids = tl.arange(0, A_PAD)
+        query = tl.load(
+            QUERY + batch * sqb + head * sqh + qpos * sqn + dims * sqd,
+            mask=valid, other=0.0,
+        ).to(tl.float32)
+        addresses = tl.load(
+            VALUES + batch * svb + head * svh + chunk * svc
+            + address_ids[:, None] * sva + dims[None, :] * svd,
+            mask=valid & (address_ids[:, None] < A), other=0.0,
+        ).to(tl.float32)
+        per_address = tl.sum(addresses * query[None, :], axis=1)
+        coherence = tl.load(
+            COHERENCE + batch * scob + head * scoh + chunk * scoc,
+            mask=valid, other=1.0,
+        ).to(tl.float32)
+        weight = tl.load(COHERENCE_WEIGHT + head).to(tl.float32)
+        log_coherence = tl.maximum(
+            tl.log(tl.maximum(coherence, 1.0e-4)), COHERENCE_LOG_FLOOR
+        )
+        per_address = tl.where(
+            address_ids == 0, per_address + weight * log_coherence, per_address
+        )
+        per_address = tl.where(address_ids < A, per_address, float("-inf"))
+        if REDUCTION == 0:
+            score = tl.max(per_address, axis=0)
+        else:
+            maximum = tl.max(per_address, axis=0)
+            probability = tl.where(
+                address_ids < A,
+                tl.exp((per_address - maximum) / TEMPERATURE),
+                0.0,
+            )
+            score = maximum + TEMPERATURE * (tl.log(tl.sum(probability, axis=0)) - LOG_A)
+        tl.store(
+            OUT + batch * sob + head * soh + qpos * son + slot * sok,
+            tl.where(valid, score, float("-inf")),
+        )
+
+    @triton.jit
+    def _selected_address_score_backward_query_kernel(
+        QUERY, VALUES, COHERENCE, COHERENCE_WEIGHT, CHUNKS, DOUT, DQUERY,
+        sqb, sqh, sqn, sqd,
+        svb, svh, svc, sva, svd,
+        scob, scoh, scoc,
+        sckb, sckh, sckn, sckk,
+        sdob, sdoh, sdon, sdok,
+        sdqb, sdqh, sdqn, sdqd,
+        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
+        HD: tl.constexpr, A: tl.constexpr, A_PAD: tl.constexpr,
+        K_VAL: tl.constexpr, REDUCTION: tl.constexpr,
+        TEMPERATURE: tl.constexpr, COHERENCE_LOG_FLOOR: tl.constexpr,
+    ):
+        program = tl.program_id(0)
+        qpos = program % N
+        batch_head = program // N
+        batch = batch_head // H
+        head = batch_head % H
+        dims = tl.arange(0, HD)
+        address_ids = tl.arange(0, A_PAD)
+        query = tl.load(
+            QUERY + batch * sqb + head * sqh + qpos * sqn + dims * sqd
+        ).to(tl.float32)
+        dquery = tl.zeros([HD], tl.float32)
+        for slot in range(K_VAL):
+            chunk = tl.load(
+                CHUNKS + batch * sckb + head * sckh + qpos * sckn + slot * sckk
+            ).to(tl.int32)
+            valid = chunk >= 0
+            addresses = tl.load(
+                VALUES + batch * svb + head * svh + chunk * svc
+                + address_ids[:, None] * sva + dims[None, :] * svd,
+                mask=valid & (address_ids[:, None] < A), other=0.0,
+            ).to(tl.float32)
+            per_address = tl.sum(addresses * query[None, :], axis=1)
+            coherence = tl.load(
+                COHERENCE + batch * scob + head * scoh + chunk * scoc,
+                mask=valid, other=1.0,
+            ).to(tl.float32)
+            coherence_weight = tl.load(COHERENCE_WEIGHT + head).to(tl.float32)
+            log_coherence = tl.maximum(
+                tl.log(tl.maximum(coherence, 1.0e-4)), COHERENCE_LOG_FLOOR
+            )
+            per_address = tl.where(
+                address_ids == 0,
+                per_address + coherence_weight * log_coherence,
+                per_address,
+            )
+            per_address = tl.where(address_ids < A, per_address, float("-inf"))
+            if REDUCTION == 0:
+                winner = tl.argmax(per_address, axis=0)
+                address_weight = (address_ids == winner).to(tl.float32)
+            else:
+                maximum = tl.max(per_address, axis=0)
+                unnormalized = tl.where(
+                    address_ids < A,
+                    tl.exp((per_address - maximum) / TEMPERATURE),
+                    0.0,
+                )
+                address_weight = unnormalized / tl.sum(unnormalized, axis=0)
+            grad = tl.load(
+                DOUT + batch * sdob + head * sdoh + qpos * sdon + slot * sdok,
+                mask=valid, other=0.0,
+            ).to(tl.float32)
+            dquery += grad * tl.sum(address_weight[:, None] * addresses, axis=0)
+        tl.store(
+            DQUERY + batch * sdqb + head * sdqh + qpos * sdqn + dims * sdqd,
+            dquery,
+        )
+
+    @triton.jit
+    def _selected_address_score_backward_source_kernel(
+        QUERY, VALUES, COHERENCE, COHERENCE_WEIGHT, CHUNKS, DOUT,
+        DVALUES, DCOHERENCE, DCOHERENCE_WEIGHT,
+        sqb, sqh, sqn, sqd,
+        svb, svh, svc, sva, svd,
+        scob, scoh, scoc,
+        sckb, sckh, sckn, sckk,
+        sdob, sdoh, sdon, sdok,
+        sdvb, sdvh, sdvc, sdva, sdvd,
+        sdcob, sdcoh, sdcoc,
+        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
+        HD: tl.constexpr, A: tl.constexpr, A_PAD: tl.constexpr,
+        K_VAL: tl.constexpr, REDUCTION: tl.constexpr,
+        TEMPERATURE: tl.constexpr, COHERENCE_LOG_FLOOR: tl.constexpr,
+    ):
+        program = tl.program_id(0)
+        slot = program % K_VAL
+        query_program = program // K_VAL
+        qpos = query_program % N
+        batch_head = query_program // N
+        batch = batch_head // H
+        head = batch_head % H
+        chunk = tl.load(
+            CHUNKS + batch * sckb + head * sckh + qpos * sckn + slot * sckk
+        ).to(tl.int32)
+        valid = chunk >= 0
+        dims = tl.arange(0, HD)
+        address_ids = tl.arange(0, A_PAD)
+        query = tl.load(
+            QUERY + batch * sqb + head * sqh + qpos * sqn + dims * sqd,
+            mask=valid, other=0.0,
+        ).to(tl.float32)
+        addresses = tl.load(
+            VALUES + batch * svb + head * svh + chunk * svc
+            + address_ids[:, None] * sva + dims[None, :] * svd,
+            mask=valid & (address_ids[:, None] < A), other=0.0,
+        ).to(tl.float32)
+        coherence = tl.load(
+            COHERENCE + batch * scob + head * scoh + chunk * scoc,
+            mask=valid, other=1.0,
+        ).to(tl.float32)
+        coherence_weight = tl.load(COHERENCE_WEIGHT + head).to(tl.float32)
+        raw_log_coherence = tl.log(tl.maximum(coherence, 1.0e-4))
+        log_coherence = tl.maximum(raw_log_coherence, COHERENCE_LOG_FLOOR)
+        per_address = tl.sum(addresses * query[None, :], axis=1)
+        per_address = tl.where(
+            address_ids == 0,
+            per_address + coherence_weight * log_coherence,
+            per_address,
+        )
+        per_address = tl.where(address_ids < A, per_address, float("-inf"))
+        if REDUCTION == 0:
+            winner = tl.argmax(per_address, axis=0)
+            address_weight = (address_ids == winner).to(tl.float32)
+        else:
+            maximum = tl.max(per_address, axis=0)
+            unnormalized = tl.where(
+                address_ids < A,
+                tl.exp((per_address - maximum) / TEMPERATURE),
+                0.0,
+            )
+            address_weight = unnormalized / tl.sum(unnormalized, axis=0)
+        grad = tl.load(
+            DOUT + batch * sdob + head * sdoh + qpos * sdon + slot * sdok,
+            mask=valid, other=0.0,
+        ).to(tl.float32)
+        dvalue = grad * address_weight[:, None] * query[None, :]
+        tl.atomic_add(
+            DVALUES + batch * sdvb + head * sdvh + chunk * sdvc
+            + address_ids[:, None] * sdva + dims[None, :] * sdvd,
+            dvalue,
+            mask=valid & (address_ids[:, None] < A),
+            sem="relaxed",
+        )
+        mean_gradient = grad * tl.sum(
+            tl.where(address_ids == 0, address_weight, 0.0), axis=0
+        )
+        coherence_active = (
+            (coherence > 1.0e-4) & (raw_log_coherence > COHERENCE_LOG_FLOOR)
+        )
+        dcoherence = tl.where(
+            coherence_active,
+            mean_gradient * coherence_weight / coherence,
+            0.0,
+        )
+        tl.atomic_add(
+            DCOHERENCE + batch * sdcob + head * sdcoh + chunk * sdcoc,
+            dcoherence,
+            mask=valid,
+            sem="relaxed",
+        )
+        tl.atomic_add(
+            DCOHERENCE_WEIGHT + head,
+            mean_gradient * log_coherence,
+            mask=valid,
+            sem="relaxed",
+        )
 
     @triton.jit
     def _selected_page_lse_kernel(
@@ -3600,6 +4011,246 @@ def _selected_page_lse_triton_apply(
     return output
 
 
+def _validate_selected_address_score_inputs(
+    query: torch.Tensor,
+    values: torch.Tensor,
+    coherence: torch.Tensor,
+    coherence_weight: torch.Tensor,
+    chunks: torch.Tensor,
+) -> tuple[int, int, int, int, int, int]:
+    if query.ndim != 4:
+        raise ValueError("routing query must have shape [B,H,N,D]")
+    if values.ndim != 5:
+        raise ValueError("routing values must have shape [B,H,C,A,D]")
+    batch, heads, seq_len, head_dim = query.shape
+    if values.shape[:2] != (batch, heads) or values.shape[-1] != head_dim:
+        raise ValueError("routing values do not match query batch/head/dimension")
+    if coherence.shape != values.shape[:3]:
+        raise ValueError("routing coherence must have shape [B,H,C]")
+    if coherence_weight.shape != (heads,):
+        raise ValueError("routing coherence weight must have shape [H]")
+    if chunks.shape[:3] != (batch, heads, seq_len) or chunks.ndim != 4:
+        raise ValueError("routing chunks must have shape [B,H,N,K]")
+    if head_dim < 16 or not _is_power_of_two(head_dim):
+        raise ValueError("selected-address Triton scoring requires power-of-two D >=16")
+    addresses = int(values.shape[-2])
+    if addresses < 1 or addresses > 16:
+        raise ValueError("selected-address Triton scoring supports 1..16 addresses")
+    return batch, heads, seq_len, head_dim, addresses, int(chunks.shape[-1])
+
+
+def _selected_address_score_forward_impl(
+    query: torch.Tensor,
+    values: torch.Tensor,
+    coherence: torch.Tensor,
+    coherence_weight: torch.Tensor,
+    chunks: torch.Tensor,
+    reduction: int,
+    temperature: float,
+    coherence_log_floor: float,
+    *,
+    use_wrap_triton: bool,
+) -> torch.Tensor:
+    batch, heads, seq_len, head_dim, addresses, slots = (
+        _validate_selected_address_score_inputs(
+            query, values, coherence, coherence_weight, chunks
+        )
+    )
+    output = torch.empty(
+        batch, heads, seq_len, slots, device=query.device, dtype=torch.float32
+    )
+    kernel = (
+        torch.library.wrap_triton(_selected_address_score_forward_kernel)
+        if use_wrap_triton else _selected_address_score_forward_kernel
+    )
+    kernel[(batch * heads * seq_len * slots,)](
+        query, values, coherence, coherence_weight, chunks, output,
+        *query.stride(), *values.stride(), *coherence.stride(),
+        *chunks.stride(), *output.stride(),
+        B=batch, H=heads, N=seq_len, HD=head_dim,
+        A=addresses, A_PAD=_next_pow2(addresses), K_VAL=slots,
+        REDUCTION=int(reduction), TEMPERATURE=float(temperature),
+        LOG_A=math.log(addresses),
+        COHERENCE_LOG_FLOOR=float(coherence_log_floor),
+        num_warps=4, num_stages=2,
+    )
+    return output
+
+
+def _selected_address_score_backward_impl(
+    query: torch.Tensor,
+    values: torch.Tensor,
+    coherence: torch.Tensor,
+    coherence_weight: torch.Tensor,
+    chunks: torch.Tensor,
+    grad_output: torch.Tensor,
+    reduction: int,
+    temperature: float,
+    coherence_log_floor: float,
+    *,
+    use_wrap_triton: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, heads, seq_len, head_dim, addresses, slots = (
+        _validate_selected_address_score_inputs(
+            query, values, coherence, coherence_weight, chunks
+        )
+    )
+    grad_output = grad_output.contiguous().float()
+    dquery = torch.zeros_like(query, dtype=torch.float32)
+    dvalues = torch.zeros_like(values, dtype=torch.float32)
+    dcoherence = torch.zeros_like(coherence, dtype=torch.float32)
+    dweight = torch.zeros_like(coherence_weight, dtype=torch.float32)
+    query_kernel = (
+        torch.library.wrap_triton(_selected_address_score_backward_query_kernel)
+        if use_wrap_triton else _selected_address_score_backward_query_kernel
+    )
+    source_kernel = (
+        torch.library.wrap_triton(_selected_address_score_backward_source_kernel)
+        if use_wrap_triton else _selected_address_score_backward_source_kernel
+    )
+    common = dict(
+        B=batch, H=heads, N=seq_len, HD=head_dim,
+        A=addresses, A_PAD=_next_pow2(addresses), K_VAL=slots,
+        REDUCTION=int(reduction), TEMPERATURE=float(temperature),
+        COHERENCE_LOG_FLOOR=float(coherence_log_floor),
+    )
+    query_kernel[(batch * heads * seq_len,)](
+        query, values, coherence, coherence_weight, chunks, grad_output, dquery,
+        *query.stride(), *values.stride(), *coherence.stride(),
+        *chunks.stride(), *grad_output.stride(), *dquery.stride(),
+        **common, num_warps=4, num_stages=2,
+    )
+    source_kernel[(batch * heads * seq_len * slots,)](
+        query, values, coherence, coherence_weight, chunks, grad_output,
+        dvalues, dcoherence, dweight,
+        *query.stride(), *values.stride(), *coherence.stride(),
+        *chunks.stride(), *grad_output.stride(), *dvalues.stride(),
+        *dcoherence.stride(),
+        **common, num_warps=4, num_stages=2,
+    )
+    return dquery, dvalues, dcoherence, dweight
+
+
+if _TRITON_LIBRARY_API_AVAILABLE:
+
+    @torch.library.triton_op("dwarf_hisa_v19::selected_address_scores", mutates_args={})
+    def _selected_address_score_op(
+        query: torch.Tensor,
+        values: torch.Tensor,
+        coherence: torch.Tensor,
+        coherence_weight: torch.Tensor,
+        chunks: torch.Tensor,
+        reduction: int,
+        temperature: float,
+        coherence_log_floor: float,
+    ) -> torch.Tensor:
+        return _selected_address_score_forward_impl(
+            query, values, coherence, coherence_weight, chunks,
+            reduction, temperature, coherence_log_floor,
+            use_wrap_triton=True,
+        )
+
+    @torch.library.triton_op(
+        "dwarf_hisa_v19::selected_address_scores_backward", mutates_args={}
+    )
+    def _selected_address_score_backward_op(
+        query: torch.Tensor,
+        values: torch.Tensor,
+        coherence: torch.Tensor,
+        coherence_weight: torch.Tensor,
+        chunks: torch.Tensor,
+        grad_output: torch.Tensor,
+        reduction: int,
+        temperature: float,
+        coherence_log_floor: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _selected_address_score_backward_impl(
+            query, values, coherence, coherence_weight, chunks, grad_output,
+            reduction, temperature, coherence_log_floor,
+            use_wrap_triton=True,
+        )
+
+    def _setup_selected_address_score_context(ctx, inputs, output) -> None:
+        (
+            query, values, coherence, coherence_weight, chunks,
+            reduction, temperature, coherence_log_floor,
+        ) = inputs
+        ctx.save_for_backward(query, values, coherence, coherence_weight, chunks)
+        ctx.reduction = int(reduction)
+        ctx.temperature = float(temperature)
+        ctx.coherence_log_floor = float(coherence_log_floor)
+
+    def _selected_address_score_registered_backward(ctx, grad_output):
+        query, values, coherence, coherence_weight, chunks = ctx.saved_tensors
+        dquery, dvalues, dcoherence, dweight = _selected_address_score_backward_op(
+            query, values, coherence, coherence_weight, chunks, grad_output,
+            ctx.reduction, ctx.temperature, ctx.coherence_log_floor,
+        )
+        return dquery, dvalues, dcoherence, dweight, None, None, None, None
+
+    torch.library.register_autograd(
+        "dwarf_hisa_v19::selected_address_scores",
+        _selected_address_score_registered_backward,
+        setup_context=_setup_selected_address_score_context,
+    )
+
+
+class _LegacySelectedAddressScoreFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, query, values, coherence, coherence_weight, chunks,
+        reduction, temperature, coherence_log_floor,
+    ):
+        ctx.save_for_backward(query, values, coherence, coherence_weight, chunks)
+        ctx.reduction = int(reduction)
+        ctx.temperature = float(temperature)
+        ctx.coherence_log_floor = float(coherence_log_floor)
+        return _selected_address_score_forward_impl(
+            query, values, coherence, coherence_weight, chunks,
+            ctx.reduction, ctx.temperature, ctx.coherence_log_floor,
+            use_wrap_triton=False,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, values, coherence, coherence_weight, chunks = ctx.saved_tensors
+        gradients = _selected_address_score_backward_impl(
+            query, values, coherence, coherence_weight, chunks, grad_output,
+            ctx.reduction, ctx.temperature, ctx.coherence_log_floor,
+            use_wrap_triton=False,
+        )
+        return (*gradients, None, None, None, None)
+
+
+def _selected_address_score_triton_apply(
+    query: torch.Tensor,
+    values: torch.Tensor,
+    coherence: torch.Tensor,
+    coherence_weight: torch.Tensor,
+    chunks: torch.Tensor,
+    *,
+    reduction: str,
+    temperature: float,
+    coherence_log_floor: float,
+) -> torch.Tensor:
+    if not query.is_cuda or not _TRITON_AVAILABLE:
+        raise RuntimeError("selected-address Triton scoring requires CUDA/Triton")
+    values5 = values if values.ndim == 5 else values.unsqueeze(-2)
+    reduction_code = 0 if reduction == "max" else 1
+    if reduction not in {"max", "logsumexp"}:
+        raise ValueError("representative score reduction must be max or logsumexp")
+    weight = coherence_weight.to(device=query.device, dtype=torch.float32)
+    if _TRITON_LIBRARY_API_AVAILABLE:
+        return _selected_address_score_op(
+            query.float(), values5.float(), coherence.float(), weight, chunks,
+            reduction_code, float(temperature), float(coherence_log_floor),
+        )
+    return _LegacySelectedAddressScoreFn.apply(
+        query.float(), values5.float(), coherence.float(), weight, chunks,
+        reduction_code, float(temperature), float(coherence_log_floor),
+    )
+
+
 def _direct_global_forward_impl(
     query: torch.Tensor,
     global_key: torch.Tensor,
@@ -4217,17 +4868,22 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         representative_score_reduction: str = "logsumexp",
         representative_lse_temperature: float = 0.5,
         coherence_score_max_weight: float = 1.0,
-        coherence_score_initial_weight: float = 0.25,
+        coherence_score_initial_weight: float = 0.20,
+        parent_coherence_score_max_weight: float = 0.5,
+        parent_coherence_score_initial_weight: float = 0.025,
+        coherence_log_floor: float = -2.0,
         routing_candidate_multiplier: int = 2,
         routing_stream_block_size: int = 16,
         hierarchical_routing: bool = True,
         hierarchy_group_size: int = 4,
         parent_top_k: int | None = None,
         exact_page_rerank: bool = True,
+        representative_prior_after_exact_rerank: bool = False,
         dual_source_candidate_union: bool | None = None,
         exploration_probability: float = 0.05,
-        exploration_policy: str = "tail_softmax",
+        exploration_policy: str = "candidate_tail",
         exploration_temperature: float = 1.0,
+        exploration_uniform_global_fraction: float = 0.10,
         exploration_final_probability: float | None = 0.0,
         exploration_anneal_steps: int = 10_000,
         route_aux_weight: float = 0.01,
@@ -4236,11 +4892,15 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         route_aux_oracle_temperature: float = 0.2,
         route_aux_teacher: str = "dense_attention",
         route_aux_coverage_weight: float = 0.0,
+        parent_route_aux_weight: float = 0.25,
+        lane_teacher_count_normalization: bool = True,
         global_mass_aux_weight: float = 0.01,
         binding_null_aux_weight: float = 0.002,
         require_auxiliary_return: bool = True,
         global_adapter_rank: int = 16,
         global_key_calibration: str = "none",
+        router_adapter_rank: int = 32,
+        route_aux_detach_core_qk: bool = True,
         binding_rank: int = 64,
         count_correction_scale_limit: float = 2.0,
         npci_theta_max: float = 0.25,
@@ -4291,6 +4951,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "global_lane_bias_limit": global_lane_bias_limit,
             "global_route_confidence_limit": global_route_confidence_limit,
             "coherence_score_max_weight": coherence_score_max_weight,
+            "parent_coherence_score_max_weight": parent_coherence_score_max_weight,
             "count_correction_scale_limit": count_correction_scale_limit,
             "npci_theta_max": npci_theta_max,
         }.items():
@@ -4298,6 +4959,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 raise ValueError(f"{name} must be finite and positive")
         if not 0.0 <= float(coherence_score_initial_weight) <= float(coherence_score_max_weight):
             raise ValueError("coherence_score_initial_weight must be in [0,max_weight]")
+        if not 0.0 <= float(parent_coherence_score_initial_weight) <= float(
+            parent_coherence_score_max_weight
+        ):
+            raise ValueError(
+                "parent_coherence_score_initial_weight must be in [0,max_weight]"
+            )
+        if not math.isfinite(float(coherence_log_floor)) or float(coherence_log_floor) >= 0.0:
+            raise ValueError("coherence_log_floor must be finite and negative")
         if representative_mode not in {
             "mean_max_blend", "mean_max_blend_ablation", "multi_address", "multi_landmark"
         }:
@@ -4317,6 +4986,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         for name, value in {
             "hierarchical_routing": hierarchical_routing,
             "exact_page_rerank": exact_page_rerank,
+            "representative_prior_after_exact_rerank": (
+                representative_prior_after_exact_rerank
+            ),
+            "lane_teacher_count_normalization": lane_teacher_count_normalization,
+            "route_aux_detach_core_qk": route_aux_detach_core_qk,
             "require_auxiliary_return": require_auxiliary_return,
             "boundary_bridge": boundary_bridge,
         }.items():
@@ -4339,13 +5013,20 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise ValueError("exploration probabilities must be in [0,1]")
         if int(exploration_anneal_steps) < 0:
             raise ValueError("exploration_anneal_steps must be non-negative")
-        if exploration_policy not in {"tail_softmax", "uniform_unseen_ablation"}:
+        if exploration_policy not in {
+            "candidate_tail", "tail_softmax", "uniform_unseen_ablation"
+        }:
             raise ValueError("unsupported exploration_policy")
         if not math.isfinite(exploration_temperature) or float(exploration_temperature) <= 0:
             raise ValueError("exploration_temperature must be finite and positive")
+        if not 0.0 <= float(exploration_uniform_global_fraction) <= 1.0:
+            raise ValueError(
+                "exploration_uniform_global_fraction must be in [0,1]"
+            )
         for name, value in {
             "route_aux_weight": route_aux_weight,
             "route_aux_coverage_weight": route_aux_coverage_weight,
+            "parent_route_aux_weight": parent_route_aux_weight,
             "global_mass_aux_weight": global_mass_aux_weight,
             "binding_null_aux_weight": binding_null_aux_weight,
         }.items():
@@ -4354,7 +5035,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if int(route_aux_samples) < 0:
             raise ValueError("route_aux_samples must be non-negative")
         if int(route_aux_samples) == 0 and (
-            float(route_aux_weight) > 0.0 or float(global_mass_aux_weight) > 0.0
+            float(route_aux_weight) > 0.0
+            or float(global_mass_aux_weight) > 0.0
+            or float(binding_null_aux_weight) > 0.0
         ):
             raise ValueError(
                 "route_aux_samples must be positive when route or global-mass "
@@ -4368,8 +5051,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise ValueError("unsupported route_aux_teacher")
         if global_key_calibration not in {"none", "rms_match_local"}:
             raise ValueError("global_key_calibration must be none or rms_match_local")
-        if int(global_adapter_rank) < 0 or int(binding_rank) < 0:
-            raise ValueError("adapter and binding ranks must be non-negative")
+        if (
+            int(global_adapter_rank) < 0
+            or int(router_adapter_rank) < 0
+            or int(binding_rank) < 0
+        ):
+            raise ValueError(
+                "global, router, and binding adapter ranks must be non-negative"
+            )
         if max_seq_len is not None and int(max_seq_len) < 1:
             raise ValueError("max_seq_len must be positive when supplied")
         local_backend = str(local_backend).lower()
@@ -4408,6 +5097,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.representative_score_reduction = representative_score_reduction
         self.representative_lse_temperature = float(representative_lse_temperature)
         self.coherence_score_max_weight = float(coherence_score_max_weight)
+        self.parent_coherence_score_max_weight = float(
+            parent_coherence_score_max_weight
+        )
+        self.coherence_log_floor = float(coherence_log_floor)
         self.routing_candidate_multiplier = int(routing_candidate_multiplier)
         self.routing_candidate_count = max(
             self.top_k_chunks, self.top_k_chunks * self.routing_candidate_multiplier
@@ -4420,6 +5113,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         self.parent_top_k = default_parent_top_k if parent_top_k is None else int(parent_top_k)
         self.exact_page_rerank = bool(exact_page_rerank)
+        self.representative_prior_after_exact_rerank = bool(
+            representative_prior_after_exact_rerank
+        )
         resolved_route_policy = _resolve_route_source_policy(
             route_source_policy,
             route_from_base_global_key=route_from_base_global_key,
@@ -4449,6 +5145,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.exploration_probability = float(exploration_probability)
         self.exploration_policy = exploration_policy
         self.exploration_temperature = float(exploration_temperature)
+        self.exploration_uniform_global_fraction = float(
+            exploration_uniform_global_fraction
+        )
         self.exploration_final_probability = float(exploration_final_probability)
         self.exploration_anneal_steps = int(exploration_anneal_steps)
         self.route_aux_weight = float(route_aux_weight)
@@ -4457,6 +5156,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.route_aux_oracle_temperature = float(route_aux_oracle_temperature)
         self.route_aux_teacher = route_aux_teacher
         self.route_aux_coverage_weight = float(route_aux_coverage_weight)
+        self.parent_route_aux_weight = float(parent_route_aux_weight)
+        self.lane_teacher_count_normalization = bool(
+            lane_teacher_count_normalization
+        )
         self.global_mass_aux_weight = float(global_mass_aux_weight)
         self.binding_null_aux_weight = float(binding_null_aux_weight)
         self.require_auxiliary_return = bool(require_auxiliary_return)
@@ -4466,10 +5169,23 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.global_route_confidence_limit = float(global_route_confidence_limit)
         self.global_adapter_rank = int(global_adapter_rank)
         self.global_key_calibration = global_key_calibration
+        self.router_adapter_rank = int(router_adapter_rank)
+        self.route_aux_detach_core_qk = bool(route_aux_detach_core_qk)
+        self.route_source_contract = dict(self.route_source_contract)
+        self.route_source_contract["student_router_stream"] = (
+            "detached_core_plus_low_rank_router_adapter"
+            if self.router_adapter_rank and self.route_aux_detach_core_qk
+            else (
+                "core_plus_low_rank_router_adapter"
+                if self.router_adapter_rank
+                else "core_key_stream"
+            )
+        )
+        self.route_source_contract["router_adapter_rank"] = self.router_adapter_rank
         self.binding_rank = int(binding_rank)
         self.count_correction_scale_limit = float(count_correction_scale_limit)
         self.register_buffer(
-            "binding_state_version", torch.tensor(3, dtype=torch.int32),
+            "binding_state_version", torch.tensor(4, dtype=torch.int32),
             persistent=bool(self.binding_rank),
         )
         self.npci_theta_max = float(npci_theta_max)
@@ -4481,8 +5197,6 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.local_mask_cache_size = int(local_mask_cache_size)
         self._local_block_mask_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
         self._local_count_cache: OrderedDict[tuple[object, ...], torch.Tensor] = OrderedDict()
-        self._local_block_mask = None
-        self._local_block_mask_key = None
 
         self.triton_block_q = 16 if triton_block_q is None else int(triton_block_q)
         self.triton_query_pack_specialization = triton_query_pack_specialization
@@ -4524,6 +5238,18 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             self.global_k_down = self.global_k_up = None
             self.global_v_down = self.global_v_up = None
 
+        if self.router_adapter_rank:
+            rank = self.router_adapter_rank
+            self.router_q_down = nn.Linear(D, rank, bias=False)
+            self.router_q_up = nn.Linear(rank, D, bias=False)
+            self.router_k_down = nn.Linear(D, rank, bias=False)
+            self.router_k_up = nn.Linear(rank, D, bias=False)
+            nn.init.normal_(self.router_q_up.weight, mean=0.0, std=0.002)
+            nn.init.normal_(self.router_k_up.weight, mean=0.0, std=0.002)
+        else:
+            self.router_q_down = self.router_q_up = None
+            self.router_k_down = self.router_k_up = None
+
         initial_route_fraction = float(route_prior_scale) / float(route_prior_max_scale)
         self.route_prior_raw = nn.Parameter(
             torch.full((H,), math.log(initial_route_fraction / (1.0 - initial_route_fraction)))
@@ -4538,6 +5264,17 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         self.representative_coherence_raw = nn.Parameter(
             torch.full((H,), math.log(coherence_fraction / (1.0 - coherence_fraction)))
+        )
+        parent_fraction = min(
+            max(
+                float(parent_coherence_score_initial_weight)
+                / self.parent_coherence_score_max_weight,
+                1e-4,
+            ),
+            1.0 - 1e-4,
+        )
+        self.parent_coherence_raw = nn.Parameter(
+            torch.full((H,), math.log(parent_fraction / (1.0 - parent_fraction)))
         )
         self.global_lane_logit_bias = nn.Parameter(torch.zeros(H))
         self.global_route_confidence_weight = nn.Parameter(torch.zeros(H, 3))
@@ -4596,7 +5333,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
     ) -> None:
         # New scalar/head calibrators have neutral/default migrations and do not
         # invalidate attention checkpoints that predate this optimized kernel.
-        for name in ("representative_coherence_raw", "count_correction_raw"):
+        for name in (
+            "representative_coherence_raw",
+            "parent_coherence_raw",
+            "count_correction_raw",
+        ):
             key = prefix + name
             if key not in state_dict:
                 state_dict[key] = getattr(self, name).detach().clone()
@@ -4605,22 +5346,73 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             version_key = prefix + "binding_state_version"
             if legacy_key in state_dict:
                 error_msgs.append(
-                    "legacy pooled HISA binder checkpoint detected; binder v3 "
+                    "legacy pooled HISA binder checkpoint detected; binder v4 "
                     "must be initialized rather than shape-migrated"
                 )
             elif version_key not in state_dict:
-                error_msgs.append("route-slot HISA binder checkpoint is missing binding_state_version=3")
+                error_msgs.append(
+                    "route-slot HISA binder checkpoint is missing binding_state_version=4"
+                )
             else:
                 version = int(state_dict[version_key].item())
-                if version != 3:
+                if version != 4:
                     error_msgs.append(
                         f"unsupported route-slot HISA binder state version {version}; "
-                        "expected 3 because mass-grounded scoring changes semantics"
+                        "expected 4 because captured-mass supervision changes semantics"
                     )
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
         )
+
+    def load_legacy_hisa_backbone_(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        strict: bool = True,
+    ):
+        """Warm-start v2/v3 non-binder weights into the v4 route/binder ABI.
+
+        Router adapters, parent coherence, and every binder-v4 tensor are reset.
+        This is model-only initialization; old optimizer/RNG state is intentionally
+        not compatible with strict resume.
+        """
+        if not self.binding_rank:
+            raise RuntimeError("legacy HISA migration requires binding_rank > 0")
+        version = state_dict.get("binding_state_version")
+        if version is None or int(version.item()) not in {2, 3}:
+            raise ValueError("state_dict is not a route-slot HISA v2/v3 checkpoint")
+        self.reset_binding_parameters_()
+        self.reset_router_adapters_()
+        current = self.state_dict()
+        migrated = OrderedDict(state_dict)
+        metadata = getattr(state_dict, "_metadata", None)
+        if metadata is not None:
+            migrated._metadata = metadata  # type: ignore[attr-defined]
+        reset_prefixes = (
+            "bind_query.",
+            "bind_route_identity.",
+            "bind_route_score.",
+            "bind_abstention.",
+            "bind_output.",
+            "router_q_down.",
+            "router_q_up.",
+            "router_k_down.",
+            "router_k_up.",
+        )
+        reset_exact = {
+            "binding_state_version",
+            "bind_evidence_weight",
+            "bind_null",
+            "bind_null_prior",
+            "binding_gain_raw",
+            "parent_coherence_raw",
+        }
+        migrated.pop("bind_evidence.weight", None)
+        for key, value in current.items():
+            if key in reset_exact or key.startswith(reset_prefixes):
+                migrated[key] = value.detach().clone()
+        return self.load_state_dict(migrated, strict=strict)
 
     def load_legacy_binding_v2_backbone_(
         self,
@@ -4628,45 +5420,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         *,
         strict: bool = True,
     ):
-        """Load a v2 checkpoint while explicitly discarding its incompatible binder.
-
-        All non-binder tensors are loaded normally. Binder-v3 parameters are reset
-        to their mass-grounded initialization and the migrated state is marked v3.
-        This is intentionally opt-in; ordinary ``load_state_dict`` rejects v2.
-        """
-        if not self.binding_rank:
-            raise RuntimeError("legacy binder migration requires binding_rank > 0")
-        version = state_dict.get("binding_state_version")
-        if version is None or int(version.item()) != 2:
-            raise ValueError("state_dict is not a route-slot HISA binder-v2 checkpoint")
-        self.reset_binding_parameters_()
-        current = self.state_dict()
-        migrated = OrderedDict(state_dict)
-        metadata = getattr(state_dict, "_metadata", None)
-        if metadata is not None:
-            migrated._metadata = metadata  # type: ignore[attr-defined]
-        binder_prefixes = (
-            "bind_query.",
-            "bind_route_identity.",
-            "bind_route_score.",
-            "bind_abstention.",
-            "bind_output.",
-        )
-        binder_exact = {
-            "binding_state_version",
-            "bind_evidence_weight",
-            "bind_null",
-            "bind_null_prior",
-            "binding_gain_raw",
-        }
-        for key in list(migrated):
-            if key == "bind_evidence.weight":
-                del migrated[key]
-        for key, value in current.items():
-            if key in binder_exact or key.startswith(binder_prefixes):
-                migrated[key] = value.detach().clone()
-        return self.load_state_dict(migrated, strict=strict)
-
+        """Compatibility alias for the explicit v2/v3 model-only warm-start."""
+        return self.load_legacy_hisa_backbone_(state_dict, strict=strict)
 
     @property
     def representative_mix(self) -> torch.Tensor:
@@ -4682,6 +5437,12 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
     def representative_coherence_weight(self) -> torch.Tensor:
         return self.coherence_score_max_weight * torch.sigmoid(
             self.representative_coherence_raw
+        )
+
+    @property
+    def parent_coherence_weight(self) -> torch.Tensor:
+        return self.parent_coherence_score_max_weight * torch.sigmoid(
+            self.parent_coherence_raw
         )
 
     @property
@@ -4720,15 +5481,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
 
     def _quality_candidate_config(self) -> dict[str, object]:
         """Versioned active semantics only; compatibility diagnostics are excluded."""
-        return {
-            "format": "hisa-v19-optimized-quality-v3",
-            "model_dim": self.D,
-            "heads": self.H,
-            "head_dim": self.hd,
-            "chunk_size": self.chunk_size,
-            "top_k_chunks": self.top_k_chunks,
-            "local_window": self.local_window,
-            "boundary_bridge": self.boundary_bridge,
+        config: dict[str, object] = {
+            "format": "hisa-v19-optimized-quality-v4",
+            "model_dim": self.D, "heads": self.H, "head_dim": self.hd,
+            "chunk_size": self.chunk_size, "top_k_chunks": self.top_k_chunks,
+            "local_window": self.local_window, "boundary_bridge": self.boundary_bridge,
             "route_source_policy": self.route_source_policy,
             "route_source_contract": self.route_source_contract,
             "routing_key_source": self.route_source,
@@ -4738,29 +5495,37 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "hierarchical_routing": self.hierarchical_routing,
             "hierarchy_group_size": self.hierarchy_group_size,
             "parent_top_k": self.parent_top_k,
+            "parent_route_aux_weight": self.parent_route_aux_weight,
             "exact_page_rerank": self.exact_page_rerank,
+            "representative_prior_after_exact_rerank": (
+                self.representative_prior_after_exact_rerank
+            ),
             "dual_source_candidate_union": self.dual_source_candidate_union,
             "representative_mode": self.representative_mode,
             "representative_score_reduction": self.representative_score_reduction,
             "representative_lse_temperature": self.representative_lse_temperature,
-            "representative_blend_alpha_initial_mean": self.representative_blend_alpha,
             "coherence_score_max_weight": self.coherence_score_max_weight,
+            "parent_coherence_score_max_weight": self.parent_coherence_score_max_weight,
+            "coherence_log_floor": self.coherence_log_floor,
             "route_prior_max_scale": self.route_prior_max_scale,
             "global_lane_bias_limit": self.global_lane_bias_limit,
             "global_route_confidence_limit": self.global_route_confidence_limit,
             "count_correction_scale_limit": self.count_correction_scale_limit,
             "global_adapter_rank": self.global_adapter_rank,
             "global_key_calibration": self.global_key_calibration,
-            "binding_rank": self.binding_rank,
-            "binding_state_version": 3,
+            "router_adapter_rank": self.router_adapter_rank,
+            "route_aux_detach_core_qk": self.route_aux_detach_core_qk,
+            "binding_rank": self.binding_rank, "binding_state_version": 4,
             "npci_theta_max": self.npci_theta_max,
-            "rerank_selected_priors_with_post_packet_representatives": self.rerank_selected_priors_with_post_packet_representatives,
+            "rerank_selected_priors_with_post_packet_representatives": (
+                self.rerank_selected_priors_with_post_packet_representatives
+            ),
             "route_aux_teacher": self.route_aux_teacher,
             "route_aux_weight": self.route_aux_weight,
             "route_aux_samples": self.route_aux_samples,
             "route_aux_temperature": self.route_aux_temperature,
-            "route_aux_oracle_temperature": self.route_aux_oracle_temperature,
             "route_aux_coverage_weight": self.route_aux_coverage_weight,
+            "lane_teacher_count_normalization": self.lane_teacher_count_normalization,
             "global_mass_aux_weight": self.global_mass_aux_weight,
             "binding_null_aux_weight": self.binding_null_aux_weight,
             "exploration_probability": self.exploration_probability,
@@ -4768,7 +5533,19 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "exploration_anneal_steps": self.exploration_anneal_steps,
             "exploration_policy": self.exploration_policy,
             "exploration_temperature": self.exploration_temperature,
+            "exploration_uniform_global_fraction": (
+                self.exploration_uniform_global_fraction
+            ),
         }
+        if self.representative_mode in {
+            "mean_max_blend", "mean_max_blend_ablation"
+        }:
+            config["representative_blend_alpha_initial_mean"] = (
+                self.representative_blend_alpha
+            )
+        if self.route_aux_teacher == "cosine_ablation":
+            config["route_aux_oracle_temperature"] = self.route_aux_oracle_temperature
+        return config
 
     def _quality_candidate_fingerprint(self) -> str:
         payload = json.dumps(
@@ -4779,18 +5556,24 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
     def semantic_config(self) -> dict[str, object]:
         config = dict(self._quality_candidate_config())
         config.update({
-            "implementation": "hisa-v19-streaming-hierarchical-route-slots-null-binding-v3",
+            "implementation": "hisa-v19-streaming-hierarchical-captured-mass-binding-v4",
             "selected_token_policy": "enumerate_complete_selected_chunks",
             "semantic_selection_scope": "per_token",
             "hard_selector": "detached_streaming_parent_child_top_m_exact_page_lse_top_k",
             "selector_autograd": "selected_K_plus_sampled_aux_rows_only",
-            "representative_coherence": "pre_normalized_mean_norm_monotonic_penalty",
+            "representative_coherence": (
+                "bounded_mean-landmark child and parent penalties"
+            ),
             "global_attention_key_source": "post_packet_rotated_global_k",
             "route_source_contract": self.route_source_contract,
-            "route_auxiliary_target": "conditional_global_chunk_mass_plus_total_global_mass",
+            "route_auxiliary_target": (
+                "policy conditional chunk mass plus executed selected captured mass"
+            ),
             "route_auxiliary_transport": "explicit_forward_return_required",
             "binding_source": "per_head_per_route_normalized_low_rank_evidence",
-            "binding_aggregation": "mass_grounded_route_null_softmax_with_separate_payload",
+            "binding_aggregation": (
+                "captured-mass-grounded route/null softmax with separate payload"
+            ),
             "binding_mass": "exact_merged_attention_log_mass",
             "binding_route_identity_features": "absolute_similarity,relative_centered_prior,relative_age,relative_position",
             "binding_abstention_features": "absolute_max,absolute_mean,route_entropy",
@@ -4814,6 +5597,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "source_block_size": self.source_block_size,
             "direct_kernel_schedule": "autotuned_candidate" if _DIRECT_GLOBAL_AUTOTUNE_ENABLED else "static_default",
             "aggregate_only_triton_specialization": True,
+            "selected_address_score_backend": (
+                "registered_triton_autograd"
+                if _TRITON_LIBRARY_API_AVAILABLE
+                else "legacy_triton_autograd"
+            ),
             "factorized_page_route_softmax": True,
             "reverse_edge_options": ("stable_sort", "bounded_id_counting", "atomic_query_owned"),
             "collect_routing_diagnostics": self.collect_routing_diagnostics,
@@ -4844,8 +5632,6 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         cached = self._local_block_mask_cache.get(key)
         if cached is not None:
             self._local_block_mask_cache.move_to_end(key)
-            self._local_block_mask = cached
-            self._local_block_mask_key = key
             return cached
         window, chunk = int(self.local_window), int(self.chunk_size)
 
@@ -4864,8 +5650,6 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self._local_block_mask_cache.move_to_end(key)
         while len(self._local_block_mask_cache) > self.local_mask_cache_size:
             self._local_block_mask_cache.popitem(last=False)
-        self._local_block_mask = mask
-        self._local_block_mask_key = key
         return mask
 
     def _local_count_geometry(self, device: torch.device, seq_len: int) -> torch.Tensor:
@@ -4965,6 +5749,23 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             self.initialize_global_adapter_up_()
 
     @torch.no_grad()
+    def initialize_router_adapter_up_(self) -> None:
+        if self.router_adapter_rank:
+            if self.router_q_up is None or self.router_k_up is None:
+                raise RuntimeError("router adapter projections are incomplete")
+            nn.init.normal_(self.router_q_up.weight, mean=0.0, std=0.002)
+            nn.init.normal_(self.router_k_up.weight, mean=0.0, std=0.002)
+
+    @torch.no_grad()
+    def reset_router_adapters_(self) -> None:
+        if self.router_adapter_rank:
+            if self.router_q_down is None or self.router_k_down is None:
+                raise RuntimeError("router adapter projections are incomplete")
+            self.router_q_down.reset_parameters()
+            self.router_k_down.reset_parameters()
+            self.initialize_router_adapter_up_()
+
+    @torch.no_grad()
     def reset_binding_parameters_(self) -> None:
         """Initialize binder v3 as a useful mass-weighted low-rank value path."""
         if not self.binding_rank:
@@ -5039,7 +5840,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         score_content = F.layer_norm(
             evidence + identity, (self.binding_head_rank,)
         )
-        score_interaction = query_features[..., None, :] * score_content + identity
+        score_interaction = (
+            score_content
+            + query_features[..., None, :] * score_content
+            + identity
+        )
         learned_route_adjustment = self.bind_route_score(
             score_interaction
         ).squeeze(-1).float()
@@ -5220,8 +6025,39 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if self.global_key_calibration == "rms_match_local":
             global_key = _rms_match_global_key(global_key, local_key, lengths)
 
-        query_normalized = _normalized_routing_query(query)
-        routing_key = base_global_key if self.route_from_base_global_key else global_key
+        route_teacher_key = (
+            base_global_key if self.route_aux_teacher_from_base_global_key else global_key
+        )
+        routing_key_core = (
+            base_global_key if self.route_from_base_global_key else global_key
+        )
+        routing_query = query.detach() if self.route_aux_detach_core_qk else query
+        routing_key = (
+            routing_key_core.detach()
+            if self.route_aux_detach_core_qk
+            else routing_key_core
+        )
+        router_q_delta: torch.Tensor | None = None
+        router_k_delta: torch.Tensor | None = None
+        if self.router_adapter_rank:
+            if any(module is None for module in (
+                self.router_q_down, self.router_q_up,
+                self.router_k_down, self.router_k_up,
+            )):
+                raise RuntimeError("router adapter modules are incomplete")
+            assert self.router_q_down is not None and self.router_q_up is not None
+            assert self.router_k_down is not None and self.router_k_up is not None
+            router_q_delta = _to_heads(
+                self.router_q_up(self.router_q_down(x)),
+                batch_size, seq_len, self.H, self.hd,
+            )
+            router_k_delta = _to_heads(
+                self.router_k_up(self.router_k_down(x)),
+                batch_size, seq_len, self.H, self.hd,
+            )
+            routing_query = routing_query + router_q_delta
+            routing_key = routing_key + router_k_delta
+        query_normalized = _normalized_routing_query(routing_query)
         hierarchy_size = self.hierarchy_group_size if self.hierarchical_routing else 1
         routing_addresses = _completed_chunk_addresses(
             routing_key,
@@ -5245,6 +6081,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             reduction=self.representative_score_reduction,
             temperature=self.representative_lse_temperature,
             coherence_weight=self.representative_coherence_weight.detach(),
+            parent_coherence_weight=self.parent_coherence_weight.detach(),
             hierarchical=self.hierarchical_routing,
         )
 
@@ -5280,6 +6117,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 reduction=self.representative_score_reduction,
                 temperature=self.representative_lse_temperature,
                 coherence_weight=self.representative_coherence_weight.detach(),
+                parent_coherence_weight=self.parent_coherence_weight.detach(),
                 hierarchical=self.hierarchical_routing,
             )
             concatenated = torch.cat(
@@ -5315,12 +6153,15 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         metadata = _inject_streaming_exploration(
             deterministic_metadata,
+            deterministic_candidates,
+            exact_candidate_lse,
             query_normalized,
             routing_addresses,
             exploration_probability,
             local_window=self.local_window,
             policy=self.exploration_policy,
             temperature=self.exploration_temperature,
+            uniform_global_fraction=self.exploration_uniform_global_fraction,
             block_size=self.routing_stream_block_size,
             reduction=self.representative_score_reduction,
             representative_temperature=self.representative_lse_temperature,
@@ -5353,6 +6194,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             reduction=self.representative_score_reduction,
             temperature=self.representative_lse_temperature,
             coherence_weight=self.representative_coherence_weight,
+            coherence_log_floor=self.coherence_log_floor,
         )
         valid_route = torch.isfinite(selected_similarity)
         valid_count = valid_route.sum(-1, keepdim=True).clamp_min(1)
@@ -5363,10 +6205,16 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             valid_route, selected_similarity - selected_mean,
             torch.zeros_like(selected_similarity),
         )
-        route = (
-            centered_similarity
-            * self.effective_route_prior_scale.reshape(1, self.H, 1, 1)
-        ).masked_fill(~valid_route, float("-inf"))
+        if self.exact_page_rerank and not self.representative_prior_after_exact_rerank:
+            route = torch.where(
+                valid_route, torch.zeros_like(centered_similarity),
+                torch.full_like(centered_similarity, float("-inf")),
+            )
+        else:
+            route = (
+                centered_similarity
+                * self.effective_route_prior_scale.reshape(1, self.H, 1, 1)
+            ).masked_fill(~valid_route, float("-inf"))
         semantic_chunks = metadata.top_chunk_idx.to(torch.int64)
         semantic_similarity = torch.where(
             valid_route, selected_similarity, torch.zeros_like(selected_similarity)
@@ -5406,17 +6254,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         auxiliary = torch.zeros((), device=x.device, dtype=torch.float32)
         router_auxiliary: HISARouterAuxiliary | None = None
         if teacher_aux_active:
-            route_aux_teacher_key = (
-                base_global_key
-                if self.route_aux_teacher_from_base_global_key
-                else global_key
-            )
             router_auxiliary = _router_auxiliary_loss(
                 query_normalized,
                 routing_addresses,
                 query,
-                route_aux_teacher_key,
-                deterministic_metadata,
+                route_teacher_key.detach(),
+                local_key.detach(),
+                global_key.detach(),
+                metadata,
                 self.route_prior_scale,
                 samples=self.route_aux_samples,
                 route_slots=self.top_k_chunks,
@@ -5426,9 +6271,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 oracle_temperature=self.route_aux_oracle_temperature,
                 teacher_mode=self.route_aux_teacher,
                 coverage_weight=self.route_aux_coverage_weight,
+                parent_aux_weight=self.parent_route_aux_weight,
+                parent_coherence_weight=self.parent_coherence_weight,
                 representative_reduction=self.representative_score_reduction,
                 representative_temperature=self.representative_lse_temperature,
                 coherence_weight=self.representative_coherence_weight,
+                coherence_log_floor=self.coherence_log_floor,
+                lane_count_normalization=self.lane_teacher_count_normalization,
                 tile_ids=route_aux_tile_ids,
             )
             auxiliary = auxiliary + self.route_aux_weight * router_auxiliary.loss
@@ -5443,6 +6292,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     reduction=self.representative_score_reduction,
                     temperature=self.representative_lse_temperature,
                     coherence_weight=self.representative_coherence_weight.detach(),
+                    coherence_log_floor=self.coherence_log_floor,
                 ).detach()
 
         local_output, local_lse = self._local_lane(
@@ -5502,9 +6352,15 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if router_auxiliary is not None and self.global_mass_aux_weight > 0.0:
             sampled_ids = router_auxiliary.sampled_tile_ids
             if sampled_ids.numel() > 0:
-                predicted_global = head_global_mass[:, :, sampled_ids].float().clamp(1e-6, 1.0 - 1e-6)
-                predicted_global_logits = torch.logit(predicted_global)
-                target_global = router_auxiliary.teacher_global_mass.detach().float().clamp(0.0, 1.0)
+                predicted_global_logits = (
+                    global_lse.float() - local_lse.float()
+                )[:, :, sampled_ids]
+                predicted_global_logits = torch.nan_to_num(
+                    predicted_global_logits, nan=0.0, posinf=20.0, neginf=-20.0
+                ).clamp(-20.0, 20.0)
+                target_global = (
+                    router_auxiliary.teacher_selected_global_mass.detach().float()
+                ).clamp(0.0, 1.0)
                 global_mass_loss = F.binary_cross_entropy_with_logits(
                     predicted_global_logits, target_global, reduction="mean"
                 )
@@ -5542,23 +6398,24 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     absolute_route_summary,
                 )
             if (
-                self.training and self.binding_null_aux_weight > 0.0
+                self.training
+                and self.binding_null_aux_weight > 0.0
                 and null_log_odds is not None
+                and router_auxiliary is not None
+                and router_auxiliary.sampled_tile_ids.numel() > 0
             ):
-                positions = torch.arange(seq_len, device=x.device).reshape(1, 1, -1)
-                valid_rows = (positions > 0) & (positions < lengths.reshape(batch_size, 1, 1))
-                target_null = (1.0 - head_global_mass.detach().float()).clamp(0.0, 1.0)
-                safe_null_log_odds = torch.nan_to_num(
-                    null_log_odds.float(), nan=0.0, posinf=20.0, neginf=-20.0
+                sampled_ids = router_auxiliary.sampled_tile_ids
+                predicted_null_logits = torch.nan_to_num(
+                    null_log_odds[:, :, sampled_ids].float(),
+                    nan=0.0, posinf=20.0, neginf=-20.0,
                 ).clamp(-20.0, 20.0)
-                per_row_null = F.binary_cross_entropy_with_logits(
-                    safe_null_log_odds,
-                    target_null,
-                    reduction="none",
+                target_null = (
+                    1.0
+                    - router_auxiliary.teacher_selected_global_mass.detach().float()
+                ).clamp(0.0, 1.0)
+                null_loss = F.binary_cross_entropy_with_logits(
+                    predicted_null_logits, target_null, reduction="mean"
                 )
-                null_loss = torch.where(
-                    valid_rows, per_row_null, torch.zeros_like(per_row_null)
-                ).sum() / valid_rows.sum().clamp_min(1)
                 auxiliary = auxiliary + self.binding_null_aux_weight * null_loss
             else:
                 null_loss = auxiliary.new_zeros(())
@@ -5619,8 +6476,36 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         / route_count
                     ),
                     "route_prior_scale_mean": self.route_prior_scale.mean(),
-                    "representative_coherence_weight_mean": self.representative_coherence_weight.mean(),
+                    "representative_coherence_weight_mean": (
+                        self.representative_coherence_weight.mean()
+                    ),
+                    "parent_coherence_weight_mean": self.parent_coherence_weight.mean(),
                     "count_correction_scale_mean": self.count_correction_scale.mean(),
+                    "router_query_adapter_rms": (
+                        torch.zeros((), device=x.device)
+                        if router_q_delta is None
+                        else router_q_delta.float().square().mean().sqrt()
+                    ),
+                    "router_key_adapter_rms": (
+                        torch.zeros((), device=x.device)
+                        if router_k_delta is None
+                        else router_k_delta.float().square().mean().sqrt()
+                    ),
+                    "binder_gain": (
+                        torch.zeros((), device=x.device)
+                        if self.binding_gain_raw is None
+                        else torch.sigmoid(self.binding_gain_raw.float())
+                    ),
+                    "binder_correction_rms": binding_correction.float().square().mean().sqrt(),
+                    "binder_to_attention_rms_ratio": (
+                        binding_correction.float().square().mean().sqrt()
+                        / projected.float().square().mean().sqrt().clamp_min(1e-12)
+                    ),
+                    "binder_null_probability_mean": (
+                        torch.ones((), device=x.device)
+                        if null_probability is None
+                        else null_probability.float().mean()
+                    ),
                     "global_lane_logit_bias_mean": self.bounded_global_lane_logit_bias.mean(),
                     "route_confidence_offset_mean": torch.where(
                         (semantic_chunks >= 0).any(-1), route_confidence_offset,
@@ -5642,9 +6527,60 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         auxiliary.new_zeros(()) if router_auxiliary is None
                         else router_auxiliary.loss
                     ),
+                    "router_child_cross_entropy": (
+                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        else router_auxiliary.cross_entropy
+                    ),
+                    "router_parent_cross_entropy": (
+                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        else router_auxiliary.parent_cross_entropy
+                    ),
+                    "teacher_full_global_mass_mean": (
+                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        else router_auxiliary.teacher_full_global_mass.mean()
+                    ),
+                    "teacher_selected_global_mass_mean": (
+                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        else router_auxiliary.teacher_selected_global_mass.mean()
+                    ),
+                    "teacher_capture_fraction_mean": (
+                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        else router_auxiliary.teacher_capture_fraction.mean()
+                    ),
                     "global_mass_auxiliary_loss": global_mass_loss,
                     "binding_null_auxiliary_loss": null_loss,
                 }
+                if router_auxiliary is not None and router_auxiliary.sampled_tile_ids.numel():
+                    sampled_ids = router_auxiliary.sampled_tile_ids
+                    teacher = router_auxiliary.teacher_mass
+                    candidates = deterministic_candidates.top_chunk_idx[:, :, sampled_ids]
+                    final_selected = metadata.top_chunk_idx[:, :, sampled_ids]
+                    candidate_mass = torch.gather(
+                        teacher, -1, candidates.clamp_min(0).long()
+                    ).masked_fill(candidates < 0, 0.0).sum(-1).clamp_max(1.0)
+                    final_mass = torch.gather(
+                        teacher, -1, final_selected.clamp_min(0).long()
+                    ).masked_fill(final_selected < 0, 0.0).sum(-1).clamp_max(1.0)
+                    teacher_top = teacher.argmax(-1)
+                    candidate_parent = torch.div(
+                        candidates.clamp_min(0).long(),
+                        max(1, self.hierarchy_group_size),
+                        rounding_mode="floor",
+                    )
+                    teacher_parent = torch.div(
+                        teacher_top,
+                        max(1, self.hierarchy_group_size),
+                        rounding_mode="floor",
+                    )
+                    parent_retained = (
+                        (candidate_parent == teacher_parent[..., None])
+                        & (candidates >= 0)
+                    ).any(-1)
+                    diagnostics["teacher_mass_after_top_m"] = candidate_mass.mean()
+                    diagnostics["teacher_mass_after_final_top_k"] = final_mass.mean()
+                    diagnostics["teacher_top_child_parent_retained"] = (
+                        parent_retained.float().mean()
+                    )
                 if exact_candidate_lse is not None:
                     finite_exact = torch.isfinite(exact_candidate_lse)
                     diagnostics["exact_candidate_page_lse_mean"] = torch.where(
@@ -5728,16 +6664,19 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             pending_base_global_key=empty_tokens.clone(),
             pending_global_key=empty_tokens.clone(),
             pending_global_value=empty_tokens.clone(),
+            pending_routing_key=empty_tokens.clone(),
             completed_base_global_key=empty_pages,
             completed_global_key=empty_pages.clone(),
             completed_global_value=empty_pages.clone(),
+            completed_routing_key=empty_pages.clone(),
             completed_routing_addresses=routing_addresses,
             completed_attention_addresses=attention_addresses,
         )
 
     def _incremental_candidate_chunks(
         self,
-        query: torch.Tensor,
+        routing_query: torch.Tensor,
+        attention_query: torch.Tensor,
         addresses: HISAChunkAddresses,
         global_key_pages: torch.Tensor,
         *,
@@ -5745,7 +6684,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         secondary_addresses: HISAChunkAddresses | None = None,
     ) -> torch.Tensor:
         """Apply parent→child top-M and exact reranking to one incremental row."""
-        query_normalized = _normalized_routing_query(query)
+        query_normalized = _normalized_routing_query(routing_query)
         batch_size, heads = query_normalized.shape[:2]
         child_count = addresses.values.shape[2]
         if eligible_count <= 0 or child_count == 0:
@@ -5763,6 +6702,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 reduction=self.representative_score_reduction,
                 temperature=self.representative_lse_temperature,
                 coherence_weight=self.representative_coherence_weight,
+                coherence_log_floor=self.coherence_log_floor,
             )
             chunk_ids = torch.arange(
                 child_count, device=query_normalized.device, dtype=torch.int64
@@ -5785,10 +6725,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         source.parent_values,
                         reduction="max",
                         temperature=1.0,
-                    ) + _coherence_score_correction(
-                        source.parent_coherence,
-                        self.representative_coherence_weight,
-                    )[:, :, None, :]
+                        coherence=source.parent_coherence,
+                        coherence_weight=self.parent_coherence_weight,
+                        coherence_log_floor=self.coherence_log_floor,
+                    )
                     parent_ids = torch.arange(
                         source.parent_values.shape[2],
                         device=query_normalized.device,
@@ -5869,7 +6809,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         selected_pages = torch.gather(expanded_pages, 3, gather_index)
         token_scores = torch.einsum(
-            "bhqd,bhqkmd->bhqkm", query.float(), selected_pages.float()
+            "bhqd,bhqkmd->bhqkm", attention_query.float(), selected_pages.float()
         ) / math.sqrt(self.hd)
         exact_lse = torch.logsumexp(token_scores, dim=-1).masked_fill(
             coarse_candidates < 0, float("-inf")
@@ -5939,6 +6879,23 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             one = torch.ones(batch_size, device=x_t.device, dtype=torch.int32)
             global_key_t = _rms_match_global_key(global_key_t, local_key_t, one)
 
+        routing_key_core_t = (
+            base_global_key_t if self.route_from_base_global_key else global_key_t
+        )
+        routing_query_t = query
+        routing_key_t = routing_key_core_t
+        if self.router_adapter_rank:
+            assert self.router_q_down is not None and self.router_q_up is not None
+            assert self.router_k_down is not None and self.router_k_up is not None
+            routing_query_t = routing_query_t + _to_heads(
+                self.router_q_up(self.router_q_down(x_t)),
+                batch_size, 1, self.H, self.hd,
+            )
+            routing_key_t = routing_key_t + _to_heads(
+                self.router_k_up(self.router_k_down(x_t)),
+                batch_size, 1, self.H, self.hd,
+            )
+
         if state.local_key.shape[2] == 0:
             local_output = torch.zeros_like(query)
             local_lse = torch.full(
@@ -5980,7 +6937,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         else:
             addresses = state.completed_routing_addresses
             attention_addresses = state.completed_attention_addresses
-            q_normalized = _normalized_routing_query(query)
+            q_normalized = _normalized_routing_query(routing_query_t)
             secondary_addresses = (
                 attention_addresses
                 if (
@@ -5991,6 +6948,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 else None
             )
             selected_chunks = self._incremental_candidate_chunks(
+                routing_query_t,
                 query,
                 addresses,
                 state.completed_global_key,
@@ -6021,9 +6979,16 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             centered = torch.where(
                 valid_route, similarity - mean, torch.zeros_like(similarity)
             )
-            route = (
-                centered * self.effective_route_prior_scale.reshape(1, self.H, 1, 1)
-            ).masked_fill(~valid_route, float("-inf"))
+            if self.exact_page_rerank and not self.representative_prior_after_exact_rerank:
+                route = torch.where(
+                    valid_route, torch.zeros_like(centered),
+                    torch.full_like(centered, float("-inf")),
+                )
+            else:
+                route = (
+                    centered
+                    * self.effective_route_prior_scale.reshape(1, self.H, 1, 1)
+                ).masked_fill(~valid_route, float("-inf"))
             semantic_similarity = torch.where(
                 valid_route, similarity, torch.zeros_like(similarity)
             )
@@ -6119,7 +7084,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 route_evidence.lse.float() - combined_lse.float()[..., None],
                 torch.full_like(route_evidence.lse.float(), float("-inf")),
             )
-            binding_correction, _ = self._binding_correction(
+            binding_correction, _, _ = self._binding_correction(
                 x_t,
                 route_evidence.output,
                 route_log_mass,
@@ -6149,9 +7114,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         pending_global_value = torch.cat(
             (state.pending_global_value, global_value_t), dim=2
         )
+        pending_routing_key = torch.cat(
+            (state.pending_routing_key, routing_key_t), dim=2
+        )
         completed_base = state.completed_base_global_key
         completed_key = state.completed_global_key
         completed_value = state.completed_global_value
+        completed_routing_key = state.completed_routing_key
         routing_address_cache = state.completed_routing_addresses
         attention_address_cache = state.completed_attention_addresses
         if pending_global_key.shape[2] == self.chunk_size:
@@ -6172,20 +7141,21 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 blend_alpha=self.representative_blend_for_addresses,
                 mode=self.representative_mode,
             )
-            if self.route_from_base_global_key:
-                routing_address_cache = _append_incremental_address_cache(
-                    routing_address_cache,
-                    pending_base_global_key,
-                    completed_base,
-                    chunk_size=self.chunk_size,
-                    blend_alpha=self.representative_blend_for_addresses,
-                    mode=self.representative_mode,
-                )
-            else:
-                routing_address_cache = attention_address_cache
+            completed_routing_key = torch.cat(
+                (completed_routing_key, pending_routing_key.unsqueeze(2)), dim=2
+            )
+            routing_address_cache = _append_incremental_address_cache(
+                routing_address_cache,
+                pending_routing_key,
+                completed_routing_key,
+                chunk_size=self.chunk_size,
+                blend_alpha=self.representative_blend_for_addresses,
+                mode=self.representative_mode,
+            )
             pending_base_global_key = pending_base_global_key[:, :, :0]
             pending_global_key = pending_global_key[:, :, :0]
             pending_global_value = pending_global_value[:, :, :0]
+            pending_routing_key = pending_routing_key[:, :, :0]
         elif pending_global_key.shape[2] > self.chunk_size:
             raise RuntimeError("incremental pending page exceeded chunk_size")
 
@@ -6197,9 +7167,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             pending_base_global_key=pending_base_global_key,
             pending_global_key=pending_global_key,
             pending_global_value=pending_global_value,
+            pending_routing_key=pending_routing_key,
             completed_base_global_key=completed_base,
             completed_global_key=completed_key,
             completed_global_value=completed_value,
+            completed_routing_key=completed_routing_key,
             completed_routing_addresses=routing_address_cache,
             completed_attention_addresses=attention_address_cache,
         )

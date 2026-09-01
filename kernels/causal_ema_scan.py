@@ -11,6 +11,7 @@ __all__ = (
     "causal_ema_scan3",
     "inverse_bounded_ema_factor",
     "causal_ema_triton_available",
+    "causal_ema_execution_config",
 )
 
 try:
@@ -33,6 +34,15 @@ def causal_ema_triton_available() -> bool:
     return bool(_TRITON_AVAILABLE)
 
 
+def causal_ema_execution_config() -> dict[str, object]:
+    return {
+        "backend": "triton_autotune" if _TRITON_AVAILABLE else "cpu_reference",
+        "dimension_blocks": (32, 64),
+        "serial_sequence_scan": True,
+        "fp32_recurrence_accumulation": True,
+    }
+
+
 def bounded_ema_factor(raw: torch.Tensor) -> torch.Tensor:
     """Map an unconstrained parameter into the supported EMA range."""
     return EMA_FLOOR + (EMA_CEILING - EMA_FLOOR) * torch.sigmoid(raw)
@@ -51,6 +61,17 @@ def inverse_bounded_ema_factor(ema_factor: float) -> float:
 
 if _TRITON_AVAILABLE:
 
+    _EMA_AUTOTUNE_CONFIGS = [
+        triton.Config({"BD": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BD": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BD": 64}, num_warps=4, num_stages=1),
+    ]
+
+    @triton.autotune(
+        configs=_EMA_AUTOTUNE_CONFIGS,
+        key=["N", "D"],
+        cache_results=True,
+    )
     @triton.jit
     def _ema3_fwd_serial(
         X,
@@ -98,6 +119,12 @@ if _TRITON_AVAILABLE:
             s1 = a1 * value + q1 * s1
             s2 = a2 * value + q2 * s2
 
+    @triton.autotune(
+        configs=_EMA_AUTOTUNE_CONFIGS,
+        key=["N", "D", "COMPUTE_DA"],
+        reset_to_zero=["DA"],
+        cache_results=True,
+    )
     @triton.jit
     def _ema3_bwd_serial(
         X,
@@ -208,8 +235,8 @@ class _CausalEMA3Fn(torch.autograd.Function):
             .contiguous()
         )
         output = torch.empty((batch, seq_len, 3, width), device=x.device, dtype=x.dtype)
-        programs = batch * triton.cdiv(width, BLOCK_D)
-        _ema3_fwd_serial[(programs,)](
+        grid = lambda meta: (batch * triton.cdiv(width, meta["BD"]),)
+        _ema3_fwd_serial[grid](
             x,
             output,
             alpha,
@@ -217,9 +244,6 @@ class _CausalEMA3Fn(torch.autograd.Function):
             width,
             *x.stride(),
             *output.stride(),
-            BD=BLOCK_D,
-            num_warps=4,
-            num_stages=1,
         )
         ctx.save_for_backward(x, output, ema_factors, alpha)
         return output
@@ -232,8 +256,8 @@ class _CausalEMA3Fn(torch.autograd.Function):
         dx = torch.empty_like(x)
         need_da = bool(ctx.needs_input_grad[1])
         da = torch.zeros_like(alpha)
-        programs = batch * triton.cdiv(width, BLOCK_D)
-        _ema3_bwd_serial[(programs,)](
+        grid = lambda meta: (batch * triton.cdiv(width, meta["BD"]),)
+        _ema3_bwd_serial[grid](
             x,
             output,
             dy,
@@ -246,10 +270,7 @@ class _CausalEMA3Fn(torch.autograd.Function):
             *output.stride(),
             *dy.stride(),
             *dx.stride(),
-            BD=BLOCK_D,
             COMPUTE_DA=need_da,
-            num_warps=4,
-            num_stages=1,
         )
         if not need_da:
             return dx, None

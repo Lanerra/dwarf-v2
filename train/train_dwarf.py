@@ -4,18 +4,21 @@
 The model is D512/H8/L24/FFN2048 with bounded-routing DSQG V23 blocks and
 strict-causal optimized HISA V19 global mixers at layers 3, 10, and 17.
 Independent causal-EMA K/V packets live at L3 and L17; L10 is ordinary HISA.
-At L17, base global K owns candidates, exact page reranking, route priors, and
-router supervision. Packet-rotated K/V are consumed only after hard route
-membership is fixed; the prior dual-source route remains an explicit ablation.
+At L17, the frozen-base route stream owns coarse candidates, exact reranking, and
+route supervision; packet-rotated K/V remain the executed global attention stream.
+Dedicated route adapters isolate route distillation from core token Q/K geometry.
 
-The trainer accepts packed token rows and includes Muon+AdamW, WSD, deterministic
-row selection, atomic resumable checkpoints, and the complete model definition.
-Dataset preparation and evaluation remain out of scope.
+The trainer accepts fixed token rows, rejects internal document boundaries by
+default, and includes Muon+AdamW, WSD, deterministic row selection, atomic
+resumable checkpoints, and the complete model definition. Deep diagnostics remain
+available behind an explicit flag; the full-throughput default performs no second
+telemetry forward. Dataset preparation and evaluation remain out of scope.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import hashlib
 import importlib.metadata
@@ -74,6 +77,7 @@ for directory in kernel_import_directories:
 from causal_ema_scan import (  # noqa: E402
     bounded_ema_factor,
     causal_ema_scan3,
+    causal_ema_execution_config,
     causal_ema_triton_available,
     inverse_bounded_ema_factor,
 )
@@ -104,43 +108,37 @@ else:
     )
 
 CHECKPOINT_KIND = (
-    "dwarf-l24-l17-basek-routepolicy-public-packed-"
-    "dsqgv23-hisav19qv3-resume-v1"
+    "dwarf-l24-l17-basek-routepolicy-single-document-"
+    "dsqgv23band-hisav19qv4-resume-v1"
 )
 CANONICAL_PARENT_CHECKPOINT_KIND = (
     "dwarf-l24-l17-basek-route-appendable-prefix-stable-dsqgv23-hisav19-resume-v1"
 )
 RELEASE_KIND = (
-    "dwarf-l24-l17-basek-routepolicy-dsqgv23-hisav19qv3-weights-v1"
+    "dwarf-l24-l17-basek-routepolicy-single-document-dsqgv23band-hisav19qv4-weights-v1"
 )
-LEGACY_HISA_V2_CHECKPOINT_KINDS = frozenset(
+LEGACY_HISA_CHECKPOINT_KINDS = frozenset(
     {
         "dwarf-l24-l17-basek-route-public-packed-dsqgv23-hisav19-resume-v1",
         CANONICAL_PARENT_CHECKPOINT_KIND,
         "dwarf-l24-l17-basek-route-dsqgv23-hisav19-weights-v1",
-    }
-)
-INCOMPATIBLE_HISA_V3_CHECKPOINT_POLICIES = frozenset(
-    {HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE}
-)
-INCOMPATIBLE_HISA_V3_CHECKPOINT_KINDS = frozenset(
-    {
+        "dwarf-l24-l17-basek-routepolicy-public-packed-dsqgv23-hisav19qv3-resume-v1",
+        "dwarf-l24-l17-basek-routepolicy-dsqgv23-hisav19qv3-weights-v1",
         "dwarf-l24-l17-basek-dualsource-public-packed-dsqgv23-hisav19qv3-resume-v1",
         "dwarf-l24-l17-basek-dualsource-dsqgv23-hisav19qv3-weights-v1",
     }
 )
 ROUTE_AUX_RECIPE_SEED = 20_260_809
-EXPECTED_PARAMETERS = 100_093_813
-EXPECTED_TRAINABLE_PARAMETERS = 100_093_773
-EXPECTED_STATE_FINGERPRINT = (
-    "cd6e6d1ea9b8e25f8b4b601a3c043c530df1d6d4f3ae93e6f07b51043b68f78d"
-)
-EXPECTED_SEEDED_RNG_FINGERPRINT = (
-    "9b349eec24e6c72fc0e50c23bc8310e0c970bb1db9fe1cdeb49ffc072a49ccfe"
-)
-EXPECTED_HISA_SOURCE_SHA256 = (
-    "09ccc592835e247e1596563e994e04b650248122ee423a9351597a3f4ee31d22"
-)
+EXPECTED_PARAMETERS = 100_290_445
+EXPECTED_TRAINABLE_PARAMETERS = 100_290_405
+EXPECTED_STATE_FINGERPRINT = "099c313d786bc6879926c842f479cf45c84954cf3612bac4a4b656578518960a"
+EXPECTED_SEEDED_RNG_FINGERPRINT = "ba02b103e767eb3ccc7420da1e82900f816843d5ac49aa42e82f87b7d7405f63"
+EXPECTED_SOURCE_AST_SHA256: dict[str, str] = {
+    "train/train_dwarf.py": "bbadffa65f80073d92117bca6d70ceb0d93f4a43ee2e96f24c2fa6a3a41f7b9d",
+    "kernels/causal_ema_scan.py": "32708b361ad30ed393d7a135c70d603cc078ec64957fec50050a841bd96a30bf",
+    "kernels/dsqg_attention_v23.py": "60e3fa45b5aaf476b0802e06b8fd4067092e14bfd3dd5dd165a33b4d78cdc6d3",
+    "kernels/hierarchical_sparse_attn_v19_hisa.py": "bfa7715f46c1dd9c2f746012e498b909a9d85e0cd61302140702d91e6196854b",
+}
 CANONICAL_TOKENIZER_SHA256 = (
     "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
 )
@@ -149,8 +147,8 @@ CANONICAL_TOKENIZER_SHA256 = (
 @dataclass(frozen=True)
 class TrainRecipe:
     learning_rate: float = 3.0e-4
-    batch_size: int = 8
-    grad_accum_steps: int = 16
+    batch_size: int = 16
+    grad_accum_steps: int = 8
     # One schedule identity spans the complete appendable 20B stable-LR trunk.
     steps: int = 76_331
     warmup_steps: int = 1_527
@@ -189,6 +187,7 @@ class DwarfConfig:
     dropout: float = 0.05
     min_offset_support: int = 64
     dsqg_backend: str = "triton"
+    dsqg_support_band_execution: bool = True
     hisa_chunk_size: int = 32
     top_k_chunks: int = 4
     hisa_top_m_tokens: int = 32
@@ -214,6 +213,8 @@ class DwarfConfig:
     hisa_route_aux_oracle_temperature: float = 0.3
     hisa_route_aux_teacher: str = "dense_attention"
     hisa_route_aux_coverage_weight: float = 0.0
+    hisa_parent_route_aux_weight: float = 0.25
+    hisa_lane_teacher_count_normalization: bool = True
     hisa_global_mass_aux_weight: float = 0.01
     hisa_binding_null_aux_weight: float = 0.002
     hisa_require_auxiliary_return: bool = True
@@ -222,19 +223,26 @@ class DwarfConfig:
     hisa_representative_score_reduction: str = "logsumexp"
     hisa_representative_lse_temperature: float = 0.5
     hisa_coherence_score_max_weight: float = 1.0
-    hisa_coherence_score_initial_weight: float = 0.25
+    hisa_coherence_score_initial_weight: float = 0.20
+    hisa_parent_coherence_score_max_weight: float = 0.5
+    hisa_parent_coherence_score_initial_weight: float = 0.025
+    hisa_coherence_log_floor: float = -2.0
     hisa_routing_candidate_multiplier: int = 2
     hisa_routing_stream_block_size: int = 16
     hisa_hierarchical_routing: bool = True
     hisa_hierarchy_group_size: int = 4
     hisa_parent_top_k: int = 3
     hisa_exact_page_rerank: bool = True
+    hisa_representative_prior_after_exact_rerank: bool = False
     hisa_exploration_probability: float = 0.10
-    hisa_exploration_policy: str = "tail_softmax"
+    hisa_exploration_policy: str = "candidate_tail"
     hisa_exploration_temperature: float = 1.0
+    hisa_exploration_uniform_global_fraction: float = 0.10
     hisa_exploration_final_probability: float = 0.0
     hisa_exploration_anneal_steps: int = 10_000
     hisa_global_key_calibration: str = "none"
+    hisa_router_adapter_rank: int = 32
+    hisa_route_aux_detach_core_qk: bool = True
     hisa_backend: str = "triton"
     hisa_token_selection_mode: str = "auto"
     hisa_local_backend: str = "flex"
@@ -300,6 +308,8 @@ class DwarfConfig:
             raise ValueError("HISA requires a power-of-two head dimension")
         if self.dsqg_backend not in {"auto", "eager", "triton"}:
             raise ValueError("DSQG backend must be auto, eager, or triton")
+        if not isinstance(self.dsqg_support_band_execution, bool):
+            raise TypeError("DSQG support-band execution flag must be bool")
         if min(
             self.hisa_chunk_size,
             self.hisa_local_window,
@@ -332,8 +342,12 @@ class DwarfConfig:
         }.items():
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"HISA {name} must be finite and positive")
-        if self.hisa_global_adapter_rank < 0 or self.hisa_binding_rank < 0:
-            raise ValueError("HISA adapter and binding ranks must be non-negative")
+        if (
+            self.hisa_global_adapter_rank < 0
+            or self.hisa_router_adapter_rank < 0
+            or self.hisa_binding_rank < 0
+        ):
+            raise ValueError("HISA global/router/binding ranks must be non-negative")
         if self.hisa_base_k_route_source_policy not in {
             HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
             HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE,
@@ -353,6 +367,7 @@ class DwarfConfig:
         for name, value in {
             "route auxiliary": self.hisa_route_aux_weight,
             "route coverage auxiliary": self.hisa_route_aux_coverage_weight,
+            "parent route auxiliary": self.hisa_parent_route_aux_weight,
             "global-mass auxiliary": self.hisa_global_mass_aux_weight,
             "binding-null auxiliary": self.hisa_binding_null_aux_weight,
         }.items():
@@ -402,6 +417,17 @@ class DwarfConfig:
         ):
             raise ValueError("HISA coherence calibration bounds are invalid")
         if (
+            not math.isfinite(self.hisa_parent_coherence_score_max_weight)
+            or self.hisa_parent_coherence_score_max_weight <= 0
+            or not math.isfinite(self.hisa_parent_coherence_score_initial_weight)
+            or not 0.0
+            <= self.hisa_parent_coherence_score_initial_weight
+            <= self.hisa_parent_coherence_score_max_weight
+            or not math.isfinite(self.hisa_coherence_log_floor)
+            or self.hisa_coherence_log_floor >= 0.0
+        ):
+            raise ValueError("HISA parent coherence bounds are invalid")
+        if (
             self.hisa_routing_candidate_multiplier < 1
             or self.hisa_routing_stream_block_size < 1
             or self.hisa_hierarchy_group_size < 1
@@ -411,6 +437,13 @@ class DwarfConfig:
         for name, value in {
             "hierarchical routing": self.hisa_hierarchical_routing,
             "exact page rerank": self.hisa_exact_page_rerank,
+            "representative prior after exact rerank": (
+                self.hisa_representative_prior_after_exact_rerank
+            ),
+            "lane teacher count normalization": (
+                self.hisa_lane_teacher_count_normalization
+            ),
+            "route auxiliary detach core QK": self.hisa_route_aux_detach_core_qk,
         }.items():
             if not isinstance(value, bool):
                 raise TypeError(f"HISA {name} flag must be bool")
@@ -419,6 +452,7 @@ class DwarfConfig:
                 "canonical optimized HISA requires hierarchy and exact page reranking"
             )
         if self.hisa_exploration_policy not in {
+            "candidate_tail",
             "tail_softmax",
             "uniform_unseen_ablation",
         }:
@@ -430,6 +464,8 @@ class DwarfConfig:
             raise ValueError("HISA exploration temperature must be positive")
         if not 0.0 <= self.hisa_exploration_probability <= 1.0:
             raise ValueError("HISA initial exploration probability must be in [0,1]")
+        if not 0.0 <= self.hisa_exploration_uniform_global_fraction <= 1.0:
+            raise ValueError("HISA exploration global fraction must be in [0,1]")
         if not 0.0 <= self.hisa_exploration_final_probability <= 1.0:
             raise ValueError("HISA final exploration probability must be in [0,1]")
         if self.hisa_exploration_anneal_steps < 0:
@@ -563,8 +599,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def source_manifest() -> dict[str, str]:
-    locations = {
+def source_locations() -> dict[str, Path]:
+    return {
         "train/train_dwarf.py": Path(__file__).resolve(),
         "kernels/causal_ema_scan.py": Path(
             sys.modules["causal_ema_scan"].__file__
@@ -576,22 +612,70 @@ def source_manifest() -> dict[str, str]:
             sys.modules["hierarchical_sparse_attn_v19_hisa"].__file__
         ).resolve(),
     }
-    return {name: _sha256(path) for name, path in locations.items()}
 
 
-def validate_canonical_kernel_sources() -> dict[str, str]:
-    """Require the exact CUDA-validated HISA source across Python runtimes."""
-    observed = source_manifest()
-    observed_source_sha256 = observed[
-        "kernels/hierarchical_sparse_attn_v19_hisa.py"
-    ]
-    if observed_source_sha256 != EXPECTED_HISA_SOURCE_SHA256:
+def source_manifest() -> dict[str, str]:
+    return {name: _sha256(path) for name, path in source_locations().items()}
+
+
+class _CanonicalSourceNormalizer(ast.NodeTransformer):
+    """Remove the self-referential expected-source table from AST identity."""
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        node = self.generic_visit(node)
+        if isinstance(node.target, ast.Name) and node.target.id == (
+            "EXPECTED_SOURCE_AST_SHA256"
+        ):
+            node.value = ast.Constant(value=None)
+        return node
+
+    def visit_Assign(self, node: ast.Assign):
+        node = self.generic_visit(node)
+        if any(
+            isinstance(target, ast.Name)
+            and target.id == "EXPECTED_SOURCE_AST_SHA256"
+            for target in node.targets
+        ):
+            node.value = ast.Constant(value=None)
+        return node
+
+
+def _semantic_ast_sha256(path: Path) -> str:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    normalized = _CanonicalSourceNormalizer().visit(tree)
+    ast.fix_missing_locations(normalized)
+    payload = ast.dump(
+        normalized, annotate_fields=True, include_attributes=False
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def source_semantic_manifest() -> dict[str, str]:
+    return {
+        name: _semantic_ast_sha256(path)
+        for name, path in source_locations().items()
+    }
+
+
+def validate_canonical_kernel_sources(
+    *, allow_mismatch: bool = False
+) -> dict[str, str]:
+    """Pin executable semantics for trainer, EMA, DSQG, and HISA together."""
+    observed = source_semantic_manifest()
+    if observed != EXPECTED_SOURCE_AST_SHA256 and not allow_mismatch:
+        mismatches = {
+            name: {
+                "expected": EXPECTED_SOURCE_AST_SHA256.get(name),
+                "observed": observed.get(name),
+            }
+            for name in sorted(set(observed) | set(EXPECTED_SOURCE_AST_SHA256))
+            if observed.get(name) != EXPECTED_SOURCE_AST_SHA256.get(name)
+        }
         raise RuntimeError(
-            "canonical CUDA-validated HISA source does not match; "
-            f"expected exact source {EXPECTED_HISA_SOURCE_SHA256}, "
-            f"observed {observed_source_sha256}"
+            "canonical executable source semantics do not match: "
+            + json.dumps(mismatches, sort_keys=True)
         )
-    return observed
+    return source_manifest()
 
 
 def _package_version(name: str) -> str | None:
@@ -675,8 +759,8 @@ def validate_optimized_hisa_contract(
 
     contract = hisa_integration_contract()
     expected = {
-        "hard_selector": "detached_streaming_top_m",
-        "selector_autograd": "selected_K_plus_sampled_auxiliary_rows_only",
+        "hard_selector": "detached_parent_child_top_m_exact_lse_top_k",
+        "selector_autograd": "direct_selected_address_scores_plus_sampled_auxiliary_rows",
         "hierarchical_routing": "completed_parent_groups_then_child_candidates",
         "exact_page_rerank": "token_level_lse_over_top_m_candidates",
         "aggregate_only_specialization": True,
@@ -792,6 +876,7 @@ def _architecture_without_sources(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("checkpoint architecture metadata is invalid")
     result = copy.deepcopy(value)
     result.pop("sources", None)
+    result.pop("source_semantics", None)
     return result
 
 
@@ -1010,7 +1095,7 @@ def assert_public_kernel_contracts() -> None:
         hisa = HierarchicalSparseAttentionV19HISACausal(**hisa_kwargs).train()
         hisa.representative_mix_raw.requires_grad_(False)
         hisa_input = torch.randn(2, 64, 64, requires_grad=True)
-        auxiliary_ids = torch.tensor((40, 47), dtype=torch.int64)
+        auxiliary_ids = torch.tensor((48, 56), dtype=torch.int64)
         hisa_output, hisa_auxiliary = hisa(
             hisa_input,
             route_aux_tile_ids=auxiliary_ids,
@@ -1069,11 +1154,39 @@ def assert_public_kernel_contracts() -> None:
             "HISA causal prefix has a future-token gradient",
         )
 
+        with torch.no_grad():
+            incremental_input = torch.randn(1, 64, 64)
+            full_incremental_reference = hisa(incremental_input)
+            incremental_state = hisa.init_incremental_state(
+                1,
+                device=incremental_input.device,
+                dtype=incremental_input.dtype,
+            )
+            incremental_rows: list[torch.Tensor] = []
+            for position in range(incremental_input.shape[1]):
+                row, incremental_state = hisa.forward_incremental(
+                    incremental_input[:, position : position + 1],
+                    incremental_state,
+                )
+                incremental_rows.append(row)
+            incremental_output = torch.cat(incremental_rows, dim=1)
+        _require_close(
+            incremental_output,
+            full_incremental_reference,
+            atol=5e-6,
+            rtol=5e-6,
+            message="HISA full-prefix/incremental execution diverged",
+        )
+
+        temperature_kwargs = {
+            **hisa_kwargs,
+            "representative_prior_after_exact_rerank": True,
+        }
         cold = HierarchicalSparseAttentionV19HISACausal(
-            **hisa_kwargs, temperature=0.5
+            **temperature_kwargs, temperature=0.5
         ).eval()
         hot = HierarchicalSparseAttentionV19HISACausal(
-            **hisa_kwargs, temperature=2.0
+            **temperature_kwargs, temperature=2.0
         ).eval()
         hot.load_state_dict(cold.state_dict(), strict=True)
         control_input = torch.randn(1, 64, 64)
@@ -1154,12 +1267,20 @@ class InterferencePacket(nn.Module):
         self.kv_proj = nn.Linear(config.embedding_dim, 2 * config.embedding_dim, bias=False)
         with torch.no_grad():
             self.gate_proj.bias.fill_(-2.0)
+        self._diagnostics: dict[str, torch.Tensor] = {}
 
     @property
     def ema_factors(self) -> torch.Tensor:
         return bounded_ema_factor(self.ema_raw)
 
-    def forward(self, normalized: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        normalized: torch.Tensor,
+        *,
+        collect_diagnostics: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not torch.compiler.is_compiling():
+            self._diagnostics = {}
         scan_input = normalized.to(torch.bfloat16) if normalized.is_cuda else normalized
         scans = causal_ema_scan3(scan_input, self.ema_factors)
         batch, seq_len, _ = normalized.shape
@@ -1191,6 +1312,21 @@ class InterferencePacket(nn.Module):
         value_delta = value_delta.reshape(
             batch, seq_len, self.heads, self.head_dim
         ).permute(0, 2, 1, 3)
+        if collect_diagnostics and not torch.compiler.is_compiling():
+            with torch.no_grad():
+                rms_flat = rms.reshape(-1).float()
+                confidence_flat = confidence.reshape(-1).float()
+                self._diagnostics = {
+                    "ema_pooled_rms_p50": torch.quantile(rms_flat, 0.50),
+                    "ema_pooled_rms_p90": torch.quantile(rms_flat, 0.90),
+                    "ema_pooled_rms_p99": torch.quantile(rms_flat, 0.99),
+                    "ema_confidence_saturation_fraction": (
+                        confidence_flat > 0.9
+                    ).float().mean(),
+                    "ema_packet_rms": packet.float().square().mean().sqrt(),
+                    "ema_key_delta_rms": key_delta.float().square().mean().sqrt(),
+                    "ema_value_delta_rms": value_delta.float().square().mean().sqrt(),
+                }
         return key_delta, value_delta
 
 
@@ -1217,6 +1353,7 @@ class DSQGBlock(nn.Module):
             pos_bias_max_slope=0.75,
             pos_bias_residual_limit=1.5,
             backend=config.dsqg_backend,
+            support_band_execution=config.dsqg_support_band_execution,
             # Every canonical group contains offsets 1..8, so projection cropping
             # can never activate and only creates a misleading execution surface.
             support_crop_projections=False,
@@ -1276,12 +1413,22 @@ class GlobalMixerBlock(nn.Module):
             coherence_score_initial_weight=(
                 config.hisa_coherence_score_initial_weight
             ),
+            parent_coherence_score_max_weight=(
+                config.hisa_parent_coherence_score_max_weight
+            ),
+            parent_coherence_score_initial_weight=(
+                config.hisa_parent_coherence_score_initial_weight
+            ),
+            coherence_log_floor=config.hisa_coherence_log_floor,
             routing_candidate_multiplier=config.hisa_routing_candidate_multiplier,
             routing_stream_block_size=config.hisa_routing_stream_block_size,
             hierarchical_routing=config.hisa_hierarchical_routing,
             hierarchy_group_size=config.hisa_hierarchy_group_size,
             parent_top_k=config.hisa_parent_top_k,
             exact_page_rerank=config.hisa_exact_page_rerank,
+            representative_prior_after_exact_rerank=(
+                config.hisa_representative_prior_after_exact_rerank
+            ),
             route_prior_scale=config.hisa_route_prior_scale,
             route_prior_max_scale=config.hisa_route_prior_max_scale,
             global_lane_bias_limit=config.hisa_global_lane_bias_limit,
@@ -1294,18 +1441,27 @@ class GlobalMixerBlock(nn.Module):
             route_aux_oracle_temperature=config.hisa_route_aux_oracle_temperature,
             route_aux_teacher=config.hisa_route_aux_teacher,
             route_aux_coverage_weight=config.hisa_route_aux_coverage_weight,
+            parent_route_aux_weight=config.hisa_parent_route_aux_weight,
+            lane_teacher_count_normalization=(
+                config.hisa_lane_teacher_count_normalization
+            ),
             global_mass_aux_weight=config.hisa_global_mass_aux_weight,
             binding_null_aux_weight=config.hisa_binding_null_aux_weight,
             require_auxiliary_return=config.hisa_require_auxiliary_return,
             exploration_probability=config.hisa_exploration_probability,
             exploration_policy=config.hisa_exploration_policy,
             exploration_temperature=config.hisa_exploration_temperature,
+            exploration_uniform_global_fraction=(
+                config.hisa_exploration_uniform_global_fraction
+            ),
             exploration_final_probability=(
                 config.hisa_exploration_final_probability
             ),
             exploration_anneal_steps=config.hisa_exploration_anneal_steps,
             global_adapter_rank=config.hisa_global_adapter_rank,
             global_key_calibration=config.hisa_global_key_calibration,
+            router_adapter_rank=config.hisa_router_adapter_rank,
+            route_aux_detach_core_qk=config.hisa_route_aux_detach_core_qk,
             binding_rank=config.hisa_binding_rank,
             count_correction_scale_limit=(
                 config.hisa_count_correction_scale_limit
@@ -1358,9 +1514,16 @@ class GlobalMixerBlock(nn.Module):
         collect_diagnostics: bool = False,
         token_ids: torch.Tensor | None = None,
         exploration_step: torch.Tensor | None = None,
+        exploration_probability_override: float | torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = self.norm1(x)
-        kv_inject = self.packet(normalized) if self.packet is not None else None
+        kv_inject = (
+            self.packet(
+                normalized, collect_diagnostics=collect_diagnostics
+            )
+            if self.packet is not None
+            else None
+        )
         attended, auxiliary = self.attn(
             normalized,
             kv_inject=kv_inject,
@@ -1368,6 +1531,7 @@ class GlobalMixerBlock(nn.Module):
             route_aux_tile_ids=route_aux_tile_ids,
             token_ids=token_ids,
             exploration_step=exploration_step,
+            exploration_probability_override=exploration_probability_override,
             collect_diagnostics=collect_diagnostics,
             return_auxiliary=True,
         )
@@ -1451,6 +1615,7 @@ class DwarfForCausalLM(nn.Module):
                         module.scale_embed.sub_(module.scale_embed.mean(0, keepdim=True))
                 elif isinstance(module, HierarchicalSparseAttentionV19HISACausal):
                     module.initialize_global_adapter_up_()
+                    module.initialize_router_adapter_up_()
                     module.reset_binding_parameters_()
                 elif isinstance(module, InterferencePacket):
                     with torch.no_grad():
@@ -1473,6 +1638,7 @@ class DwarfForCausalLM(nn.Module):
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         exploration_step: torch.Tensor | None = None,
+        exploration_probability_override: float | torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_auxiliary: bool = False,
     ):
@@ -1490,6 +1656,7 @@ class DwarfForCausalLM(nn.Module):
                     collect_diagnostics,
                     input_ids if collect_diagnostics else None,
                     exploration_step,
+                    exploration_probability_override,
                 )
                 if (
                     self.config.hisa_training_activation_checkpointing
@@ -1520,6 +1687,7 @@ class DwarfForCausalLM(nn.Module):
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         exploration_step: torch.Tensor | None = None,
+        exploration_probability_override: float | torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_auxiliary: bool = False,
     ):
@@ -1527,6 +1695,7 @@ class DwarfForCausalLM(nn.Module):
             "valid_lengths": valid_lengths,
             "route_aux_tile_ids": route_aux_tile_ids,
             "exploration_step": exploration_step,
+            "exploration_probability_override": exploration_probability_override,
             "collect_diagnostics": collect_diagnostics,
             "return_auxiliary": return_auxiliary,
         }
@@ -1542,6 +1711,7 @@ class DwarfForCausalLM(nn.Module):
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         exploration_step: torch.Tensor | None = None,
+        exploration_probability_override: float | torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_hidden: bool = False,
         return_auxiliary: bool = False,
@@ -1551,6 +1721,7 @@ class DwarfForCausalLM(nn.Module):
             valid_lengths=valid_lengths,
             route_aux_tile_ids=route_aux_tile_ids,
             exploration_step=exploration_step,
+            exploration_probability_override=exploration_probability_override,
             collect_diagnostics=collect_diagnostics,
             return_auxiliary=True,
         )
@@ -1564,6 +1735,7 @@ class DwarfForCausalLM(nn.Module):
         valid_lengths: torch.Tensor | None = None,
         route_aux_tile_ids: torch.Tensor | None = None,
         exploration_step: torch.Tensor | None = None,
+        exploration_probability_override: float | torch.Tensor | None = None,
         collect_diagnostics: bool = False,
         return_hidden: bool = False,
         return_auxiliary: bool = False,
@@ -1572,6 +1744,7 @@ class DwarfForCausalLM(nn.Module):
             "valid_lengths": valid_lengths,
             "route_aux_tile_ids": route_aux_tile_ids,
             "exploration_step": exploration_step,
+            "exploration_probability_override": exploration_probability_override,
             "collect_diagnostics": collect_diagnostics,
             "return_hidden": return_hidden,
             "return_auxiliary": return_auxiliary,
@@ -1599,7 +1772,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
     ]
     l17_attention = global_mixers[-1][1].attn
     return {
-        "format": "dwarf-l24-l17-basek-routepolicy-dsqgv23-hisav19qv3-v1",
+        "format": "dwarf-l24-l17-basek-routepolicy-dsqgv23band-hisav19qv4-v1",
         "config": asdict(model.config),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameters": sum(
@@ -1626,18 +1799,20 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
                 for index, block in global_mixers
             },
             "l17_route_contract": l17_attention.route_source_contract,
-            "dsqg": "v23-bounded-routing-null-candidate",
-            "hisa": "v19-streaming-hierarchical-exact-rerank-binder-v3",
+            "dsqg": "v23-bounded-routing-support-banded-null-candidate",
+            "hisa": "v19-v4-captured-mass-router-adapter-binder",
             "offset_groups": model.offset_groups,
         },
         "complexity": {
-            "dsqg_attention": "linear_in_sequence_length_for_fixed_offsets",
+            "dsqg_attention": (
+                "linear_in_sequence_length_with_exact_support-band offset prefixes"
+            ),
             "hisa_selected_attention": "linear_in_sequence_length_for_fixed_routing",
             "selector_compute": (
                 "quadratic_at_fixed_chunk_size_with_parent_group_reduction"
             ),
             "selector_workspace": (
-                "bounded_streaming_top_m_without_full_differentiable_surface"
+                "bounded_streaming_top_m_plus_direct_selected-address Triton scoring"
             ),
             "hierarchical_route_level": "one_level_completed_parent_to_child",
         },
@@ -1649,6 +1824,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
             "kernel_incremental_hisa_cache_complexity": "exact_O_N_KV",
         },
         "hisa_integration_contract": hisa_integration_contract(),
+        "causal_ema_execution": causal_ema_execution_config(),
         "dsqg": [
             {
                 "layer": index,
@@ -1670,6 +1846,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
             for index, block in global_mixers
         ],
         "sources": source_manifest(),
+        "source_semantics": source_semantic_manifest(),
     }
 
 
@@ -1703,6 +1880,7 @@ def make_parameter_groups(
         "null": [],
         "npci": [],
         "route": [],
+        "router_adapter": [],
         "binding_calibration": [],
         "ema": [],
         "positional": [],
@@ -1719,6 +1897,7 @@ def make_parameter_groups(
                 (
                     module.route_prior_raw,
                     module.representative_coherence_raw,
+                    module.parent_coherence_raw,
                     module.global_lane_logit_bias,
                     module.global_route_confidence_weight,
                     module.global_route_confidence_bias,
@@ -1727,6 +1906,18 @@ def make_parameter_groups(
             )
             if module.representative_mix_raw.requires_grad:
                 special["route"].append(module.representative_mix_raw)
+            if module.router_adapter_rank:
+                if any(item is None for item in (
+                    module.router_q_down, module.router_q_up,
+                    module.router_k_down, module.router_k_up,
+                )):
+                    raise RuntimeError("HISA router adapters are incomplete")
+                assert module.router_q_down is not None and module.router_q_up is not None
+                assert module.router_k_down is not None and module.router_k_up is not None
+                special["router_adapter"].extend((
+                    module.router_q_down.weight, module.router_q_up.weight,
+                    module.router_k_down.weight, module.router_k_up.weight,
+                ))
             if module.binding_gain_raw is not None:
                 special["route"].append(module.binding_gain_raw)
             if module.binding_rank:
@@ -1805,6 +1996,12 @@ def make_parameter_groups(
         group("adam_null", special["null"], recipe.learning_rate, 0.0),
         group("adam_npci", special["npci"], recipe.learning_rate, 0.0),
         group("adam_route", special["route"], recipe.learning_rate * 2.0, 0.0),
+        group(
+            "adam_router_adapter",
+            special["router_adapter"],
+            recipe.learning_rate,
+            0.0,
+        ),
         group(
             "adam_binding_calibration",
             special["binding_calibration"],
@@ -2293,9 +2490,15 @@ def tokenizer_identity(path: str | Path, vocab_size: int) -> dict[str, Any]:
     observed = {token: tokenizer.token_to_id(token) for token in expected}
     if observed != expected:
         raise ValueError(f"tokenizer structural IDs do not match: {observed}")
+    actual_sha256 = _sha256(resolved)
+    if actual_sha256 != CANONICAL_TOKENIZER_SHA256:
+        raise ValueError(
+            "tokenizer SHA-256 does not match the canonical DWARF tokenizer: "
+            f"expected {CANONICAL_TOKENIZER_SHA256}, observed {actual_sha256}"
+        )
     return {
         "path": str(resolved),
-        "sha256": _sha256(resolved),
+        "sha256": actual_sha256,
         "vocab_size": vocab_size,
         "structural_token_ids": expected,
     }
@@ -2371,21 +2574,161 @@ def validate_dataset_identity(
     # condition needed for an exact resume.
 
 
+def tensor_prefix_sha256(
+    tensor: torch.Tensor,
+    rows: int,
+    *,
+    chunk_rows: int = 1024,
+) -> str:
+    if tensor.device.type != "cpu" or tensor.ndim != 2:
+        raise ValueError("prefix hashing requires a two-dimensional CPU tensor")
+    if (
+        isinstance(rows, bool)
+        or not isinstance(rows, int)
+        or not 0 < rows <= len(tensor)
+        or chunk_rows < 1
+    ):
+        raise ValueError("prefix hashing bounds are invalid")
+    digest = hashlib.sha256()
+    for start in range(0, rows, chunk_rows):
+        block = tensor[start : min(start + chunk_rows, rows)].contiguous().numpy()
+        digest.update(memoryview(block).cast("B"))
+    return digest.hexdigest()
+
+
+def validate_prefix_extension_transition(
+    contract: dict[str, Any],
+    *,
+    parent_checkpoint_sha256: str,
+    parent_checkpoint_kind: str,
+    parent_step: int,
+    saved_dataset: dict[str, Any],
+    current_dataset: dict[str, Any],
+    current_tensor: torch.Tensor,
+    stop_step: int,
+    effective_batch: int,
+) -> dict[str, Any]:
+    if not isinstance(contract, dict) or contract.get("format") != (
+        "dwarf-prefix-extension-transition-v1"
+    ):
+        raise ValueError("prefix extension contract format is invalid")
+    if contract.get("status") != "AUTHORIZED":
+        raise ValueError("prefix extension contract is not authorized")
+    parent = contract.get("parent")
+    child = contract.get("child")
+    proof = contract.get("prefix_proof")
+    if not all(isinstance(value, dict) for value in (parent, child, proof)):
+        raise ValueError("prefix extension contract sections are invalid")
+    assert isinstance(parent, dict) and isinstance(child, dict) and isinstance(proof, dict)
+
+    if parent.get("checkpoint_sha256") != parent_checkpoint_sha256:
+        raise ValueError("parent checkpoint SHA-256 does not match transition contract")
+    if parent.get("checkpoint_kind") != parent_checkpoint_kind:
+        raise ValueError("parent checkpoint kind does not match transition contract")
+    if parent.get("step") != parent_step:
+        raise ValueError("parent checkpoint step does not match transition contract")
+    if child.get("stop_step") != stop_step:
+        raise ValueError("child stop step does not match transition contract")
+    if effective_batch < 1:
+        raise ValueError("effective batch is invalid")
+    consumed_rows = parent_step * effective_batch
+    selected_rows = stop_step * effective_batch
+    if not 0 < consumed_rows < selected_rows:
+        raise ValueError("prefix extension cursor bounds are invalid")
+
+    saved_tokenizer = copy.deepcopy(saved_dataset.get("tokenizer"))
+    current_tokenizer = copy.deepcopy(current_dataset.get("tokenizer"))
+    if not isinstance(saved_tokenizer, dict) or not isinstance(current_tokenizer, dict):
+        raise ValueError("prefix extension tokenizer identity is invalid")
+    saved_tokenizer.pop("path", None)
+    current_tokenizer.pop("path", None)
+    if saved_tokenizer != current_tokenizer:
+        raise ValueError("prefix extension tokenizer identity does not match")
+    if saved_dataset.get("document_boundary_policy") != current_dataset.get(
+        "document_boundary_policy"
+    ):
+        raise ValueError("prefix extension document-boundary policy does not match")
+
+    saved_rows = saved_dataset.get("rows")
+    current_rows = current_dataset.get("rows")
+    if saved_rows != consumed_rows:
+        raise ValueError("parent dataset row count does not equal the consumed prefix")
+    if (
+        isinstance(current_rows, bool)
+        or not isinstance(current_rows, int)
+        or current_rows < selected_rows
+        or current_rows <= consumed_rows
+    ):
+        raise ValueError("child dataset does not extend the consumed prefix")
+    if len(current_tensor) != current_rows:
+        raise ValueError("child tensor row count does not match its identity")
+
+    saved_selection = saved_dataset.get("selection")
+    current_selection = current_dataset.get("selection")
+    if not isinstance(saved_selection, dict) or not isinstance(current_selection, dict):
+        raise ValueError("prefix extension dataset selection is invalid")
+    if saved_selection.get("mode") != "sequential_prefix" or (
+        current_selection.get("mode") != "sequential_prefix"
+    ):
+        raise ValueError("prefix extension requires sequential-prefix selections")
+    if saved_selection.get("rows") != consumed_rows:
+        raise ValueError("parent selection does not end at the consumed prefix")
+    if current_selection.get("rows") != selected_rows:
+        raise ValueError("child selection does not match the requested stop step")
+
+    saved_content = _dataset_content_identity(saved_dataset)
+    current_content = _dataset_content_identity(current_dataset)
+    if parent.get("dataset_content") != saved_content:
+        raise ValueError("parent dataset content does not match transition contract")
+    if child.get("dataset_content") != current_content:
+        raise ValueError("child dataset content does not match transition contract")
+    if saved_content == current_content:
+        raise ValueError("prefix extension must bind a distinct child dataset artifact")
+
+    if proof.get("rows") != consumed_rows:
+        raise ValueError("prefix row count does not match the consumed cursor")
+    expected_prefix_sha256 = proof.get("tensor_content_sha256")
+    if not isinstance(expected_prefix_sha256, str) or len(expected_prefix_sha256) != 64:
+        raise ValueError("prefix tensor content SHA-256 is invalid")
+    observed_prefix_sha256 = tensor_prefix_sha256(current_tensor, consumed_rows)
+    if observed_prefix_sha256 != expected_prefix_sha256:
+        raise ValueError("prefix tensor content does not match transition contract")
+
+    return {
+        "format": contract["format"],
+        "parent_step": parent_step,
+        "consumed_rows": consumed_rows,
+        "child_stop_step": stop_step,
+        "child_selected_rows": selected_rows,
+        "prefix_tensor_content_sha256": observed_prefix_sha256,
+    }
+
+
 def preflight_training_rows(
     dataset: torch.Tensor,
     *,
     selected_rows: int,
     vocab_size: int,
     pad_token_id: int | None = None,
+    eod_token_id: int | None = None,
+    document_boundary_policy: str = "single_document_rows",
     chunk_rows: int = 1024,
-) -> dict[str, int]:
+) -> dict[str, int | str]:
     if dataset.device.type != "cpu" or dataset.ndim != 2:
         raise ValueError("dataset preflight requires a two-dimensional CPU tensor")
     if not 0 < selected_rows <= len(dataset) or vocab_size < 1 or chunk_rows < 1:
         raise ValueError("dataset preflight bounds are invalid")
+    if document_boundary_policy not in {
+        "single_document_rows", "allow_packed_unsafe"
+    }:
+        raise ValueError("unsupported document-boundary policy")
     minimum = vocab_size
     maximum = -1
     pad_tokens = 0
+    eod_tokens = 0
+    rows_with_eod = 0
+    rows_with_multiple_eod = 0
+    internal_eod_tokens = 0
     for start in range(0, selected_rows, chunk_rows):
         rows = dataset[start : min(start + chunk_rows, selected_rows)]
         local_min_tensor, local_max_tensor = torch.aminmax(rows)
@@ -2397,12 +2740,26 @@ def preflight_training_rows(
             )
         if pad_token_id is not None:
             pad_tokens += int((rows == int(pad_token_id)).sum())
+        if eod_token_id is not None:
+            eod = rows == int(eod_token_id)
+            per_row = eod.sum(-1)
+            eod_tokens += int(per_row.sum())
+            rows_with_eod += int((per_row > 0).sum())
+            rows_with_multiple_eod += int((per_row > 1).sum())
+            internal_eod_tokens += int(eod[:, :-1].sum())
         minimum = min(minimum, local_min)
         maximum = max(maximum, local_max)
     if pad_tokens:
         raise ValueError(
-            f"selected packed rows contain {pad_tokens} pad tokens, but the canonical "
+            f"selected rows contain {pad_tokens} pad tokens, but the canonical "
             "fused language-model loss has no padding mask"
+        )
+    if document_boundary_policy == "single_document_rows" and internal_eod_tokens:
+        raise ValueError(
+            "selected rows contain internal <|eod|> boundaries, but DSQG, HISA, "
+            "local attention, and EMA are configured for single-document rows; "
+            "repack the corpus or explicitly pass --document-boundary-policy "
+            "allow_packed_unsafe for a noncanonical ablation"
         )
     return {
         "rows": selected_rows,
@@ -2410,14 +2767,26 @@ def preflight_training_rows(
         "minimum_token_id": minimum,
         "maximum_token_id": maximum,
         "pad_tokens": pad_tokens,
+        "eod_tokens": eod_tokens,
+        "rows_with_eod": rows_with_eod,
+        "rows_with_multiple_eod": rows_with_multiple_eod,
+        "internal_eod_tokens": internal_eod_tokens,
+        "document_boundary_policy": document_boundary_policy,
     }
 
 
 class _TrainingForwardCallable(nn.Module):
-    def __init__(self, model: DwarfForCausalLM, *, diagnostics: bool) -> None:
+    def __init__(
+        self,
+        model: DwarfForCausalLM,
+        *,
+        diagnostics: bool,
+        exploration_disabled: bool,
+    ) -> None:
         super().__init__()
         self.model = model
         self.diagnostics = diagnostics
+        self.exploration_disabled = exploration_disabled
 
     def forward(
         self,
@@ -2430,24 +2799,58 @@ class _TrainingForwardCallable(nn.Module):
             valid_lengths=None,
             route_aux_tile_ids=route_aux_tile_ids,
             exploration_step=exploration_step,
+            exploration_probability_override=(
+                0.0 if self.exploration_disabled else None
+            ),
             collect_diagnostics=self.diagnostics,
             return_hidden=True,
             return_auxiliary=True,
         )
 
 
+@dataclass(frozen=True)
+class TrainingCallables:
+    exploration: nn.Module
+    no_exploration: nn.Module
+    diagnostic_exploration: nn.Module | None
+    diagnostic_no_exploration: nn.Module | None
+
+
 def compiled_training_callables(
     model: DwarfForCausalLM,
-) -> tuple[nn.Module, nn.Module]:
-    normal = torch.compile(
-        _TrainingForwardCallable(model, diagnostics=False),
+    *,
+    diagnostics_enabled: bool,
+) -> TrainingCallables:
+    exploration = torch.compile(
+        _TrainingForwardCallable(
+            model, diagnostics=False, exploration_disabled=False
+        ),
         mode="default",
         dynamic=False,
     )
-    # Diagnostics intentionally remain eager: they mutate per-layer telemetry
-    # dictionaries and run only on the final microbatch of logging updates.
-    diagnostic = _TrainingForwardCallable(model, diagnostics=True)
-    return normal, diagnostic
+    no_exploration = torch.compile(
+        _TrainingForwardCallable(
+            model, diagnostics=False, exploration_disabled=True
+        ),
+        mode="default",
+        dynamic=False,
+    )
+    if diagnostics_enabled:
+        diagnostic_exploration: nn.Module | None = _TrainingForwardCallable(
+            model, diagnostics=True, exploration_disabled=False
+        )
+        diagnostic_no_exploration: nn.Module | None = _TrainingForwardCallable(
+            model, diagnostics=True, exploration_disabled=True
+        )
+    else:
+        diagnostic_exploration = None
+        diagnostic_no_exploration = None
+    return TrainingCallables(
+        exploration=exploration,
+        no_exploration=no_exploration,
+        diagnostic_exploration=diagnostic_exploration,
+        diagnostic_no_exploration=diagnostic_no_exploration,
+    )
 
 
 class BatchStager:
@@ -2848,19 +3251,11 @@ def reconstruct_model_from_checkpoint(
     )
     if (
         isinstance(checkpoint, dict)
-        and checkpoint.get("kind") in LEGACY_HISA_V2_CHECKPOINT_KINDS
+        and checkpoint.get("kind") in LEGACY_HISA_CHECKPOINT_KINDS
     ):
         raise ValueError(
-            "legacy HISA binder-v2 checkpoints cannot be reconstructed as the "
-            "optimized binder-v3 model without an explicit warm-start migration"
-        )
-    if (
-        isinstance(checkpoint, dict)
-        and checkpoint.get("kind") in INCOMPATIBLE_HISA_V3_CHECKPOINT_KINDS
-    ):
-        raise ValueError(
-            "binder-v3 dual-source route-policy checkpoints cannot be reconstructed "
-            "as the base-owned canonical policy without an explicit model-only migration"
+            "legacy HISA v2/v3 checkpoints cannot be reconstructed as the v4 "
+            "captured-mass/router-adapter model without an explicit warm-start migration"
         )
     if not isinstance(checkpoint, dict) or checkpoint.get("kind") not in {
         CHECKPOINT_KIND,
@@ -2949,15 +3344,10 @@ def restore_checkpoint(
     if not isinstance(checkpoint, dict):
         raise ValueError("not a canonical DWARF resumable checkpoint")
     kind = checkpoint.get("kind")
-    if kind in LEGACY_HISA_V2_CHECKPOINT_KINDS:
+    if kind in LEGACY_HISA_CHECKPOINT_KINDS:
         raise ValueError(
-            "legacy HISA binder-v2 checkpoints cannot resume into binder v3; "
-            "start a new run or use a separately audited warm-start migration"
-        )
-    if kind in INCOMPATIBLE_HISA_V3_CHECKPOINT_KINDS:
-        raise ValueError(
-            "binder-v3 dual-source route-policy checkpoints cannot strict-resume "
-            "into the base-owned canonical route policy"
+            "legacy HISA v2/v3 checkpoints cannot strict-resume into v4; start a "
+            "new run or use a separately audited model-only warm-start migration"
         )
     if kind != CHECKPOINT_KIND:
         raise ValueError("not a canonical DWARF resumable checkpoint")
@@ -3013,6 +3403,101 @@ def restore_checkpoint(
     return step
 
 
+def restore_prefix_extension_checkpoint(
+    path: str | Path,
+    *,
+    transition_contract_path: str | Path,
+    model: DwarfForCausalLM,
+    optimizer: MultiOptimizer,
+    architecture: dict[str, Any],
+    dataset: dict[str, Any],
+    dataset_tensor: torch.Tensor,
+    stop_step: int,
+    device: torch.device,
+    environment: dict[str, Any] | None = None,
+    allow_source_mismatch: bool = False,
+    allow_environment_mismatch: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    checkpoint_path = Path(path)
+    contract_path = Path(transition_contract_path)
+    checkpoint_sha256 = _sha256(checkpoint_path)
+    try:
+        contract = json.loads(contract_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("prefix extension contract cannot be read") from error
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict) or checkpoint.get("kind") != CHECKPOINT_KIND:
+        raise ValueError("not a canonical DWARF resumable checkpoint")
+    validate_checkpoint_architecture(
+        checkpoint.get("architecture"),
+        architecture,
+        allow_source_mismatch=allow_source_mismatch,
+    )
+    validate_checkpoint_environment(
+        checkpoint.get("environment"),
+        runtime_environment(device) if environment is None else environment,
+        allow_mismatch=allow_environment_mismatch,
+    )
+    if checkpoint.get("recipe") != asdict(RECIPE):
+        raise ValueError("checkpoint recipe does not match")
+    step = checkpoint.get("step")
+    if isinstance(step, bool) or not isinstance(step, int) or not 0 < step < stop_step:
+        raise ValueError("checkpoint step is invalid for prefix extension")
+    transition = validate_prefix_extension_transition(
+        contract,
+        parent_checkpoint_sha256=checkpoint_sha256,
+        parent_checkpoint_kind=checkpoint["kind"],
+        parent_step=step,
+        saved_dataset=checkpoint.get("dataset"),
+        current_dataset=dataset,
+        current_tensor=dataset_tensor,
+        stop_step=stop_step,
+        effective_batch=RECIPE.effective_batch,
+    )
+
+    saved_model = checkpoint.get("model")
+    expected_model = model.state_dict()
+    if not isinstance(saved_model, dict) or saved_model.keys() != expected_model.keys():
+        raise ValueError("checkpoint model keys do not match")
+    for name, expected in expected_model.items():
+        saved = saved_model[name]
+        if (
+            not torch.is_tensor(saved)
+            or saved.shape != expected.shape
+            or saved.dtype != expected.dtype
+        ):
+            raise ValueError(f"checkpoint model tensor does not match: {name}")
+    resolved = _resolved_cuda_device(device)
+    cuda_rng = checkpoint.get("cuda_rng")
+    if not torch.is_tensor(cuda_rng) or cuda_rng.dtype != torch.uint8:
+        raise ValueError("checkpoint CUDA RNG state is invalid")
+    if not torch.is_tensor(checkpoint.get("torch_rng")):
+        raise ValueError("checkpoint CPU RNG state is invalid")
+    if not isinstance(checkpoint.get("optimizer"), dict):
+        raise ValueError("checkpoint optimizer state is invalid")
+
+    model.load_state_dict(saved_model, strict=True)
+    optimizer.load_state_dict(
+        checkpoint["optimizer"],
+        expected_lr_factor=wsd_multiplier(step - 1, RECIPE),
+        require_complete_state=True,
+    )
+    random.setstate(checkpoint["python_rng"])
+    torch.set_rng_state(checkpoint["torch_rng"])
+    torch.cuda.set_rng_state(cuda_rng, resolved)
+    return step, {
+        "status": "PASS",
+        "mode": "contracted_full_state_prefix_extension",
+        "parent_checkpoint": str(checkpoint_path.resolve()),
+        "parent_checkpoint_sha256": checkpoint_sha256,
+        "transition_contract": str(contract_path.resolve()),
+        "transition_contract_sha256": _sha256(contract_path),
+        "source_mismatch_allowed": bool(allow_source_mismatch),
+        "environment_mismatch_allowed": bool(allow_environment_mismatch),
+        "transition": transition,
+    }
+
+
 def amp_context():
     return torch.autocast("cuda", dtype=torch.bfloat16)
 
@@ -3042,7 +3527,7 @@ def assert_hisa_auxiliary_gradient_contract(
     auxiliary: torch.Tensor,
     attention_modules: Iterable[HierarchicalSparseAttentionV19HISACausal],
 ) -> dict[str, float | int]:
-    """Synchronously prove the optimized HISA auxiliary graph on one step."""
+    """Synchronously prove that every v4 HISA auxiliary family is connected."""
     modules = tuple(attention_modules)
     _require(bool(modules), "HISA auxiliary diagnostic has no attention modules")
     _require(
@@ -3052,10 +3537,7 @@ def assert_hisa_auxiliary_gradient_contract(
     _require(torch.isfinite(auxiliary).all(), "HISA auxiliary is non-finite")
     _require(auxiliary.requires_grad, "HISA auxiliary does not require grad")
     total_to_auxiliary = torch.autograd.grad(
-        total_loss,
-        auxiliary,
-        retain_graph=True,
-        allow_unused=True,
+        total_loss, auxiliary, retain_graph=True, allow_unused=True
     )[0]
     _require(
         total_to_auxiliary is not None
@@ -3065,9 +3547,7 @@ def assert_hisa_auxiliary_gradient_contract(
     )
 
     parameters: list[nn.Parameter] = []
-    layouts: list[
-        tuple[HierarchicalSparseAttentionV19HISACausal, dict[str, int]]
-    ] = []
+    layouts: list[tuple[HierarchicalSparseAttentionV19HISACausal, dict[str, int]]] = []
 
     def add(layout: dict[str, int], name: str, parameter: nn.Parameter) -> None:
         layout[name] = len(parameters)
@@ -3075,22 +3555,16 @@ def assert_hisa_auxiliary_gradient_contract(
 
     for module in modules:
         layout: dict[str, int] = {}
-        add(layout, "route_prior_raw", module.route_prior_raw)
-        add(layout, "representative_coherence_raw", module.representative_coherence_raw)
-        add(layout, "qkvg_proj_weight", module.qkvg_proj.weight)
-        add(layout, "global_lane_logit_bias", module.global_lane_logit_bias)
-        add(
-            layout,
+        for name in (
+            "route_prior_raw",
+            "representative_coherence_raw",
+            "parent_coherence_raw",
+            "global_lane_logit_bias",
             "global_route_confidence_weight",
-            module.global_route_confidence_weight,
-        )
-        add(
-            layout,
             "global_route_confidence_bias",
-            module.global_route_confidence_bias,
-        )
-        add(layout, "count_correction_raw", module.count_correction_raw)
-
+            "count_correction_raw",
+        ):
+            add(layout, name, getattr(module, name))
         if module.representative_mode == "mean_max_blend":
             _require(
                 module.representative_mix_raw.requires_grad,
@@ -3102,13 +3576,18 @@ def assert_hisa_auxiliary_gradient_contract(
                 not module.representative_mix_raw.requires_grad,
                 "inactive HISA representative mixture remains trainable",
             )
-
-        if module.global_adapter_rank:
-            if module.global_k_down is None or module.global_k_up is None:
-                raise AssertionError("HISA representative K adapter is incomplete")
-            add(layout, "representative_k_down", module.global_k_down.weight)
-            add(layout, "representative_k_up", module.global_k_up.weight)
-
+        if module.router_adapter_rank:
+            adapters = {
+                "router_q_down": module.router_q_down,
+                "router_q_up": module.router_q_up,
+                "router_k_down": module.router_k_down,
+                "router_k_up": module.router_k_up,
+            }
+            if any(value is None for value in adapters.values()):
+                raise AssertionError("HISA router adapter modules are incomplete")
+            for name, layer in adapters.items():
+                assert layer is not None
+                add(layout, name, layer.weight)
         if module.binding_rank and module.binding_null_aux_weight > 0.0:
             if (
                 module.bind_route_score is None
@@ -3123,111 +3602,82 @@ def assert_hisa_auxiliary_gradient_contract(
         layouts.append((module, layout))
 
     gradients = torch.autograd.grad(
-        auxiliary,
-        tuple(parameters),
-        retain_graph=True,
-        allow_unused=True,
+        auxiliary, tuple(parameters), retain_graph=True, allow_unused=True
     )
-    magnitudes: dict[str, float] = {
-        "route_prior_raw": 0.0,
-        "representative_coherence_raw": 0.0,
-        "routing_q_rows": 0.0,
-        "representative_k_rows": 0.0,
-        "representative_k_down": 0.0,
-        "representative_k_up": 0.0,
+    totals: dict[str, float | int] = {
+        "attention_modules": len(modules),
+        "total_loss_to_auxiliary": float(total_to_auxiliary.detach().abs()),
+        "route_prior": 0.0,
+        "child_coherence": 0.0,
+        "parent_coherence": 0.0,
+        "router_adapter": 0.0,
         "lane_calibration": 0.0,
-        "binder_null_calibration": 0.0,
+        "binder_calibration": 0.0,
     }
 
-    def record(
-        name: str,
-        gradient: torch.Tensor | None,
-        *,
-        require_nonzero: bool,
-    ) -> float:
+    def magnitude(name: str, gradient: torch.Tensor | None) -> float:
         _require(gradient is not None, f"HISA auxiliary gradient is absent: {name}")
         assert gradient is not None
         _require(
             torch.isfinite(gradient).all(),
             f"HISA auxiliary gradient is non-finite: {name}",
         )
-        magnitude = float(gradient.detach().float().abs().sum())
-        if require_nonzero:
-            _require(magnitude > 0.0, f"HISA auxiliary gradient is zero: {name}")
-        return magnitude
+        return float(gradient.detach().float().abs().sum())
 
     for module, layout in layouts:
-        route_magnitude = record(
-            "route_prior_raw",
-            gradients[layout["route_prior_raw"]],
-            require_nonzero=True,
+        route_value = magnitude(
+            "route_prior_raw", gradients[layout["route_prior_raw"]]
         )
-        magnitudes["route_prior_raw"] += route_magnitude
-
-        coherence_magnitude = record(
+        child_value = magnitude(
             "representative_coherence_raw",
             gradients[layout["representative_coherence_raw"]],
-            require_nonzero=True,
         )
-        magnitudes["representative_coherence_raw"] += coherence_magnitude
+        parent_value = magnitude(
+            "parent_coherence_raw", gradients[layout["parent_coherence_raw"]]
+        )
+        _require(route_value > 0.0, "HISA route auxiliary has zero route-prior gradient")
+        _require(child_value > 0.0, "HISA route auxiliary has zero child-coherence gradient")
+        totals["route_prior"] += route_value
+        totals["child_coherence"] += child_value
+        totals["parent_coherence"] += parent_value
 
         if "representative_mix_raw" in layout:
-            magnitudes.setdefault("representative_mix_raw", 0.0)
-            magnitudes["representative_mix_raw"] += record(
+            value = magnitude(
                 "representative_mix_raw",
                 gradients[layout["representative_mix_raw"]],
-                require_nonzero=True,
             )
+            _require(value > 0.0, "active representative mixture has zero gradient")
+            totals["representative_mix"] = float(
+                totals.get("representative_mix", 0.0)
+            ) + value
 
-        projection_gradient = gradients[layout["qkvg_proj_weight"]]
-        _require(
-            projection_gradient is not None,
-            "HISA auxiliary qkvg projection gradient is absent",
-        )
-        assert projection_gradient is not None
-        magnitudes["routing_q_rows"] += record(
-            "routing_q_rows",
-            projection_gradient[: module.D],
-            require_nonzero=True,
-        )
-        magnitudes["representative_k_rows"] += record(
-            "representative_k_rows",
-            projection_gradient[module.D : 2 * module.D],
-            require_nonzero=True,
-        )
-
-        if module.global_adapter_rank:
-            magnitudes["representative_k_down"] += record(
-                "representative_k_down",
-                gradients[layout["representative_k_down"]],
-                require_nonzero=True,
+        adapter_value = 0.0
+        for name in ("router_q_down", "router_q_up", "router_k_down", "router_k_up"):
+            if name in layout:
+                adapter_value += magnitude(name, gradients[layout[name]])
+        if module.router_adapter_rank:
+            _require(
+                adapter_value > 0.0,
+                "HISA route auxiliary does not reach the dedicated router adapters",
             )
-            magnitudes["representative_k_up"] += record(
-                "representative_k_up",
-                gradients[layout["representative_k_up"]],
-                require_nonzero=True,
-            )
+        totals["router_adapter"] += adapter_value
 
-        lane_magnitude = 0.0
+        lane_value = 0.0
         for name in (
             "global_lane_logit_bias",
             "global_route_confidence_weight",
             "global_route_confidence_bias",
             "count_correction_raw",
         ):
-            lane_magnitude += record(
-                name,
-                gradients[layout[name]],
-                require_nonzero=False,
-            )
+            lane_value += magnitude(name, gradients[layout[name]])
         if module.global_mass_aux_weight > 0.0:
             _require(
-                lane_magnitude > 0.0,
-                "HISA global-mass auxiliary does not reach lane calibration",
+                lane_value > 0.0,
+                "captured-mass auxiliary does not reach lane calibration",
             )
-        magnitudes["lane_calibration"] += lane_magnitude
+        totals["lane_calibration"] += lane_value
 
-        binder_magnitude = 0.0
+        binder_value = 0.0
         for name in (
             "bind_route_score",
             "bind_null_prior",
@@ -3235,23 +3685,23 @@ def assert_hisa_auxiliary_gradient_contract(
             "bind_abstention_bias",
         ):
             if name in layout:
-                binder_magnitude += record(
-                    name,
-                    gradients[layout[name]],
-                    require_nonzero=False,
-                )
+                binder_value += magnitude(name, gradients[layout[name]])
         if module.binding_rank and module.binding_null_aux_weight > 0.0:
             _require(
-                binder_magnitude > 0.0,
-                "HISA binding-null auxiliary does not reach binder calibration",
+                binder_value > 1e-12,
+                "captured-mass null auxiliary does not reach binder calibration",
             )
-        magnitudes["binder_null_calibration"] += binder_magnitude
+        totals["binder_calibration"] += binder_value
+    if any(
+        module.parent_route_aux_weight > 0.0 and module.hierarchical_routing
+        for module in modules
+    ):
+        _require(
+            float(totals["parent_coherence"]) > 0.0,
+            "HISA parent auxiliary has zero aggregate parent-coherence gradient",
+        )
+    return totals
 
-    return {
-        "attention_modules": len(modules),
-        "total_loss_to_auxiliary": float(total_to_auxiliary.detach().abs()),
-        **magnitudes,
-    }
 
 def _capture_rng_state(device: torch.device) -> tuple[Any, torch.Tensor, torch.Tensor]:
     resolved = _resolved_cuda_device(device)
@@ -3274,12 +3724,12 @@ def _restore_rng_state(
 def warm_compiled_training_step(
     *,
     model: DwarfForCausalLM,
-    compiled: nn.Module,
+    callables: TrainingCallables,
     loss_fn: nn.Module,
     device: torch.device,
     config: DwarfConfig,
 ) -> dict[str, float | int]:
-    """Compile/autotune the real training graph without advancing training RNG."""
+    """Compile/autotune both training graphs without advancing training RNG."""
     state = _capture_rng_state(device)
     try:
         synthetic = torch.randint(
@@ -3294,12 +3744,14 @@ def warm_compiled_training_step(
         exploration_step = torch.tensor(1, device=device, dtype=torch.int64)
         model.zero_grad(set_to_none=True)
         with amp_context():
-            hidden, auxiliary = compiled(input_ids, route_ids, exploration_step)
+            hidden, auxiliary = callables.exploration(
+                input_ids, route_ids, exploration_step
+            )
             language_loss = loss_fn(
                 model.lm_head.weight, hidden.flatten(0, 1), labels.flatten()
             )
             loss = language_loss + auxiliary
-        auxiliary_gradient_contract = assert_hisa_auxiliary_gradient_contract(
+        contract = assert_hisa_auxiliary_gradient_contract(
             total_loss=loss,
             auxiliary=auxiliary,
             attention_modules=(
@@ -3309,22 +3761,40 @@ def warm_compiled_training_step(
             ),
         )
         loss.backward()
+        _assert_finite(loss.detach(), "exploration compile warm-up loss is non-finite")
         torch.cuda.synchronize(device)
         model.zero_grad(set_to_none=True)
+
+        no_exploration_step = torch.tensor(
+            config.hisa_exploration_anneal_steps,
+            device=device,
+            dtype=torch.int64,
+        )
+        with amp_context():
+            hidden_off, auxiliary_off = callables.no_exploration(
+                input_ids, route_ids, no_exploration_step
+            )
+            language_off = loss_fn(
+                model.lm_head.weight,
+                hidden_off.flatten(0, 1),
+                labels.flatten(),
+            )
+            loss_off = language_off + auxiliary_off
+        loss_off.backward()
+        _assert_finite(loss_off.detach(), "no-exploration compile warm-up loss is non-finite")
+        torch.cuda.synchronize(device)
+        model.zero_grad(set_to_none=True)
+        contract["compiled_graphs"] = 2
+        contract["no_exploration_auxiliary"] = float(auxiliary_off.detach())
+        return contract
     finally:
         _restore_rng_state(state, device)
-    return auxiliary_gradient_contract
 
 
 _HISA_VECTOR_DIAGNOSTICS_FOR_LOG = frozenset(
     {
         "representative_max_winner_positions",
         "representative_max_winner_token_ids",
-        "marginal_teacher_mass_by_added_unique_chunk",
-        "global_attention_mass_by_head",
-        "local_attention_mass_by_head",
-        "global_attention_mass_by_position",
-        "local_attention_mass_by_position",
     }
 )
 
@@ -3334,16 +3804,37 @@ def routing_diagnostics_for_log(
     values: dict[str, torch.Tensor],
     *,
     hisa: bool,
+    detail: str,
 ) -> dict[str, Any]:
-    """Serialize scalar telemetry plus the bounded HISA audit vectors."""
+    """Serialize diagnostic tensors at explicit summary or full detail."""
+    if detail not in {"summary", "full"}:
+        raise ValueError("diagnostic detail must be summary or full")
     logged: dict[str, Any] = {}
     for key, value in values.items():
         if not torch.is_tensor(value):
             continue
-        if value.numel() == 1:
-            logged[prefix + key] = float(value)
-        elif hisa and key in _HISA_VECTOR_DIAGNOSTICS_FOR_LOG:
-            logged[prefix + key] = value.detach().cpu().tolist()
+        detached = value.detach()
+        if detached.numel() == 1:
+            logged[prefix + key] = float(detached)
+            continue
+        if detail == "full" and hisa and key in _HISA_VECTOR_DIAGNOSTICS_FOR_LOG:
+            logged[prefix + key] = detached.cpu().tolist()
+            continue
+        finite = detached.float()[torch.isfinite(detached.float())]
+        summary_key = prefix + key + "_summary"
+        if finite.numel():
+            logged[summary_key] = {
+                "shape": list(detached.shape),
+                "mean": float(finite.mean()),
+                "std": float(finite.std(unbiased=False)),
+                "min": float(finite.min()),
+                "max": float(finite.max()),
+            }
+        else:
+            logged[summary_key] = {
+                "shape": list(detached.shape),
+                "finite_values": 0,
+            }
     return logged
 
 
@@ -3356,8 +3847,9 @@ def collect_model_diagnostics(
     route_aux_tile_ids: torch.Tensor,
     exploration_step: torch.Tensor,
     device: torch.device,
+    detail: str,
 ) -> tuple[dict[str, Any], float, int, int]:
-    """Run one RNG-neutral eager diagnostic forward and collect layer-qualified data."""
+    """Run one explicit RNG-neutral eager diagnostic forward."""
     state = _capture_rng_state(device)
     torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
@@ -3381,6 +3873,7 @@ def collect_model_diagnostics(
                     prefix,
                     values,
                     hisa=isinstance(block, GlobalMixerBlock),
+                    detail=detail,
                 )
             )
             if isinstance(block, GlobalMixerBlock) and block.packet is not None:
@@ -3399,9 +3892,20 @@ def collect_model_diagnostics(
                     torch.tanh(block.attn.npci_theta_v.detach()).mean()
                     * block.attn.npci_theta_max
                 )
-        allocated = torch.cuda.max_memory_allocated(device)
-        reserved = torch.cuda.max_memory_reserved(device)
-        return metrics, elapsed, allocated, reserved
+                metrics.update(
+                    routing_diagnostics_for_log(
+                        prefix,
+                        block.packet._diagnostics,
+                        hisa=False,
+                        detail=detail,
+                    )
+                )
+        return (
+            metrics,
+            elapsed,
+            torch.cuda.max_memory_allocated(device),
+            torch.cuda.max_memory_reserved(device),
+        )
     finally:
         _restore_rng_state(state, device)
 
@@ -3434,10 +3938,13 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("invalid save/log interval")
 
     config = DwarfConfig()
-    validate_canonical_kernel_sources()
+    validate_canonical_kernel_sources(
+        allow_mismatch=args.allow_source_mismatch
+    )
     loss_class, environment = validate_training_runtime(requested_device, config)
     device = _resolved_cuda_device(requested_device)
     compile_policy = configure_compiled_backward_autocast()
+    diagnostics_enabled = args.diagnostics != "off"
 
     random.seed(42)
     torch.manual_seed(42)
@@ -3460,9 +3967,12 @@ def train(args: argparse.Namespace) -> None:
             selected_rows=len(order),
             vocab_size=config.vocab_size,
             pad_token_id=config.pad_token_id,
+            eod_token_id=config.eod_token_id,
+            document_boundary_policy=args.document_boundary_policy,
         )
         identity = source.identity(len(dataset), tokenizer, args.dataset_id)
         identity["selection"] = selection
+        identity["document_boundary_policy"] = args.document_boundary_policy
 
         model = DwarfForCausalLM(config).to(device)
         model.prepare_runtime(device)
@@ -3476,6 +3986,7 @@ def train(args: argparse.Namespace) -> None:
 
         optimizer = build_optimizer(model)
         start_step = 0
+        transition_receipt: dict[str, Any] | None = None
         if args.resume:
             start_step = restore_checkpoint(
                 args.resume,
@@ -3488,23 +3999,37 @@ def train(args: argparse.Namespace) -> None:
                 allow_source_mismatch=args.allow_source_mismatch,
                 allow_environment_mismatch=args.allow_environment_mismatch,
             )
+        elif args.resume_prefix_extension:
+            start_step, transition_receipt = restore_prefix_extension_checkpoint(
+                args.resume_prefix_extension,
+                transition_contract_path=args.prefix_extension_contract,
+                model=model,
+                optimizer=optimizer,
+                architecture=architecture,
+                dataset=identity,
+                dataset_tensor=dataset,
+                stop_step=stop_step,
+                device=device,
+                environment=environment,
+                allow_source_mismatch=args.allow_source_mismatch,
+                allow_environment_mismatch=args.allow_environment_mismatch,
+            )
         if start_step >= stop_step:
             raise ValueError("checkpoint is already at or beyond --stop-after")
 
-        compiled, diagnostic = compiled_training_callables(model)
-        loss_fn = loss_class(accum_dtype=torch.float32)
-        stager = BatchStager(
-            dataset, batch_size=RECIPE.batch_size, device=device
+        callables = compiled_training_callables(
+            model, diagnostics_enabled=diagnostics_enabled
         )
+        loss_fn = loss_class(accum_dtype=torch.float32)
+        stager = BatchStager(dataset, batch_size=RECIPE.batch_size, device=device)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         writer = AsyncCheckpointWriter()
 
-        compiled.train()
-        diagnostic.train()
+        model.train()
         auxiliary_gradient_contract = warm_compiled_training_step(
             model=model,
-            compiled=compiled,
+            callables=callables,
             loss_fn=loss_fn,
             device=device,
             config=config,
@@ -3520,10 +4045,13 @@ def train(args: argparse.Namespace) -> None:
                     "environment": environment,
                     "start_step": start_step,
                     "stop_step": stop_step,
+                    "prefix_extension_transition": transition_receipt,
                     "device": str(device),
                     "compiled": True,
+                    "compiled_graphs": ["exploration", "no_exploration"],
+                    "diagnostics": args.diagnostics,
                     "compile_policy": compile_policy,
-                    "compile_warmup": "complete_rng_neutral",
+                    "compile_warmup": "complete_rng_neutral_both_graphs",
                     "compile_warmup_auxiliary_gradient_contract": (
                         auxiliary_gradient_contract
                     ),
@@ -3553,6 +4081,14 @@ def train(args: argparse.Namespace) -> None:
             auxiliary_accumulator = torch.zeros((), device=device, dtype=torch.float32)
             route_aux_tile_ids = route_aux_tile_ids_for_update(step, device, config)
             exploration_step = torch.tensor(step, device=device, dtype=torch.int64)
+            exploration_active = not (
+                config.hisa_exploration_final_probability == 0.0
+                and step >= config.hisa_exploration_anneal_steps
+            )
+            compiled = (
+                callables.exploration if exploration_active
+                else callables.no_exploration
+            )
             last_input_ids: torch.Tensor | None = None
             for batch in stager.batches(update):
                 input_ids, labels = batch[:, :-1], batch[:, 1:]
@@ -3608,29 +4144,43 @@ def train(args: argparse.Namespace) -> None:
                 interval_seconds = training_now - interval_started
                 training_compute_elapsed += interval_seconds
                 interval_steps = step - interval_start_step
-                targets = (
-                    interval_steps * RECIPE.effective_batch * config.model_length
-                )
+                targets = interval_steps * RECIPE.effective_batch * config.model_length
                 training_peak_allocated = torch.cuda.max_memory_allocated(device)
                 training_peak_reserved = torch.cuda.max_memory_reserved(device)
-                (
-                    diagnostics,
-                    diagnostic_seconds,
-                    diagnostic_peak_allocated,
-                    diagnostic_peak_reserved,
-                ) = collect_model_diagnostics(
-                    model=model,
-                    diagnostic=diagnostic,
-                    input_ids=last_input_ids,
-                    route_aux_tile_ids=route_aux_tile_ids,
-                    exploration_step=exploration_step,
-                    device=device,
-                )
+
+                diagnostics: dict[str, Any] = {}
+                diagnostic_seconds = 0.0
+                diagnostic_peak_allocated = 0
+                diagnostic_peak_reserved = 0
+                if diagnostics_enabled:
+                    diagnostic = (
+                        callables.diagnostic_exploration if exploration_active
+                        else callables.diagnostic_no_exploration
+                    )
+                    if diagnostic is None:
+                        raise RuntimeError("diagnostic callable was not constructed")
+                    (
+                        diagnostics,
+                        diagnostic_seconds,
+                        diagnostic_peak_allocated,
+                        diagnostic_peak_reserved,
+                    ) = collect_model_diagnostics(
+                        model=model,
+                        diagnostic=diagnostic,
+                        input_ids=last_input_ids,
+                        route_aux_tile_ids=route_aux_tile_ids,
+                        exploration_step=exploration_step,
+                        device=device,
+                        detail=args.diagnostics,
+                    )
+                total_interval_seconds = interval_seconds + diagnostic_seconds
                 event: dict[str, Any] = {
                     "step": step,
                     "loss": float(loss_accumulator),
                     "language_loss": float(language_accumulator),
                     "hisa_auxiliary_loss": float(auxiliary_accumulator),
+                    "exploration_graph_active": exploration_active,
+                    "diagnostics_mode": args.diagnostics,
                     "lr_factor": factor,
                     "learning_rates": {
                         str(group["name"]): float(group["lr"])
@@ -3646,11 +4196,12 @@ def train(args: argparse.Namespace) -> None:
                     ),
                     "grad_clip_muon_clipped": norms["muon"]["clipped"],
                     "grad_clip_adamw_clipped": norms["adamw"]["clipped"],
-                    "shifted_targets": (
-                        step * RECIPE.effective_batch * config.model_length
-                    ),
+                    "shifted_targets": step * RECIPE.effective_batch * config.model_length,
                     "interval_training_seconds": interval_seconds,
                     "shifted_targets_per_second": targets / interval_seconds,
+                    "wall_effective_shifted_targets_per_second": (
+                        targets / total_interval_seconds
+                    ),
                     "training_compute_elapsed_seconds": training_compute_elapsed,
                     "wall_elapsed_seconds": time.perf_counter() - wall_started,
                     "training_peak_allocated_bytes": training_peak_allocated,
@@ -3679,9 +4230,7 @@ def train(args: argparse.Namespace) -> None:
                         environment=environment,
                     ),
                     output_dir / f"dwarf_step_{step:07d}.pt",
-                    producer_streams={
-                        device: torch.cuda.current_stream(device)
-                    },
+                    producer_streams={device: torch.cuda.current_stream(device)},
                 )
 
             if logged:
@@ -3856,7 +4405,7 @@ def self_test() -> None:
             "canonical HISA binding rank changed",
         )
         _require(
-            int(attention.binding_state_version) == 3,
+            int(attention.binding_state_version) == 4,
             "canonical HISA binder state version changed",
         )
         _require(
@@ -3875,6 +4424,13 @@ def self_test() -> None:
             and attention.routing_candidate_multiplier
             == model.config.hisa_routing_candidate_multiplier,
             "canonical HISA hierarchical selection changed",
+        )
+        _require(
+            attention.router_adapter_rank == model.config.hisa_router_adapter_rank
+            and attention.route_aux_detach_core_qk
+            and not attention.representative_prior_after_exact_rerank
+            and attention.exploration_policy == "candidate_tail",
+            "canonical HISA v4 routing-isolation contract changed",
         )
         _require(
             attention.backend == model.config.hisa_backend,
@@ -3956,6 +4512,7 @@ def self_test() -> None:
             "adam_null",
             "adam_npci",
             "adam_route",
+            "adam_router_adapter",
             "adam_binding_calibration",
             "adam_ema",
             "adam_positional",
@@ -3966,7 +4523,7 @@ def self_test() -> None:
         metadata["complexity"]["selector_compute"]
         == "quadratic_at_fixed_chunk_size_with_parent_group_reduction"
         and metadata["complexity"]["selector_workspace"]
-        == "bounded_streaming_top_m_without_full_differentiable_surface",
+        == "bounded_streaming_top_m_plus_direct_selected-address Triton scoring",
         "release metadata misstates HISA selector complexity",
     )
     _require(
@@ -3987,9 +4544,45 @@ def self_test() -> None:
             "route_aux_teacher_key": "base_global_k",
             "global_attention_key": "post_packet_rotated_global_k",
             "global_attention_value": "post_packet_rotated_global_v",
+            "student_router_stream": (
+                "detached_core_plus_low_rank_router_adapter"
+            ),
+            "router_adapter_rank": 32,
         },
         "L17 base-owned route-source contract changed",
     )
+    boundary_rows = torch.tensor(
+        [
+            [5, 6, 7, 4],
+            [5, 4, 6, 7],
+        ],
+        dtype=torch.int64,
+    )
+    _require_raises(
+        ValueError,
+        lambda: preflight_training_rows(
+            boundary_rows,
+            selected_rows=2,
+            vocab_size=16,
+            pad_token_id=2,
+            eod_token_id=4,
+            document_boundary_policy="single_document_rows",
+        ),
+        "single-document policy accepted an internal EOD boundary",
+    )
+    unsafe_preflight = preflight_training_rows(
+        boundary_rows,
+        selected_rows=2,
+        vocab_size=16,
+        pad_token_id=2,
+        eod_token_id=4,
+        document_boundary_policy="allow_packed_unsafe",
+    )
+    _require(
+        unsafe_preflight["internal_eod_tokens"] == 1,
+        "unsafe packed-row preflight did not report the internal boundary",
+    )
+
     print(
         json.dumps(
             {
@@ -4018,7 +4611,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-id")
     parser.add_argument("--dataset-sha256")
     parser.add_argument("--trust-dataset-sha256", action="store_true")
-    parser.add_argument("--resume")
+    parser.add_argument(
+        "--document-boundary-policy",
+        choices=("single_document_rows", "allow_packed_unsafe"),
+        default="single_document_rows",
+        help=(
+            "reject internal <|eod|> boundaries by default; the unsafe override "
+            "is a deliberate noncanonical ablation"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostics",
+        choices=("off", "summary", "full"),
+        default="off",
+        help=(
+            "deep diagnostics require an additional eager model forward; off is "
+            "the full-throughput default"
+        ),
+    )
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume")
+    resume_group.add_argument(
+        "--resume-prefix-extension",
+        help=(
+            "restore full state through a separately contracted sequential-prefix "
+            "dataset extension"
+        ),
+    )
+    parser.add_argument("--prefix-extension-contract")
     parser.add_argument(
         "--allow-source-mismatch",
         action="store_true",
@@ -4029,7 +4649,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="allow resume after an explicitly reviewed runtime ABI change",
     )
-
     parser.add_argument(
         "--export-weights",
         help="write a weights-only release artifact after the requested final step",
@@ -4043,10 +4662,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dataset and --output-dir are required for training")
     if args.trust_dataset_sha256 and not args.dataset_sha256:
         parser.error("--trust-dataset-sha256 requires --dataset-sha256")
-    if args.allow_source_mismatch and not args.resume:
-        parser.error("--allow-source-mismatch requires --resume")
-    if args.allow_environment_mismatch and not args.resume:
-        parser.error("--allow-environment-mismatch requires --resume")
+    if args.resume_prefix_extension and not args.prefix_extension_contract:
+        parser.error("--resume-prefix-extension requires --prefix-extension-contract")
+    if args.prefix_extension_contract and not args.resume_prefix_extension:
+        parser.error("--prefix-extension-contract requires --resume-prefix-extension")
+    if args.allow_source_mismatch and not (args.resume or args.resume_prefix_extension):
+        parser.error("--allow-source-mismatch requires a resume mode")
+    if args.allow_environment_mismatch and not (
+        args.resume or args.resume_prefix_extension
+    ):
+        parser.error("--allow-environment-mismatch requires a resume mode")
     return args
 
 
