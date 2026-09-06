@@ -134,11 +134,12 @@ EXPECTED_TRAINABLE_PARAMETERS = 100_290_405
 EXPECTED_STATE_FINGERPRINT = "099c313d786bc6879926c842f479cf45c84954cf3612bac4a4b656578518960a"
 EXPECTED_SEEDED_RNG_FINGERPRINT = "ba02b103e767eb3ccc7420da1e82900f816843d5ac49aa42e82f87b7d7405f63"
 EXPECTED_SOURCE_AST_SHA256: dict[str, str] = {
-    "train/train_dwarf.py": "bbadffa65f80073d92117bca6d70ceb0d93f4a43ee2e96f24c2fa6a3a41f7b9d",
-    "kernels/causal_ema_scan.py": "32708b361ad30ed393d7a135c70d603cc078ec64957fec50050a841bd96a30bf",
-    "kernels/dsqg_attention_v23.py": "60e3fa45b5aaf476b0802e06b8fd4067092e14bfd3dd5dd165a33b4d78cdc6d3",
-    "kernels/hierarchical_sparse_attn_v19_hisa.py": "bfa7715f46c1dd9c2f746012e498b909a9d85e0cd61302140702d91e6196854b",
+    'train/train_dwarf.py': '898201afda342ce262dd78cbe1232fdcc827464ee478796145f4bd8568c7783f',
+    'kernels/causal_ema_scan.py': 'd531c6f8a1ba23fb8fdcbb7bc36337c8922a245863f0140a880717d257a1d0ed',
+    'kernels/dsqg_attention_v23.py': '70cbcf568ee485247783581623ba040b1b6bf3479cf2654db7cf9a3accd72804',
+    'kernels/hierarchical_sparse_attn_v19_hisa.py': 'bfd831d3b7f5903e36bcca6e945ef0f2f70395bfa328b681149f1d85d6483b22',
 }
+
 CANONICAL_TOKENIZER_SHA256 = (
     "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
 )
@@ -376,7 +377,9 @@ class DwarfConfig:
         if self.hisa_route_aux_samples < 0:
             raise ValueError("HISA route auxiliary sample count must be non-negative")
         if self.hisa_route_aux_samples == 0 and (
-            self.hisa_route_aux_weight > 0 or self.hisa_global_mass_aux_weight > 0
+            self.hisa_route_aux_weight > 0
+            or self.hisa_global_mass_aux_weight > 0
+            or (self.hisa_binding_rank > 0 and self.hisa_binding_null_aux_weight > 0)
         ):
             raise ValueError("HISA teacher auxiliaries require sampled routing rows")
         if not isinstance(self.hisa_require_auxiliary_return, bool):
@@ -640,13 +643,40 @@ class _CanonicalSourceNormalizer(ast.NodeTransformer):
         return node
 
 
+def _canonical_ast_dump_v1(node: ast.AST) -> str:
+    """Serialize semantic AST fields independently of ast.dump defaults.
+
+    Version 1 omits empty lists and optional None fields, retains literal None,
+    and includes explicit field names and context nodes. In particular it is
+    independent of Python 3.13's ast.dump(show_empty=False) default and later
+    pretty-printer changes. New syntax still changes the serialized tree.
+    """
+    def render(value: Any) -> str:
+        if isinstance(value, ast.AST):
+            fields = []
+            for name, child in ast.iter_fields(value):
+                if isinstance(child, list) and not child:
+                    continue
+                if child is None and not (
+                    isinstance(value, ast.Constant) and name == "value"
+                ):
+                    continue
+                fields.append(f"{name}={render(child)}")
+            return f"{type(value).__name__}({', '.join(fields)})"
+        if isinstance(value, list):
+            return f"[{', '.join(render(child) for child in value)}]"
+        return repr(value)
+
+    if not isinstance(node, ast.AST):
+        raise TypeError("canonical AST serialization requires an AST node")
+    return render(node)
+
+
 def _semantic_ast_sha256(path: Path) -> str:
     tree = ast.parse(path.read_text(), filename=str(path))
     normalized = _CanonicalSourceNormalizer().visit(tree)
     ast.fix_missing_locations(normalized)
-    payload = ast.dump(
-        normalized, annotate_fields=True, include_attributes=False
-    ).encode()
+    payload = b"dwarf-python-ast-v1\x00" + _canonical_ast_dump_v1(normalized).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -714,6 +744,7 @@ def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
             "compile_mode": "default",
             "compile_dynamic": False,
             "compiled_backward_autocast": "off",
+            "inductor_deterministic": True,
         },
     }
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
@@ -990,8 +1021,68 @@ def assert_public_kernel_contracts() -> None:
                 message=f"causal EMA {name} gradient changed",
             )
 
+        ema_source = ast.parse(source_locations()["kernels/causal_ema_scan.py"].read_text())
+        ema_backward_nodes = [
+            node for node in ast.walk(ema_source)
+            if isinstance(node, ast.FunctionDef) and node.name == "_ema3_bwd_serial"
+        ]
+        _require(len(ema_backward_nodes) == 1, "causal EMA backward kernel is absent")
+        _require(
+            not any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "atomic_add"
+                for call in ast.walk(ema_backward_nodes[0])
+            ),
+            "EMA unordered factor-gradient accumulation returned",
+        )
+
         # DSQG: state compatibility, support boundary, strict causality, and
         # bounded live telemetry.
+        # Keep the shared-gradient replay fix covered on the public surface;
+        # numerical repeatability is additionally qualified on CUDA.
+        dsqg_source = ast.parse(source_locations()["kernels/dsqg_attention_v23.py"].read_text())
+        dsqg_backward_names = {
+            "_bwd_dq_v23", "_bwd_dq_v23_banded",
+            "_bwd_dkdv_v23", "_bwd_dkdv_v23_banded",
+        }
+        dsqg_backward_nodes = {
+            node.name: node for node in ast.walk(dsqg_source)
+            if isinstance(node, ast.FunctionDef) and node.name in dsqg_backward_names
+        }
+        _require(
+            set(dsqg_backward_nodes) == dsqg_backward_names,
+            "DSQG shared-gradient backward kernels are absent",
+        )
+        for name, node in dsqg_backward_nodes.items():
+            _require(
+                not any(
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "atomic_add"
+                    for call in ast.walk(node)
+                ),
+                f"DSQG unordered shared-gradient accumulation returned: {name}",
+            )
+        hisa_source = ast.parse(
+            source_locations()["kernels/hierarchical_sparse_attn_v19_hisa.py"].read_text()
+        )
+        selected_source_found = False
+        for node in ast.walk(hisa_source):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith(
+                "_selected_address_score_backward_"
+            ):
+                selected_source_found |= node.name == "_selected_address_score_backward_source_kernel"
+                _require(
+                    not any(
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "atomic_add"
+                        for call in ast.walk(node)
+                    ),
+                    "HISA unordered selected-address gradient accumulation returned",
+                )
+        _require(selected_source_found, "HISA selected-address source backward is absent")
         dsqg_kwargs = {
             "embedding_dim": 64,
             "num_heads": 4,
@@ -1128,6 +1219,79 @@ def assert_public_kernel_contracts() -> None:
         _require(
             "global_attention_mass" in hisa._routing_diagnostics,
             "HISA live routing diagnostics were not populated",
+        )
+
+        # Null-only supervision must pass the same guard used by GPU warmup,
+        # without requiring gradients from disabled routing/mass objectives.
+        null_only = HierarchicalSparseAttentionV19HISACausal(
+            **{**hisa_kwargs, "route_aux_weight": 0.0, "global_mass_aux_weight": 0.0}
+        ).train()
+        null_output, null_auxiliary = null_only(
+            hisa_input.detach(),
+            route_aux_tile_ids=auxiliary_ids,
+            return_auxiliary=True,
+        )
+        null_language_loss = null_output.square().mean()
+        null_total = null_language_loss + null_auxiliary
+        null_contract = assert_hisa_auxiliary_gradient_contract(
+            total_loss=null_total,
+            auxiliary=null_auxiliary,
+            attention_modules=(null_only,),
+        )
+        _require(
+            null_contract["binder_calibration"] > 0.0
+            and null_contract["route_prior"] == 0.0
+            and null_contract["lane_calibration"] == 0.0,
+            "HISA null-only auxiliary contract changed",
+        )
+        _require_raises(
+            AssertionError,
+            lambda: assert_hisa_auxiliary_gradient_contract(
+                total_loss=null_language_loss + null_auxiliary.detach(),
+                auxiliary=null_auxiliary,
+                attention_modules=(null_only,),
+            ),
+            "HISA detached null-only auxiliary passed the total-loss guard",
+        )
+        null_total.backward()
+
+        # Compiled warmup consumes its auxiliary probe rather than retaining
+        # donated buffers, then builds a fresh graph for training backward.
+        hisa.zero_grad(set_to_none=True)
+        probe_output, probe_auxiliary = hisa(
+            hisa_input.detach(),
+            route_aux_tile_ids=auxiliary_ids,
+            return_auxiliary=True,
+        )
+        assert_hisa_auxiliary_gradient_contract(
+            total_loss=probe_output.square().mean() + probe_auxiliary,
+            auxiliary=probe_auxiliary,
+            attention_modules=(hisa,),
+            retain_graph=False,
+        )
+        _require(
+            all(parameter.grad is None for parameter in hisa.parameters()),
+            "HISA consumptive auxiliary probe accumulated parameter gradients",
+        )
+        _require_raises(
+            RuntimeError,
+            lambda: probe_auxiliary.backward(),
+            "HISA consumptive auxiliary probe retained its graph",
+        )
+        fresh_output, fresh_auxiliary = hisa(
+            hisa_input.detach(),
+            route_aux_tile_ids=auxiliary_ids,
+            return_auxiliary=True,
+        )
+        (fresh_output.square().mean() + fresh_auxiliary).backward()
+        _require(
+            any(parameter.grad is not None for parameter in hisa.parameters())
+            and all(
+                torch.isfinite(parameter.grad).all()
+                for parameter in hisa.parameters()
+                if parameter.grad is not None
+            ),
+            "HISA fresh backward after consumptive probe failed",
         )
 
         hisa.eval()
@@ -2825,14 +2989,14 @@ def compiled_training_callables(
         _TrainingForwardCallable(
             model, diagnostics=False, exploration_disabled=False
         ),
-        mode="default",
+        options={"deterministic": True},
         dynamic=False,
     )
     no_exploration = torch.compile(
         _TrainingForwardCallable(
             model, diagnostics=False, exploration_disabled=True
         ),
-        mode="default",
+        options={"deterministic": True},
         dynamic=False,
     )
     if diagnostics_enabled:
@@ -3505,8 +3669,9 @@ def amp_context():
 def configure_compiled_backward_autocast() -> dict[str, str | bool]:
     try:
         from torch._functorch import config as functorch_config
+        from torch._inductor import config as inductor_config
     except ImportError as error:
-        raise RuntimeError("compiled backward autocast policy is unavailable") from error
+        raise RuntimeError("compiled training numerical policy is unavailable") from error
     previous = getattr(functorch_config, "backward_pass_autocast", None)
     if not isinstance(previous, str):
         raise RuntimeError("compiled backward autocast policy is unavailable")
@@ -3514,7 +3679,18 @@ def configure_compiled_backward_autocast() -> dict[str, str | bool]:
     observed = getattr(functorch_config, "backward_pass_autocast", None)
     if observed != "off":
         raise RuntimeError("compiled backward autocast policy could not be set")
-    return {"previous": previous, "observed": observed, "required": True}
+    # Timing-selected reduction tiles can change floating-point sum order
+    # across fresh processes/cache rebuilds despite an exact checkpoint restore.
+    # Freeze numerical choices, not compilation or AOT buffer donation.
+    if not isinstance(getattr(inductor_config, "deterministic", None), bool):
+        raise RuntimeError("deterministic compiled reductions are unavailable")
+    inductor_config.deterministic = True
+    if inductor_config.deterministic is not True:
+        raise RuntimeError("deterministic compiled reductions could not be set")
+    return {
+        "previous": previous, "observed": observed, "required": True,
+        "inductor_deterministic": True,
+    }
 
 
 def _assert_finite(value: torch.Tensor, message: str) -> None:
@@ -3526,8 +3702,15 @@ def assert_hisa_auxiliary_gradient_contract(
     total_loss: torch.Tensor,
     auxiliary: torch.Tensor,
     attention_modules: Iterable[HierarchicalSparseAttentionV19HISACausal],
+    retain_graph: bool = True,
 ) -> dict[str, float | int]:
-    """Synchronously prove that every v4 HISA auxiliary family is connected."""
+    """Prove that each enabled HISA auxiliary family is connected.
+
+    Disabled families have zero diagnostic totals; their parameters need not
+    receive auxiliary gradients (or be trainable in an objective-only probe).
+    Compiled callers must consume the probe with retain_graph=False and use a
+    fresh forward for training backward: AOT donated buffers cannot be reused.
+    """
     modules = tuple(attention_modules)
     _require(bool(modules), "HISA auxiliary diagnostic has no attention modules")
     _require(
@@ -3537,7 +3720,7 @@ def assert_hisa_auxiliary_gradient_contract(
     _require(torch.isfinite(auxiliary).all(), "HISA auxiliary is non-finite")
     _require(auxiliary.requires_grad, "HISA auxiliary does not require grad")
     total_to_auxiliary = torch.autograd.grad(
-        total_loss, auxiliary, retain_graph=True, allow_unused=True
+        total_loss, auxiliary, retain_graph=retain_graph, allow_unused=True
     )[0]
     _require(
         total_to_auxiliary is not None
@@ -3555,28 +3738,34 @@ def assert_hisa_auxiliary_gradient_contract(
 
     for module in modules:
         layout: dict[str, int] = {}
-        for name in (
-            "route_prior_raw",
-            "representative_coherence_raw",
-            "parent_coherence_raw",
-            "global_lane_logit_bias",
-            "global_route_confidence_weight",
-            "global_route_confidence_bias",
-            "count_correction_raw",
-        ):
-            add(layout, name, getattr(module, name))
+        if module.route_aux_weight > 0.0:
+            for name in (
+                "route_prior_raw",
+                "representative_coherence_raw",
+                "parent_coherence_raw",
+            ):
+                add(layout, name, getattr(module, name))
+        if module.global_mass_aux_weight > 0.0:
+            for name in (
+                "global_lane_logit_bias",
+                "global_route_confidence_weight",
+                "global_route_confidence_bias",
+                "count_correction_raw",
+            ):
+                add(layout, name, getattr(module, name))
         if module.representative_mode == "mean_max_blend":
             _require(
                 module.representative_mix_raw.requires_grad,
                 "active HISA representative mixture is frozen",
             )
-            add(layout, "representative_mix_raw", module.representative_mix_raw)
+            if module.route_aux_weight > 0.0:
+                add(layout, "representative_mix_raw", module.representative_mix_raw)
         else:
             _require(
                 not module.representative_mix_raw.requires_grad,
                 "inactive HISA representative mixture remains trainable",
             )
-        if module.router_adapter_rank:
+        if module.router_adapter_rank and module.route_aux_weight > 0.0:
             adapters = {
                 "router_q_down": module.router_q_down,
                 "router_q_up": module.router_q_up,
@@ -3602,7 +3791,7 @@ def assert_hisa_auxiliary_gradient_contract(
         layouts.append((module, layout))
 
     gradients = torch.autograd.grad(
-        auxiliary, tuple(parameters), retain_graph=True, allow_unused=True
+        auxiliary, tuple(parameters), retain_graph=retain_graph, allow_unused=True
     )
     totals: dict[str, float | int] = {
         "attention_modules": len(modules),
@@ -3625,21 +3814,22 @@ def assert_hisa_auxiliary_gradient_contract(
         return float(gradient.detach().float().abs().sum())
 
     for module, layout in layouts:
-        route_value = magnitude(
-            "route_prior_raw", gradients[layout["route_prior_raw"]]
-        )
-        child_value = magnitude(
-            "representative_coherence_raw",
-            gradients[layout["representative_coherence_raw"]],
-        )
-        parent_value = magnitude(
-            "parent_coherence_raw", gradients[layout["parent_coherence_raw"]]
-        )
-        _require(route_value > 0.0, "HISA route auxiliary has zero route-prior gradient")
-        _require(child_value > 0.0, "HISA route auxiliary has zero child-coherence gradient")
-        totals["route_prior"] += route_value
-        totals["child_coherence"] += child_value
-        totals["parent_coherence"] += parent_value
+        if module.route_aux_weight > 0.0:
+            route_value = magnitude(
+                "route_prior_raw", gradients[layout["route_prior_raw"]]
+            )
+            child_value = magnitude(
+                "representative_coherence_raw",
+                gradients[layout["representative_coherence_raw"]],
+            )
+            parent_value = magnitude(
+                "parent_coherence_raw", gradients[layout["parent_coherence_raw"]]
+            )
+            _require(route_value > 0.0, "HISA route auxiliary has zero route-prior gradient")
+            _require(child_value > 0.0, "HISA route auxiliary has zero child-coherence gradient")
+            totals["route_prior"] += route_value
+            totals["child_coherence"] += child_value
+            totals["parent_coherence"] += parent_value
 
         if "representative_mix_raw" in layout:
             value = magnitude(
@@ -3655,7 +3845,7 @@ def assert_hisa_auxiliary_gradient_contract(
         for name in ("router_q_down", "router_q_up", "router_k_down", "router_k_up"):
             if name in layout:
                 adapter_value += magnitude(name, gradients[layout[name]])
-        if module.router_adapter_rank:
+        if module.router_adapter_rank and module.route_aux_weight > 0.0:
             _require(
                 adapter_value > 0.0,
                 "HISA route auxiliary does not reach the dedicated router adapters",
@@ -3669,7 +3859,8 @@ def assert_hisa_auxiliary_gradient_contract(
             "global_route_confidence_bias",
             "count_correction_raw",
         ):
-            lane_value += magnitude(name, gradients[layout[name]])
+            if name in layout:
+                lane_value += magnitude(name, gradients[layout[name]])
         if module.global_mass_aux_weight > 0.0:
             _require(
                 lane_value > 0.0,
@@ -3693,7 +3884,9 @@ def assert_hisa_auxiliary_gradient_contract(
             )
         totals["binder_calibration"] += binder_value
     if any(
-        module.parent_route_aux_weight > 0.0 and module.hierarchical_routing
+        module.route_aux_weight > 0.0
+        and module.parent_route_aux_weight > 0.0
+        and module.hierarchical_routing
         for module in modules
     ):
         _require(
@@ -3759,7 +3952,19 @@ def warm_compiled_training_step(
                 for module in model.modules()
                 if isinstance(module, HierarchicalSparseAttentionV19HISACausal)
             ),
+            retain_graph=False,
         )
+        # The auxiliary probe consumed this graph. Release it before a fresh
+        # training forward so AOTAutograd can keep buffer donation enabled.
+        del hidden, auxiliary, language_loss, loss
+        with amp_context():
+            hidden, auxiliary = callables.exploration(
+                input_ids, route_ids, exploration_step
+            )
+            language_loss = loss_fn(
+                model.lm_head.weight, hidden.flatten(0, 1), labels.flatten()
+            )
+            loss = language_loss + auxiliary
         loss.backward()
         _assert_finite(loss.detach(), "exploration compile warm-up loss is non-finite")
         torch.cuda.synchronize(device)
@@ -3788,6 +3993,7 @@ def warm_compiled_training_step(
         contract["no_exploration_auxiliary"] = float(auxiliary_off.detach())
         return contract
     finally:
+        model.zero_grad(set_to_none=True)
         _restore_rng_state(state, device)
 
 
@@ -4681,4 +4887,3 @@ if __name__ == "__main__":
         self_test()
     else:
         train(arguments)
-

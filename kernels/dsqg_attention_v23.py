@@ -76,6 +76,7 @@ _DSQG_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": 64}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_N": 64}, num_warps=8, num_stages=3),
 ]
+_DSQG_MIN_AUTOTUNE_BLOCK_N = min(config.kwargs["BLOCK_N"] for config in _DSQG_AUTOTUNE_CONFIGS)
 
 
 ALL_OFFSETS = [
@@ -269,6 +270,7 @@ def _bwd_dq_v23(
     BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
     J_VAL: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
     QUERY_START: tl.constexpr,
+    GRAD_BLOCKS: tl.constexpr,
 ):
     """Compute exact D and dQ together without saving a FP32 forward output."""
     bh = tl.program_id(0)
@@ -348,14 +350,14 @@ def _bwd_dq_v23(
     dq = (response_key - delta_row[:, None] * probability_key) * scale
     dnull_score = -null_probability * delta_row
     dnull_key = tl.sum(dnull_score[:, None] * query, axis=0) * scale
-    tl.atomic_add(
-        DNULL_KEY + head * stride_nkh + dims * stride_nkd,
-        dnull_key, mask=dmask, sem="relaxed",
+    partial = (batch * H + head) * GRAD_BLOCKS + block
+    tl.store(
+        DNULL_KEY + partial * HD + dims,
+        dnull_key, mask=dmask,
     )
-    tl.atomic_add(
-        DNULL_BIAS + head,
+    tl.store(
+        DNULL_BIAS + partial,
         tl.sum(tl.where(qmask, dnull_score, 0.0)),
-        sem="relaxed",
     )
     tl.store(
         DELTA + batch * stride_db + head * stride_dh + positions * stride_dn,
@@ -396,6 +398,7 @@ def _bwd_dkdv_v23(
     BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
     J_VAL: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
     QUERY_START: tl.constexpr, SOURCE_END: tl.constexpr,
+    GRAD_BLOCKS: tl.constexpr,
 ):
     bhkv = tl.program_id(0)
     block = tl.program_id(1)
@@ -463,14 +466,15 @@ def _bwd_dkdv_v23(
             dscore = probability * (tl.sum(dout * value, axis=1) - delta_row)
             dk += dscore[:, None] * query * scale
             dv += probability[:, None] * dout
-            tl.atomic_add(
-                DPOS_BIAS + logical_index * stride_pbi + head * stride_pbh,
-                tl.sum(tl.where(valid, dscore, 0.0)), sem="relaxed",
+            partial = ((batch * H + head) * GRAD_BLOCKS + block) * J_VAL + logical_index
+            tl.store(
+                DPOS_BIAS + partial,
+                tl.sum(tl.where(valid, dscore, 0.0)),
             )
             dscale = tl.sum(dscore[:, None] * query, axis=0) * scale
-            tl.atomic_add(
-                DSCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
-                dscale, mask=dmask, sem="relaxed",
+            tl.store(
+                DSCALE_EMBED + partial * HD + dims,
+                dscale, mask=dmask,
             )
 
     # DK/DV have the BF16 Triton-input dtype. The grouped reductions above
@@ -640,6 +644,8 @@ def _bwd_dq_v23_banded(
     BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
     J_ACTIVE: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
     QUERY_START: tl.constexpr, QUERY_END: tl.constexpr,
+    GRAD_BLOCKS: tl.constexpr,
+    GRAD_BLOCK_OFFSET: tl.constexpr,
 ):
     bh = tl.program_id(0)
     block = tl.program_id(1)
@@ -711,14 +717,15 @@ def _bwd_dq_v23_banded(
         delta_row += probability * response
     dq = (response_key - delta_row[:, None] * probability_key) * scale
     dnull_score = -null_probability * delta_row
-    tl.atomic_add(
-        DNULL_KEY + head * stride_nkh + dims * stride_nkd,
+    partial = (batch * H + head) * GRAD_BLOCKS + GRAD_BLOCK_OFFSET + block
+    tl.store(
+        DNULL_KEY + partial * HD + dims,
         tl.sum(dnull_score[:, None] * query, axis=0) * scale,
-        mask=dmask, sem="relaxed",
+        mask=dmask,
     )
-    tl.atomic_add(
-        DNULL_BIAS + head,
-        tl.sum(tl.where(qmask, dnull_score, 0.0)), sem="relaxed",
+    tl.store(
+        DNULL_BIAS + partial,
+        tl.sum(tl.where(qmask, dnull_score, 0.0)),
     )
     tl.store(
         DELTA + batch * stride_db + head * stride_dh + positions * stride_dn,
@@ -750,6 +757,8 @@ def _bwd_dkdv_v23_banded(
     J_ACTIVE: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
     QUERY_START: tl.constexpr, SOURCE_START: tl.constexpr,
     SOURCE_END: tl.constexpr,
+    GRAD_BLOCKS: tl.constexpr,
+    GRAD_BLOCK_OFFSET: tl.constexpr, GRAD_J: tl.constexpr,
 ):
     bhkv = tl.program_id(0)
     block = tl.program_id(1)
@@ -812,14 +821,15 @@ def _bwd_dkdv_v23_banded(
             dscore = probability * (tl.sum(dout * value, axis=1) - delta_row)
             dk += dscore[:, None] * query * scale
             dv += probability[:, None] * dout
-            tl.atomic_add(
-                DPOS_BIAS + logical_index * stride_pbi + head * stride_pbh,
-                tl.sum(tl.where(valid, dscore, 0.0)), sem="relaxed",
+            partial = ((batch * H + head) * GRAD_BLOCKS + GRAD_BLOCK_OFFSET + block) * GRAD_J + logical_index
+            tl.store(
+                DPOS_BIAS + partial,
+                tl.sum(tl.where(valid, dscore, 0.0)),
             )
-            tl.atomic_add(
-                DSCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
+            tl.store(
+                DSCALE_EMBED + partial * HD + dims,
                 tl.sum(dscore[:, None] * query, axis=0) * scale,
-                mask=dmask, sem="relaxed",
+                mask=dmask,
             )
     tl.store(
         DK + batch * stride_dkb + kv_head * stride_dkh
@@ -978,6 +988,17 @@ class _DSQGV23Fn(torch.autograd.Function):
 
         if ctx.query_start < seq_len:
             if ctx.use_bands:
+                query_blocks = sum(
+                    triton.cdiv(stop - start, _band_launch_geometry(active)[0])
+                    for start, stop, active in ctx.query_bands
+                )
+                partial_null_key = torch.zeros(
+                    (batch, heads, query_blocks, head_dim), device=q.device, dtype=torch.float32
+                )
+                partial_null_bias = torch.zeros(
+                    (batch, heads, query_blocks), device=q.device, dtype=torch.float32
+                )
+                query_block_offset = 0
                 for band_start, band_end, active in ctx.query_bands:
                     block_n, warps, stages = _band_launch_geometry(active)
                     grid = (
@@ -986,7 +1007,7 @@ class _DSQGV23Fn(torch.autograd.Function):
                     )
                     _bwd_dq_v23_banded[grid](
                         q, k, v, pos_bias, scale_embed, null_key, null_bias,
-                        dout, lse, delta, dq, dnull_key, dnull_bias, offsets_dev,
+                        dout, lse, delta, dq, partial_null_key, partial_null_bias, offsets_dev,
                         log_valid_count,
                         *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
                         *lse.stride(), *delta.stride(), *dq.stride(),
@@ -995,16 +1016,29 @@ class _DSQGV23Fn(torch.autograd.Function):
                         BLOCK_N=block_n, BLOCK_HD=ctx.block_hd, J_ACTIVE=active,
                         KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
                         QUERY_START=band_start, QUERY_END=band_end,
+                        GRAD_BLOCKS=query_blocks, GRAD_BLOCK_OFFSET=query_block_offset,
                         num_warps=warps, num_stages=stages,
                     )
+                    query_block_offset += grid[1]
+                dnull_key = partial_null_key.sum(dim=(0, 2))
+                dnull_bias = partial_null_bias.sum(dim=(0, 2))
             else:
+                # Autotuning may choose any tile: reserve and zero enough slots
+                # for the smallest tile, and reduce untouched slots as zeros.
+                query_blocks = triton.cdiv(seq_len - ctx.query_start, _DSQG_MIN_AUTOTUNE_BLOCK_N)
+                partial_null_key = torch.zeros(
+                    (batch, heads, query_blocks, head_dim), device=q.device, dtype=torch.float32
+                )
+                partial_null_bias = torch.zeros(
+                    (batch, heads, query_blocks), device=q.device, dtype=torch.float32
+                )
                 query_grid = lambda meta: (
                     batch * heads,
                     triton.cdiv(seq_len - ctx.query_start, meta["BLOCK_N"]),
                 )
                 _bwd_dq_v23[query_grid](
                     q, k, v, pos_bias, scale_embed, null_key, null_bias,
-                    dout, lse, delta, dq, dnull_key, dnull_bias, offsets_dev,
+                    dout, lse, delta, dq, partial_null_key, partial_null_bias, offsets_dev,
                     log_valid_count,
                     *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
                     *lse.stride(), *delta.stride(), *dq.stride(),
@@ -1013,11 +1047,27 @@ class _DSQGV23Fn(torch.autograd.Function):
                     BLOCK_HD=ctx.block_hd, J_VAL=ctx.j_val,
                     KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
                     QUERY_START=ctx.query_start,
+                    GRAD_BLOCKS=query_blocks,
                 )
+                dnull_key = partial_null_key.sum(dim=(0, 2))
+                dnull_bias = partial_null_bias.sum(dim=(0, 2))
 
         if ctx.source_end > 0:
             kv_heads = heads // ctx.kv_head_group_size
             if ctx.use_bands:
+                source_blocks = sum(
+                    triton.cdiv(stop - start, _band_launch_geometry(active)[0])
+                    for start, stop, active in ctx.source_bands
+                )
+                # Each CTA owns a partial slot. One fixed-order reduction after
+                # all bands avoids atomic rounding races and per-band launches.
+                partial_pos_bias = torch.zeros(
+                    (batch, heads, source_blocks, ctx.j_val), device=q.device, dtype=torch.float32
+                )
+                partial_scale_embed = torch.zeros(
+                    (batch, heads, source_blocks, ctx.j_val, head_dim), device=q.device, dtype=torch.float32
+                )
+                source_block_offset = 0
                 for source_start, source_stop, active in ctx.source_bands:
                     block_n, warps, stages = _band_launch_geometry(active)
                     grid = (
@@ -1026,7 +1076,7 @@ class _DSQGV23Fn(torch.autograd.Function):
                     )
                     _bwd_dkdv_v23_banded[grid](
                         q, k, v, pos_bias, scale_embed, dout, lse, delta,
-                        dk_accum, dv_accum, dpos_bias, dscale_embed, offsets_dev,
+                        dk_accum, dv_accum, partial_pos_bias, partial_scale_embed, offsets_dev,
                         *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
                         *lse.stride(), *delta.stride(),
                         *dk_accum.stride(), *dv_accum.stride(),
@@ -1036,16 +1086,28 @@ class _DSQGV23Fn(torch.autograd.Function):
                         KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
                         QUERY_START=ctx.query_start,
                         SOURCE_START=source_start, SOURCE_END=source_stop,
+                        GRAD_BLOCKS=source_blocks, GRAD_BLOCK_OFFSET=source_block_offset,
+                        GRAD_J=ctx.j_val,
                         num_warps=warps, num_stages=stages,
                     )
+                    source_block_offset += grid[1]
+                dpos_bias = partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
+                dscale_embed = partial_scale_embed.sum(dim=(0, 1, 2))
             else:
+                source_blocks = triton.cdiv(ctx.source_end, _DSQG_MIN_AUTOTUNE_BLOCK_N)
+                partial_pos_bias = torch.zeros(
+                    (batch, heads, source_blocks, ctx.j_val), device=q.device, dtype=torch.float32
+                )
+                partial_scale_embed = torch.zeros(
+                    (batch, heads, source_blocks, ctx.j_val, head_dim), device=q.device, dtype=torch.float32
+                )
                 kv_grid = lambda meta: (
                     batch * kv_heads,
                     triton.cdiv(ctx.source_end, meta["BLOCK_N"]),
                 )
                 _bwd_dkdv_v23[kv_grid](
                     q, k, v, pos_bias, scale_embed, dout, lse, delta,
-                    dk_accum, dv_accum, dpos_bias, dscale_embed, offsets_dev,
+                    dk_accum, dv_accum, partial_pos_bias, partial_scale_embed, offsets_dev,
                     *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
                     *lse.stride(), *delta.stride(),
                     *dk_accum.stride(), *dv_accum.stride(),
@@ -1054,7 +1116,10 @@ class _DSQGV23Fn(torch.autograd.Function):
                     BLOCK_HD=ctx.block_hd, J_VAL=ctx.j_val,
                     KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
                     QUERY_START=ctx.query_start, SOURCE_END=ctx.source_end,
+                    GRAD_BLOCKS=source_blocks,
                 )
+                dpos_bias = partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
+                dscale_embed = partial_scale_embed.sum(dim=(0, 1, 2))
 
         gradients = (
             dq, dk_accum, dv_accum, dpos_bias, dscale_embed,

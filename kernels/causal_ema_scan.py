@@ -122,7 +122,6 @@ if _TRITON_AVAILABLE:
     @triton.autotune(
         configs=_EMA_AUTOTUNE_CONFIGS,
         key=["N", "D", "COMPUTE_DA"],
-        reset_to_zero=["DA"],
         cache_results=True,
     )
     @triton.jit
@@ -133,6 +132,7 @@ if _TRITON_AVAILABLE:
         DX,
         A,
         DA,
+        B: tl.constexpr,
         N,
         D: tl.constexpr,
         sxb,
@@ -218,9 +218,27 @@ if _TRITON_AVAILABLE:
                 da1 += tl.where(dmask, l1 * (value - p1), 0.0)
                 da2 += tl.where(dmask, l2 * (value - p2), 0.0)
         if COMPUTE_DA:
-            tl.atomic_add(DA, tl.sum(da0, axis=0), sem="relaxed")
-            tl.atomic_add(DA + 1, tl.sum(da1, axis=0), sem="relaxed")
-            tl.atomic_add(DA + 2, tl.sum(da2, axis=0), sem="relaxed")
+            # Own one partial per batch/channel, independent of the autotuned
+            # dimension tile. Neither CTA completion nor BD changes sum order.
+            index = batch * D + dims
+            tl.store(DA + index, da0, mask=dmask)
+            tl.store(DA + B * D + index, da1, mask=dmask)
+            tl.store(DA + 2 * B * D + index, da2, mask=dmask)
+
+    @triton.jit
+    def _ema3_reduce_factor_gradients(
+        PARTIALS, DA, TOTAL: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        factor = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK)
+        accumulator = tl.zeros([BLOCK], tl.float32)
+        for start in range(tl.cdiv(TOTAL, BLOCK)):
+            index = start * BLOCK + offsets
+            accumulator += tl.load(
+                PARTIALS + factor * TOTAL + index,
+                mask=index < TOTAL, other=0.0,
+            )
+        tl.store(DA + factor, tl.sum(accumulator, axis=0))
 
 
 class _CausalEMA3Fn(torch.autograd.Function):
@@ -256,6 +274,10 @@ class _CausalEMA3Fn(torch.autograd.Function):
         dx = torch.empty_like(x)
         need_da = bool(ctx.needs_input_grad[1])
         da = torch.zeros_like(alpha)
+        partials = (
+            torch.empty((3, batch, width), device=x.device, dtype=torch.float32)
+            if need_da else da
+        )
         grid = lambda meta: (batch * triton.cdiv(width, meta["BD"]),)
         _ema3_bwd_serial[grid](
             x,
@@ -263,7 +285,8 @@ class _CausalEMA3Fn(torch.autograd.Function):
             dy,
             dx,
             alpha,
-            da,
+            partials,
+            batch,
             seq_len,
             width,
             *x.stride(),
@@ -274,6 +297,9 @@ class _CausalEMA3Fn(torch.autograd.Function):
         )
         if not need_da:
             return dx, None
+        _ema3_reduce_factor_gradients[(3,)](
+            partials, da, TOTAL=batch * width, BLOCK=1024, num_warps=4,
+        )
         return dx, da.to(ema_factors.dtype)
 
 

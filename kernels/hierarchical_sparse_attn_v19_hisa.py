@@ -77,7 +77,17 @@ if _FLEX_COMPILE_MODE not in {
         "max-autotune, or max-autotune-no-cudagraphs"
     )
 _COMPILED_FLEX_ATTENTION = (
-    torch.compile(flex_attention, mode=_FLEX_COMPILE_MODE, dynamic=False)
+    # Compile wrappers capture configuration at construction. This nested
+    # graph exists before the trainer configures its runtime, so bind the
+    # numerical policy here instead of inheriting an import-time default.
+    torch.compile(
+        flex_attention,
+        options={
+            **torch._inductor.list_mode_options(_FLEX_COMPILE_MODE, dynamic=False),
+            "deterministic": True,
+        },
+        dynamic=False,
+    )
     if _FLEX_ATTENTION_AVAILABLE
     else None
 )
@@ -1485,6 +1495,7 @@ def _streaming_topk_address_values(
     reduction: str,
     temperature: float,
     coherence_weight: torch.Tensor | float,
+    coherence_log_floor: float = -2.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, heads, seq_len, _ = query_normalized.shape
     entry_count = values.shape[2]
@@ -1509,6 +1520,7 @@ def _streaming_topk_address_values(
             reduction=reduction, temperature=temperature,
             coherence=coherence[:, :, start:end],
             coherence_weight=coherence_weight,
+            coherence_log_floor=coherence_log_floor,
         ).float()
         block_scores = block_scores.masked_fill(
             ~eligibility[:, None, :, start:end], float("-inf")
@@ -1559,6 +1571,7 @@ def _hierarchical_candidate_metadata(
     coherence_weight: torch.Tensor | float,
     parent_coherence_weight: torch.Tensor | float,
     hierarchical: bool,
+    coherence_log_floor: float = -2.0,
 ) -> HISAMetadata:
     batch_size, heads, seq_len, _ = query_normalized.shape
     child_count = addresses.values.shape[2]
@@ -1574,6 +1587,7 @@ def _hierarchical_candidate_metadata(
             local_window=local_window, top_k=candidate_k,
             block_size=streaming_block_size, reduction=reduction,
             temperature=temperature, coherence_weight=coherence_weight,
+            coherence_log_floor=coherence_log_floor,
         )
         indices = torch.where(valid, indices, torch.full_like(indices, -1))
     else:
@@ -1584,6 +1598,7 @@ def _hierarchical_candidate_metadata(
             local_window=local_window, top_k=parent_top_k,
             block_size=streaming_block_size, reduction="max", temperature=1.0,
             coherence_weight=parent_coherence_weight,
+            coherence_log_floor=coherence_log_floor,
         )
         child_offsets = torch.arange(
             group, device=query_normalized.device, dtype=torch.int64
@@ -1630,6 +1645,7 @@ def _hierarchical_candidate_metadata(
             query_normalized, addresses, safe_ids,
             reduction=reduction, temperature=temperature,
             coherence_weight=coherence_weight,
+            coherence_log_floor=coherence_log_floor,
         ).masked_fill(~unique, float("-inf"))
         k = min(max(1, int(candidate_k)), candidate_scores.shape[-1])
         values, order = candidate_scores.topk(k, dim=-1)
@@ -1718,6 +1734,12 @@ def _rerank_candidate_metadata(
     local_window: int,
     exact_rerank: bool,
 ) -> tuple[HISAMetadata, torch.Tensor | None]:
+    """Return selected routes and exact scores aligned with ALL input candidates.
+
+    The second result feeds candidate-tail exploration, so retaining only the
+    final top-K scores would discard the scores of the very pages it samples.
+    None means exact scoring was unnecessary or explicitly disabled.
+    """
     candidate_chunks = candidate_metadata.top_chunk_idx
     if not exact_rerank or candidate_chunks.shape[-1] <= int(top_k):
         selected = candidate_chunks[..., : int(top_k)]
@@ -1740,10 +1762,9 @@ def _rerank_candidate_metadata(
         tile_starts=candidate_metadata.tile_starts,
         valid_lengths=candidate_metadata.valid_lengths,
         chunk_size=candidate_metadata.chunk_size, selector_tile_size=1,
-    ), values
+    ), exact_lse
 
 
-@torch.no_grad()
 @torch.no_grad()
 def _inject_streaming_exploration(
     metadata: HISAMetadata,
@@ -1761,6 +1782,7 @@ def _inject_streaming_exploration(
     reduction: str,
     representative_temperature: float,
     coherence_weight: torch.Tensor | float,
+    coherence_log_floor: float = -2.0,
 ) -> HISAMetadata:
     """Replace one route using the retained top-M tail by default."""
     indices = metadata.top_chunk_idx.to(torch.int64)
@@ -1800,11 +1822,14 @@ def _inject_streaming_exploration(
         candidates = candidate_metadata.top_chunk_idx.to(torch.int64)
         if candidates.shape[:3] != indices.shape[:3]:
             raise ValueError("candidate-tail metadata does not align with final routes")
-        if candidate_scores is None or candidate_scores.shape != candidates.shape:
+        if candidate_scores is not None and candidate_scores.shape != candidates.shape:
+            raise ValueError("candidate scores must align with all candidate-tail IDs")
+        if candidate_scores is None:
             candidate_scores = _selected_routing_scores(
                 query_normalized, addresses, candidates, reduction=reduction,
                 temperature=representative_temperature,
                 coherence_weight=coherence_weight,
+                coherence_log_floor=coherence_log_floor,
             ).detach()
         unseen = (candidates >= 0) & ~(
             candidates[..., None] == indices[..., None, :]
@@ -1843,6 +1868,7 @@ def _inject_streaming_exploration(
                 reduction=reduction, temperature=representative_temperature,
                 coherence=addresses.coherence[:, :, start:end],
                 coherence_weight=coherence_weight,
+                coherence_log_floor=coherence_log_floor,
             ).float()
             ids = torch.arange(
                 start, end, device=indices.device, dtype=torch.int64
@@ -3017,14 +3043,14 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _selected_address_score_backward_source_kernel(
         QUERY, VALUES, COHERENCE, COHERENCE_WEIGHT, CHUNKS, DOUT,
-        DVALUES, DCOHERENCE, DCOHERENCE_WEIGHT,
+        DVALUE_EDGE_PARTIALS, DCOHERENCE_EDGE_PARTIALS,
+        DCOHERENCE_WEIGHT_PARTIALS,
         sqb, sqh, sqn, sqd,
         svb, svh, svc, sva, svd,
         scob, scoh, scoc,
         sckb, sckh, sckn, sckk,
         sdob, sdoh, sdon, sdok,
-        sdvb, sdvh, sdvc, sdva, sdvd,
-        sdcob, sdcoh, sdcoc,
+        sdpeb, sdpeh, sdpen, sdpek, sdpea,
         B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
         HD: tl.constexpr, A: tl.constexpr, A_PAD: tl.constexpr,
         K_VAL: tl.constexpr, REDUCTION: tl.constexpr,
@@ -3081,13 +3107,14 @@ if _TRITON_AVAILABLE:
             DOUT + batch * sdob + head * sdoh + qpos * sdon + slot * sdok,
             mask=valid, other=0.0,
         ).to(tl.float32)
-        dvalue = grad * address_weight[:, None] * query[None, :]
-        tl.atomic_add(
-            DVALUES + batch * sdvb + head * sdvh + chunk * sdvc
-            + address_ids[:, None] * sdva + dims[None, :] * sdvd,
-            dvalue,
-            mask=valid & (address_ids[:, None] < A),
-            sem="relaxed",
+        # Preserve one scalar address coefficient per edge.  A later stable
+        # source-owned pass consumes q-major CSR edges in a fixed order, rather
+        # than atomically reducing concurrent query/slot programs into VALUES.
+        tl.store(
+            DVALUE_EDGE_PARTIALS + batch * sdpeb + head * sdpeh
+            + qpos * sdpen + slot * sdpek + address_ids * sdpea,
+            grad * address_weight,
+            mask=valid & (address_ids < A),
         )
         mean_gradient = grad * tl.sum(
             tl.where(address_ids == 0, address_weight, 0.0), axis=0
@@ -3100,17 +3127,82 @@ if _TRITON_AVAILABLE:
             mean_gradient * coherence_weight / coherence,
             0.0,
         )
-        tl.atomic_add(
-            DCOHERENCE + batch * sdcob + head * sdcoh + chunk * sdcoc,
-            dcoherence,
-            mask=valid,
-            sem="relaxed",
+        tl.store(
+            DCOHERENCE_EDGE_PARTIALS + batch * sdob + head * sdoh
+            + qpos * sdon + slot * sdok,
+            tl.where(valid, dcoherence, 0.0),
         )
-        tl.atomic_add(
-            DCOHERENCE_WEIGHT + head,
-            mean_gradient * log_coherence,
-            mask=valid,
-            sem="relaxed",
+        # One source program owns this [B,H,N,K] contribution.  Reducing it
+        # in PyTorch below fixes the head-scalar addition order.
+        tl.store(
+            DCOHERENCE_WEIGHT_PARTIALS + batch * sdob + head * sdoh
+            + qpos * sdon + slot * sdok,
+            tl.where(valid, mean_gradient * log_coherence, 0.0),
+        )
+
+    @triton.jit
+    def _selected_address_score_backward_source_reduce_kernel(
+        QUERY, DVALUE_EDGE_PARTIALS, DCOHERENCE_EDGE_PARTIALS,
+        REVERSE_EDGES, CHUNK_OFFSETS, DVALUES, DCOHERENCE,
+        sqb, sqh, sqn, sqd,
+        sdpeb, sdpeh, sdpen, sdpek, sdpea,
+        sdob, sdoh, sdon, sdok,
+        sreb, sreh, sree,
+        soffb, soffh, soffc,
+        sdvb, sdvh, sdvc, sdva, sdvd,
+        sdcob, sdcoh, sdcoc,
+        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
+        HD: tl.constexpr, A: tl.constexpr, K_VAL: tl.constexpr,
+        NUM_CHUNKS: tl.constexpr,
+    ):
+        program = tl.program_id(0)
+        address = program % A
+        source_program = program // A
+        source_chunk = source_program % NUM_CHUNKS
+        batch_head = source_program // NUM_CHUNKS
+        batch = batch_head // H
+        head = batch_head % H
+        dimensions = tl.arange(0, HD)
+        edge_start = tl.load(
+            CHUNK_OFFSETS + batch * soffb + head * soffh + source_chunk * soffc
+        ).to(tl.int32)
+        edge_end = tl.load(
+            CHUNK_OFFSETS + batch * soffb + head * soffh
+            + (source_chunk + 1) * soffc
+        ).to(tl.int32)
+        dvalue = tl.zeros([HD], tl.float32)
+        dcoherence = 0.0
+        is_address_zero = address == 0
+        for reverse_offset in tl.range(
+            edge_start, edge_end, num_stages=1, loop_unroll_factor=1
+        ):
+            edge = tl.load(
+                REVERSE_EDGES + batch * sreb + head * sreh + reverse_offset * sree
+            ).to(tl.int32)
+            qpos = edge // K_VAL
+            slot = edge - qpos * K_VAL
+            query = tl.load(
+                QUERY + batch * sqb + head * sqh + qpos * sqn + dimensions * sqd
+            ).to(tl.float32)
+            dvalue_partial = tl.load(
+                DVALUE_EDGE_PARTIALS + batch * sdpeb + head * sdpeh
+                + qpos * sdpen + slot * sdpek + address * sdpea
+            ).to(tl.float32)
+            dvalue += dvalue_partial * query
+            dcoherence += tl.load(
+                DCOHERENCE_EDGE_PARTIALS + batch * sdob + head * sdoh
+                + qpos * sdon + slot * sdok,
+                mask=is_address_zero, other=0.0,
+            ).to(tl.float32)
+        tl.store(
+            DVALUES + batch * sdvb + head * sdvh + source_chunk * sdvc
+            + address * sdva + dimensions * sdvd,
+            dvalue,
+        )
+        tl.store(
+            DCOHERENCE + batch * sdcob + head * sdcoh + source_chunk * sdcoc,
+            dcoherence,
+            mask=is_address_zero,
         )
 
     @triton.jit
@@ -4099,7 +4191,19 @@ def _selected_address_score_backward_impl(
     dquery = torch.zeros_like(query, dtype=torch.float32)
     dvalues = torch.zeros_like(values, dtype=torch.float32)
     dcoherence = torch.zeros_like(coherence, dtype=torch.float32)
-    dweight = torch.zeros_like(coherence_weight, dtype=torch.float32)
+    # Source-owned deterministic reductions need only scalar address
+    # coefficients per edge, never an edge-by-head-dimension tensor.
+    dvalue_edge_partials = torch.empty(
+        batch, heads, seq_len, slots, addresses,
+        device=query.device, dtype=torch.float32,
+    )
+    dcoherence_edge_partials = torch.empty_like(grad_output)
+    # The source kernel owns one entry per selected query/slot.  Avoid an
+    # unordered atomic reduction into the per-head coherence-weight scalar.
+    dweight_partials = torch.empty_like(grad_output)
+    reverse_edges, chunk_offsets = _stable_chunk_reverse_edges(
+        chunks, num_chunks=values.shape[2]
+    )
     query_kernel = (
         torch.library.wrap_triton(_selected_address_score_backward_query_kernel)
         if use_wrap_triton else _selected_address_score_backward_query_kernel
@@ -4107,6 +4211,10 @@ def _selected_address_score_backward_impl(
     source_kernel = (
         torch.library.wrap_triton(_selected_address_score_backward_source_kernel)
         if use_wrap_triton else _selected_address_score_backward_source_kernel
+    )
+    source_reduce_kernel = (
+        torch.library.wrap_triton(_selected_address_score_backward_source_reduce_kernel)
+        if use_wrap_triton else _selected_address_score_backward_source_reduce_kernel
     )
     common = dict(
         B=batch, H=heads, N=seq_len, HD=head_dim,
@@ -4122,11 +4230,22 @@ def _selected_address_score_backward_impl(
     )
     source_kernel[(batch * heads * seq_len * slots,)](
         query, values, coherence, coherence_weight, chunks, grad_output,
-        dvalues, dcoherence, dweight,
+        dvalue_edge_partials, dcoherence_edge_partials, dweight_partials,
         *query.stride(), *values.stride(), *coherence.stride(),
-        *chunks.stride(), *grad_output.stride(), *dvalues.stride(),
-        *dcoherence.stride(),
+        *chunks.stride(), *grad_output.stride(), *dvalue_edge_partials.stride(),
         **common, num_warps=4, num_stages=2,
+    )
+    source_reduce_kernel[(batch * heads * values.shape[2] * addresses,)](
+        query, dvalue_edge_partials, dcoherence_edge_partials,
+        reverse_edges, chunk_offsets, dvalues, dcoherence,
+        *query.stride(), *dvalue_edge_partials.stride(), *grad_output.stride(),
+        *reverse_edges.stride(), *chunk_offsets.stride(),
+        *dvalues.stride(), *dcoherence.stride(),
+        B=batch, H=heads, N=seq_len, HD=head_dim, A=addresses,
+        K_VAL=slots, NUM_CHUNKS=values.shape[2], num_warps=4, num_stages=2,
+    )
+    dweight = dweight_partials.permute(1, 0, 2, 3).reshape(heads, -1).sum(
+        dim=1, dtype=torch.float32
     )
     return dquery, dvalues, dcoherence, dweight
 
@@ -5940,7 +6059,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
 
         teacher_aux_active = bool(
             self.training and self.route_aux_samples > 0
-            and (self.route_aux_weight > 0.0 or self.global_mass_aux_weight > 0.0)
+            and (
+                self.route_aux_weight > 0.0
+                or self.global_mass_aux_weight > 0.0
+                or (self.binding_rank > 0 and self.binding_null_aux_weight > 0.0)
+            )
         )
         binding_aux_active = bool(
             self.training and self.binding_rank and self.binding_null_aux_weight > 0.0
@@ -6083,6 +6206,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             coherence_weight=self.representative_coherence_weight.detach(),
             parent_coherence_weight=self.parent_coherence_weight.detach(),
             hierarchical=self.hierarchical_routing,
+            coherence_log_floor=self.coherence_log_floor,
         )
 
         attention_addresses: HISAChunkAddresses | None = None
@@ -6119,6 +6243,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 coherence_weight=self.representative_coherence_weight.detach(),
                 parent_coherence_weight=self.parent_coherence_weight.detach(),
                 hierarchical=self.hierarchical_routing,
+                coherence_log_floor=self.coherence_log_floor,
             )
             concatenated = torch.cat(
                 (deterministic_candidates.top_chunk_idx,
@@ -6166,6 +6291,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             reduction=self.representative_score_reduction,
             representative_temperature=self.representative_lse_temperature,
             coherence_weight=self.representative_coherence_weight.detach(),
+            coherence_log_floor=self.coherence_log_floor,
         )
         if not compiling:
             self._last_token_selection_path = (
@@ -6587,6 +6713,16 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         finite_exact, exact_candidate_lse,
                         torch.zeros_like(exact_candidate_lse),
                     ).sum() / finite_exact.sum().clamp_min(1)
+                    # Report deterministic top-K separately from all scored
+                    # candidates. Exploration may subsequently replace a route.
+                    selected_exact = exact_candidate_lse.topk(
+                        min(self.top_k_chunks, exact_candidate_lse.shape[-1]),
+                        dim=-1,
+                    ).values
+                    finite_selected = torch.isfinite(selected_exact)
+                    diagnostics["exact_deterministic_selected_page_lse_mean"] = torch.where(
+                        finite_selected, selected_exact, torch.zeros_like(selected_exact)
+                    ).sum() / finite_selected.sum().clamp_min(1)
                 if analysis_selection_logits is not None:
                     first_competitive = (
                         (self.top_k_chunks + 1) * self.chunk_size + self.local_window
@@ -6951,7 +7087,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 routing_query_t,
                 query,
                 addresses,
-                state.completed_global_key,
+                (
+                    state.completed_base_global_key
+                    if self.hard_rerank_from_base_global_key
+                    else state.completed_global_key
+                ),
                 eligible_count=eligible_count,
                 secondary_addresses=secondary_addresses,
             )
@@ -6970,6 +7110,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 reduction=self.representative_score_reduction,
                 temperature=self.representative_lse_temperature,
                 coherence_weight=self.representative_coherence_weight,
+                coherence_log_floor=self.coherence_log_floor,
             )
             valid_route = torch.isfinite(similarity)
             count = valid_route.sum(-1, keepdim=True).clamp_min(1)
