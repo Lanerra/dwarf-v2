@@ -1640,7 +1640,11 @@ def _hierarchical_candidate_metadata(
         deduplicated, unique = _deduplicate_fixed_candidates(
             candidate_ids, entry_count=child_count
         )
-        safe_ids = deduplicated.clamp(max=max(0, child_count - 1))
+        # Qualified combined-v4 path: preserve invalid deduplicated entries as -1
+        # rather than gathering a real chunk and masking it afterward.
+        safe_ids = torch.where(
+            unique, deduplicated, torch.full_like(deduplicated, -1)
+        )
         candidate_scores = _selected_routing_scores(
             query_normalized, addresses, safe_ids,
             reduction=reduction, temperature=temperature,
@@ -1794,15 +1798,31 @@ def _inject_streaming_exploration(
     if not 0.0 <= float(uniform_global_fraction) <= 1.0:
         raise ValueError("uniform_global_fraction must be in [0,1]")
     batch_size, heads, seq_len, slots = indices.shape
-    eligible = _eligibility(
-        metadata.tile_starts, addresses.values.shape[2], metadata.chunk_size,
-        metadata.valid_lengths, int(local_window),
-    )
+    # Candidate-tail/uniform-unseen exploration only needs the number of
+    # globally eligible completed chunks, not the full [B,N,C] mask.
+    if policy in {"candidate_tail", "uniform_unseen_ablation"}:
+        qpos = metadata.tile_starts.to(torch.int64)
+        count = torch.div(
+            (qpos - int(local_window)).clamp_min(0),
+            metadata.chunk_size, rounding_mode="floor",
+        ).clamp(max=addresses.values.shape[2])
+        query_live = qpos.reshape(1, -1) < metadata.valid_lengths.reshape(-1, 1)
+        direct_eligible_count = torch.where(query_live, count.reshape(1, -1), 0)
+        eligible = None
+    else:
+        eligible = _eligibility(
+            metadata.tile_starts, addresses.values.shape[2], metadata.chunk_size,
+            metadata.valid_lengths, int(local_window),
+        )
+        direct_eligible_count = None
 
     def uniform_unseen() -> tuple[torch.Tensor, torch.Tensor]:
-        eligible_count = eligible.sum(-1, dtype=torch.int64)[:, None].expand(
-            batch_size, heads, seq_len
+        counts = (
+            direct_eligible_count
+            if direct_eligible_count is not None
+            else eligible.sum(-1, dtype=torch.int64)
         )
+        eligible_count = counts[:, None].expand(batch_size, heads, seq_len)
         selected_sorted = torch.where(
             valid, indices, eligible_count[..., None]
         ).sort(dim=-1).values
@@ -2140,6 +2160,7 @@ def _sampled_router_teacher_targets(
     cosine_temperature: float,
     target_temperature: float,
     count_normalize_lanes: bool,
+    same_key_stream: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build policy route targets and executed-lane captured-mass targets."""
     if query.ndim != 4:
@@ -2154,9 +2175,12 @@ def _sampled_router_teacher_targets(
     route_chunks, route_token_valid, _ = _chunk_tensors(
         route_teacher_key, chunk_size, valid_lengths
     )
-    actual_chunks, actual_token_valid, _ = _chunk_tensors(
-        actual_global_key, chunk_size, valid_lengths
-    )
+    if same_key_stream:
+        actual_chunks, actual_token_valid = route_chunks, route_token_valid
+    else:
+        actual_chunks, actual_token_valid, _ = _chunk_tensors(
+            actual_global_key, chunk_size, valid_lengths
+        )
     chunk_count, token_count = route_chunks.shape[2:4]
     eligible = _eligibility(
         sampled_positions.to(torch.int32), chunk_count, chunk_size,
@@ -2184,9 +2208,13 @@ def _sampled_router_teacher_targets(
         route_scores = torch.einsum(
             "bhsd,bhcmd->bhscm", query.float(), route_chunks.float()
         ) * float(attention_scale)
-        actual_scores = torch.einsum(
-            "bhsd,bhcmd->bhscm", query.float(), actual_chunks.float()
-        ) * float(attention_scale)
+        actual_scores = (
+            route_scores
+            if same_key_stream
+            else torch.einsum(
+                "bhsd,bhcmd->bhscm", query.float(), actual_chunks.float()
+            ) * float(attention_scale)
+        )
         local_scores = torch.einsum(
             "bhsd,bhnd->bhsn", query.float(), local_key.float()
         ) * float(attention_scale)
@@ -2196,10 +2224,14 @@ def _sampled_router_teacher_targets(
             "bhsd,bhcmd->bhscm",
             qdir, F.normalize(route_chunks.float(), dim=-1, eps=1e-6),
         ) / float(cosine_temperature)
-        actual_scores = torch.einsum(
-            "bhsd,bhcmd->bhscm",
-            qdir, F.normalize(actual_chunks.float(), dim=-1, eps=1e-6),
-        ) / float(cosine_temperature)
+        actual_scores = (
+            route_scores
+            if same_key_stream
+            else torch.einsum(
+                "bhsd,bhcmd->bhscm",
+                qdir, F.normalize(actual_chunks.float(), dim=-1, eps=1e-6),
+            ) / float(cosine_temperature)
+        )
         local_scores = torch.einsum(
             "bhsd,bhnd->bhsn",
             qdir, F.normalize(local_key.float(), dim=-1, eps=1e-6),
@@ -2333,6 +2365,7 @@ def _router_auxiliary_loss(
     coherence_log_floor: float,
     lane_count_normalization: bool,
     tile_ids: torch.Tensor | None = None,
+    same_key_stream: bool = False,
 ) -> HISARouterAuxiliary:
     resolved_ids = _resolve_route_aux_tile_ids(
         selected_metadata, samples=samples, route_slots=route_slots,
@@ -2388,6 +2421,7 @@ def _router_auxiliary_loss(
                 cosine_temperature=oracle_temperature,
                 target_temperature=target_temperature,
                 count_normalize_lanes=lane_count_normalization,
+                same_key_stream=same_key_stream,
             )
         )
     route = (
@@ -3204,6 +3238,145 @@ if _TRITON_AVAILABLE:
             dcoherence,
             mask=is_address_zero,
         )
+
+    # Qualified combined-v4 schedules used by the canonical K222 path.
+    @triton.jit
+    def _selected_page_lse_packed_kernel(
+        Q, G, C, L, O,
+        QS: tl.constexpr, GS: tl.constexpr, CS: tl.constexpr,
+        H: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
+        K: tl.constexpr, CHUNK: tl.constexpr, CP: tl.constexpr,
+        W: tl.constexpr, EP: tl.constexpr,
+    ):
+        bh, tile = tl.program_id(0), tl.program_id(1)
+        b, h = bh // H, bh % H
+        e = tile * EP + tl.arange(0, EP)
+        n, k = e // K, e % K
+        length = tl.load(L + b)
+        live = (e < N * K) & (n < length)
+        ch = tl.load(
+            C + b * CS[0] + h * CS[1] + n * CS[2] + k * CS[3],
+            mask=live, other=-1,
+        )
+        ds, tt = tl.arange(0, D), tl.arange(0, CP)
+        ids = ch[:, None] * CHUNK + tt[None, :]
+        valid = (
+            live[:, None] & (ch[:, None] >= 0) & (tt[None, :] < CHUNK)
+            & (ids >= 0) & (ids < N) & (ids < length) & (ids < n[:, None] - W)
+        )
+        q = tl.load(
+            Q + b * QS[0] + h * QS[1] + n[:, None] * QS[2] + ds[None, :] * QS[3],
+            mask=live[:, None], other=0.0,
+        ).to(tl.float32)
+        keys = tl.load(
+            G + b * GS[0] + h * GS[1] + ids[:, :, None] * GS[2]
+            + ds[None, None, :] * GS[3],
+            mask=valid[:, :, None], other=0.0,
+        ).to(tl.float32)
+        scores = tl.sum(keys * q[:, None, :], axis=2) / tl.sqrt(D * 1.0)
+        scores = tl.where(valid, scores, float("-inf"))
+        mx = tl.max(scores, axis=1)
+        safe = tl.where(mx > float("-inf"), mx, 0.0)
+        prob = tl.where(valid, tl.exp(scores - safe[:, None]), 0.0)
+        z = tl.sum(prob, axis=1)
+        lse = tl.where(z > 0, mx + tl.log(z), float("-inf"))
+        tl.store(O + bh * N * K + e, lse, mask=e < N * K)
+
+    @triton.jit
+    def _selected_address_score_backward_packed_kernel(
+        Q, V, CO, CW, C, GO, DQ, EPART, CPART, WPART,
+        QS: tl.constexpr, VS: tl.constexpr, COS: tl.constexpr, CS: tl.constexpr,
+        H: tl.constexpr, N: tl.constexpr, D: tl.constexpr, NC: tl.constexpr,
+        A: tl.constexpr, AP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
+        QP: tl.constexpr, RED: tl.constexpr, TEMP: tl.constexpr, FLOOR: tl.constexpr,
+    ):
+        bh, tile = tl.program_id(0), tl.program_id(1)
+        b, h = bh // H, bh % H
+        n = tile * QP + tl.arange(0, QP)
+        kk, aa, dd = tl.arange(0, KP), tl.arange(0, AP), tl.arange(0, D)
+        ch = tl.load(
+            C + b * CS[0] + h * CS[1] + n[:, None] * CS[2] + kk[None, :] * CS[3],
+            mask=(n[:, None] < N) & (kk[None, :] < K), other=-1,
+        )
+        valid = (n[:, None] < N) & (kk[None, :] < K) & (ch >= 0) & (ch < NC)
+        q = tl.load(
+            Q + b * QS[0] + h * QS[1] + n[:, None] * QS[2] + dd[None, :] * QS[3],
+            mask=n[:, None] < N, other=0.0,
+        ).to(tl.float32)
+        values = tl.load(
+            V + b * VS[0] + h * VS[1] + ch[:, :, None, None] * VS[2]
+            + aa[None, None, :, None] * VS[3] + dd[None, None, None, :] * VS[4],
+            mask=valid[:, :, None, None] & (aa[None, None, :, None] < A), other=0.0,
+        ).to(tl.float32)
+        co = tl.load(
+            CO + b * COS[0] + h * COS[1] + ch * COS[2], mask=valid, other=1.0
+        ).to(tl.float32)
+        w = tl.load(CW + h).to(tl.float32)
+        raw = tl.log(tl.maximum(co, 1.0e-4))
+        lc = tl.maximum(raw, FLOOR)
+        score = tl.sum(values * q[:, None, None, :], axis=3)
+        score = tl.where(aa[None, None, :] == 0, score + w * lc[:, :, None], score)
+        score = tl.where(aa[None, None, :] < A, score, float("-inf"))
+        if RED == 0:
+            winner = tl.argmax(score, axis=2, tie_break_left=True)
+            aw = (aa[None, None, :] == winner[:, :, None]).to(tl.float32)
+        else:
+            mx = tl.max(score, axis=2)
+            prob = tl.where(
+                aa[None, None, :] < A, tl.exp((score - mx[:, :, None]) / TEMP), 0.0
+            )
+            aw = prob / tl.sum(prob, axis=2)[:, :, None]
+        go = tl.load(
+            GO + (bh * N + n[:, None]) * K + kk[None, :], mask=valid, other=0.0
+        ).to(tl.float32)
+        coeff = go[:, :, None] * aw
+        dq = tl.sum(tl.sum(coeff[:, :, :, None] * values, axis=2), axis=1)
+        tl.store(DQ + (bh * N + n[:, None]) * D + dd[None, :], dq, mask=n[:, None] < N)
+        edge = (bh * N + n[:, None]) * K + kk[None, :]
+        tl.store(
+            EPART + edge[:, :, None] * A + aa[None, None, :], coeff,
+            mask=(n[:, None, None] < N) & (kk[None, :, None] < K) & (aa[None, None, :] < A),
+        )
+        mean_grad = tl.sum(tl.where(aa[None, None, :] == 0, coeff, 0.0), axis=2)
+        dc = tl.where(valid & (co > 1.0e-4) & (raw > FLOOR), mean_grad * w / co, 0.0)
+        mask = (n[:, None] < N) & (kk[None, :] < K)
+        tl.store(CPART + edge, dc, mask=mask)
+        tl.store(WPART + edge, tl.where(valid, mean_grad * lc, 0.0), mask=mask)
+
+    @triton.jit
+    def _selected_address_score_backward_source_packed_reduce_kernel(
+        Q, EPART, CPART, RE, OFF, DV, DC,
+        QS: tl.constexpr, RES: tl.constexpr, OS: tl.constexpr,
+        H: tl.constexpr, N: tl.constexpr, D: tl.constexpr, NC: tl.constexpr,
+        A: tl.constexpr, K: tl.constexpr, ET: tl.constexpr,
+    ):
+        bh, ca = tl.program_id(0), tl.program_id(1)
+        b, h = bh // H, bh % H
+        ch, a = ca // A, ca % A
+        lo = tl.load(OFF + b * OS[0] + h * OS[1] + ch * OS[2])
+        hi = tl.load(OFF + b * OS[0] + h * OS[1] + (ch + 1) * OS[2])
+        ee, dd = tl.arange(0, ET), tl.arange(0, D)
+        acc = tl.zeros((ET, D), tl.float32)
+        ac = tl.zeros((ET,), tl.float32)
+        for start in tl.range(lo, hi, ET, num_stages=1):
+            ix = start + ee
+            edge = tl.load(
+                RE + b * RES[0] + h * RES[1] + ix * RES[2], mask=ix < hi, other=0
+            )
+            n = edge // K
+            q = tl.load(
+                Q + b * QS[0] + h * QS[1] + n[:, None] * QS[2] + dd[None, :] * QS[3],
+                mask=(ix < hi)[:, None], other=0.0,
+            ).to(tl.float32)
+            coeff = tl.load(
+                EPART + (bh * N * K + edge) * A + a, mask=ix < hi, other=0.0
+            )
+            acc += coeff[:, None] * q
+            ac += tl.load(
+                CPART + bh * N * K + edge, mask=(ix < hi) & (a == 0), other=0.0
+            )
+        tl.store(DV + ((bh * NC + ch) * A + a) * D + dd, tl.sum(acc, axis=0))
+        tl.store(DC + bh * NC + ch, tl.sum(ac, axis=0), mask=a == 0)
 
     @triton.jit
     def _selected_page_lse_kernel(
@@ -4083,22 +4256,21 @@ def _selected_page_lse_triton_apply(
             chunk_size=int(chunk_size), local_window=int(local_window),
         )
     batch_size, heads, seq_len, head_dim = query.shape
-    output = torch.full(
-        (*chunks.shape,), float("-inf"), device=query.device, dtype=torch.float32
-    )
+    slots = int(chunks.shape[-1])
+    output = torch.empty((*chunks.shape,), device=query.device, dtype=torch.float32)
     lengths = valid_lengths.reshape(-1).contiguous()
     chunk_pad = max(16, _next_pow2(int(chunk_size)))
-    selected_lse_kernel = (
-        torch.library.wrap_triton(_selected_page_lse_kernel)
-        if _TRITON_LIBRARY_API_AVAILABLE else _selected_page_lse_kernel
+    pack = 4
+    kernel = (
+        torch.library.wrap_triton(_selected_page_lse_packed_kernel)
+        if _TRITON_LIBRARY_API_AVAILABLE else _selected_page_lse_packed_kernel
     )
-    selected_lse_kernel[(batch_size * heads * seq_len * chunks.shape[-1],)](
+    kernel[(batch_size * heads, triton.cdiv(seq_len * slots, pack))](
         query, global_key, chunks, lengths, output,
-        *query.stride(), *global_key.stride(), *chunks.stride(), *output.stride(),
-        B=batch_size, N=seq_len, H=heads, HD=head_dim,
-        K_VAL=chunks.shape[-1], CHUNK_SIZE=int(chunk_size),
-        CHUNK_PAD=chunk_pad, LOCAL_WINDOW=int(local_window),
-        num_warps=4, num_stages=2,
+        query.stride(), global_key.stride(), chunks.stride(),
+        H=heads, N=seq_len, D=head_dim, K=slots,
+        CHUNK=int(chunk_size), CP=chunk_pad, W=int(local_window), EP=pack,
+        num_warps=4, num_stages=1,
     )
     return output
 
@@ -4188,63 +4360,56 @@ def _selected_address_score_backward_impl(
         )
     )
     grad_output = grad_output.contiguous().float()
-    dquery = torch.zeros_like(query, dtype=torch.float32)
-    dvalues = torch.zeros_like(values, dtype=torch.float32)
-    dcoherence = torch.zeros_like(coherence, dtype=torch.float32)
-    # Source-owned deterministic reductions need only scalar address
-    # coefficients per edge, never an edge-by-head-dimension tensor.
-    dvalue_edge_partials = torch.empty(
-        batch, heads, seq_len, slots, addresses,
-        device=query.device, dtype=torch.float32,
-    )
-    dcoherence_edge_partials = torch.empty_like(grad_output)
-    # The source kernel owns one entry per selected query/slot.  Avoid an
-    # unordered atomic reduction into the per-head coherence-weight scalar.
-    dweight_partials = torch.empty_like(grad_output)
     reverse_edges, chunk_offsets = _stable_chunk_reverse_edges(
         chunks, num_chunks=values.shape[2]
     )
+    dquery = torch.empty_like(
+        query, memory_format=torch.contiguous_format, dtype=torch.float32
+    )
+    dvalues = torch.empty_like(
+        values, memory_format=torch.contiguous_format, dtype=torch.float32
+    )
+    dcoherence = torch.empty_like(
+        coherence, memory_format=torch.contiguous_format, dtype=torch.float32
+    )
+    edge_partials = torch.empty(
+        (batch, heads, seq_len, slots, addresses),
+        device=query.device, dtype=torch.float32,
+    )
+    coherence_partials = torch.empty(
+        (batch, heads, seq_len, slots), device=query.device, dtype=torch.float32
+    )
+    weight_partials = torch.empty_like(coherence_partials)
+    query_pack = 4
+    edge_tile = 4
     query_kernel = (
-        torch.library.wrap_triton(_selected_address_score_backward_query_kernel)
-        if use_wrap_triton else _selected_address_score_backward_query_kernel
+        torch.library.wrap_triton(_selected_address_score_backward_packed_kernel)
+        if use_wrap_triton else _selected_address_score_backward_packed_kernel
     )
     source_kernel = (
-        torch.library.wrap_triton(_selected_address_score_backward_source_kernel)
-        if use_wrap_triton else _selected_address_score_backward_source_kernel
+        torch.library.wrap_triton(
+            _selected_address_score_backward_source_packed_reduce_kernel
+        )
+        if use_wrap_triton
+        else _selected_address_score_backward_source_packed_reduce_kernel
     )
-    source_reduce_kernel = (
-        torch.library.wrap_triton(_selected_address_score_backward_source_reduce_kernel)
-        if use_wrap_triton else _selected_address_score_backward_source_reduce_kernel
-    )
-    common = dict(
-        B=batch, H=heads, N=seq_len, HD=head_dim,
-        A=addresses, A_PAD=_next_pow2(addresses), K_VAL=slots,
-        REDUCTION=int(reduction), TEMPERATURE=float(temperature),
-        COHERENCE_LOG_FLOOR=float(coherence_log_floor),
-    )
-    query_kernel[(batch * heads * seq_len,)](
-        query, values, coherence, coherence_weight, chunks, grad_output, dquery,
-        *query.stride(), *values.stride(), *coherence.stride(),
-        *chunks.stride(), *grad_output.stride(), *dquery.stride(),
-        **common, num_warps=4, num_stages=2,
-    )
-    source_kernel[(batch * heads * seq_len * slots,)](
+    query_kernel[(batch * heads, triton.cdiv(seq_len, query_pack))](
         query, values, coherence, coherence_weight, chunks, grad_output,
-        dvalue_edge_partials, dcoherence_edge_partials, dweight_partials,
-        *query.stride(), *values.stride(), *coherence.stride(),
-        *chunks.stride(), *grad_output.stride(), *dvalue_edge_partials.stride(),
-        **common, num_warps=4, num_stages=2,
+        dquery, edge_partials, coherence_partials, weight_partials,
+        query.stride(), values.stride(), coherence.stride(), chunks.stride(),
+        H=heads, N=seq_len, D=head_dim, NC=values.shape[2],
+        A=addresses, AP=_next_pow2(addresses), K=slots, KP=_next_pow2(slots),
+        QP=query_pack, RED=int(reduction), TEMP=float(temperature),
+        FLOOR=float(coherence_log_floor), num_warps=4, num_stages=1,
     )
-    source_reduce_kernel[(batch * heads * values.shape[2] * addresses,)](
-        query, dvalue_edge_partials, dcoherence_edge_partials,
-        reverse_edges, chunk_offsets, dvalues, dcoherence,
-        *query.stride(), *dvalue_edge_partials.stride(), *grad_output.stride(),
-        *reverse_edges.stride(), *chunk_offsets.stride(),
-        *dvalues.stride(), *dcoherence.stride(),
-        B=batch, H=heads, N=seq_len, HD=head_dim, A=addresses,
-        K_VAL=slots, NUM_CHUNKS=values.shape[2], num_warps=4, num_stages=2,
+    source_kernel[(batch * heads, values.shape[2] * addresses)](
+        query, edge_partials, coherence_partials, reverse_edges, chunk_offsets,
+        dvalues, dcoherence, query.stride(), reverse_edges.stride(),
+        chunk_offsets.stride(), H=heads, N=seq_len, D=head_dim,
+        NC=values.shape[2], A=addresses, K=slots, ET=edge_tile,
+        num_warps=4, num_stages=1,
     )
-    dweight = dweight_partials.permute(1, 0, 2, 3).reshape(heads, -1).sum(
+    dweight = weight_partials.permute(1, 0, 2, 3).reshape(heads, -1).sum(
         dim=1, dtype=torch.float32
     )
     return dquery, dvalues, dcoherence, dweight
@@ -5706,6 +5871,12 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
 
     def execution_config(self) -> dict[str, object]:
         return {
+            "qualified_execution_profile": "combined_v4_promoted",
+            "selected_address_forward_pack": 1,
+            "selected_address_backward_query_pack": 4,
+            "selected_address_backward_edge_tile": 4,
+            "exact_page_rerank_pack": 4,
+            "teacher_same_key_reuse": True,
             "backend": self.backend,
             "local_backend": self.local_backend,
             "local_block_size": self.local_block_size,
@@ -6405,6 +6576,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 coherence_log_floor=self.coherence_log_floor,
                 lane_count_normalization=self.lane_teacher_count_normalization,
                 tile_ids=route_aux_tile_ids,
+                same_key_stream=not self.route_aux_teacher_from_base_global_key,
             )
             auxiliary = auxiliary + self.route_aux_weight * router_auxiliary.loss
 
