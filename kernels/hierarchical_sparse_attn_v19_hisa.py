@@ -53,6 +53,7 @@ import torch.nn.functional as F
 
 try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
     try:
         from torch.nn.attention.flex_attention import AuxRequest
     except Exception:  # PyTorch releases with the older return_lse surface
@@ -123,9 +124,7 @@ def _isolated_flex_attention_lse(
     # the sparse Q/KV block sizes to be divisible by the physical tile sizes.
     tile = min(64, sparse_block)
     if sparse_block % tile != 0:
-        raise RuntimeError(
-            "HISA local Flex tile must divide the BlockMask granularity"
-        )
+        raise RuntimeError("HISA local Flex tile must divide the BlockMask granularity")
     kernel_options = {
         "BACKEND": "TRITON",
         "BLOCK_M": tile,
@@ -166,10 +165,10 @@ def _isolated_flex_attention_lse(
     return output, lse
 
 
-
 try:
     import triton
     import triton.language as tl
+
     _TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover - CPU-only development
     triton = None
@@ -192,12 +191,30 @@ _DIRECT_GLOBAL_AUTOTUNE_ENABLED = (
     os.getenv("DWARF_HISA_V19_DIRECT_AUTOTUNE", "0") == "1"
 )
 _DIRECT_GLOBAL_LAYOUT_STRIDE_KEY = (
-    "sqb", "sqh", "sqn", "sqd",
-    "sgkb", "sgkh", "sgkn", "sgkd",
-    "sgvb", "sgvh", "sgvn", "sgvd",
-    "spvb", "spvh", "spvn", "spvd",
-    "srb", "srh", "srn", "srk",
-    "scb", "sch", "scn", "sck",
+    "sqb",
+    "sqh",
+    "sqn",
+    "sqd",
+    "sgkb",
+    "sgkh",
+    "sgkn",
+    "sgkd",
+    "sgvb",
+    "sgvh",
+    "sgvn",
+    "sgvd",
+    "spvb",
+    "spvh",
+    "spvn",
+    "spvd",
+    "srb",
+    "srh",
+    "srn",
+    "srk",
+    "scb",
+    "sch",
+    "scn",
+    "sck",
 )
 _DIRECT_GLOBAL_AUTOTUNE_KEY = (
     "B",
@@ -232,7 +249,6 @@ def _direct_global_autotune_contract() -> dict[str, dict[str, object]]:
             "configs": ((4, 1), (8, 1)),
         },
     }
-
 
 
 def _cuda_arch_code(device: torch.device) -> int:
@@ -371,14 +387,10 @@ def _resolve_route_source_policy(
     """Resolve the new explicit policy while preserving the legacy constructor."""
     if route_source_policy is None:
         route_from_base = (
-            False
-            if route_from_base_global_key is None
-            else route_from_base_global_key
+            False if route_from_base_global_key is None else route_from_base_global_key
         )
         dual_source = (
-            True
-            if dual_source_candidate_union is None
-            else dual_source_candidate_union
+            True if dual_source_candidate_union is None else dual_source_candidate_union
         )
         rerank_priors = (
             False
@@ -386,9 +398,7 @@ def _resolve_route_source_policy(
             else rerank_selected_priors_with_post_packet_representatives
         )
         if not route_from_base:
-            return HISA_ROUTE_SOURCE_POLICIES[
-                HISA_ROUTE_SOURCE_POLICY_POST_PACKET
-            ]
+            return HISA_ROUTE_SOURCE_POLICIES[HISA_ROUTE_SOURCE_POLICY_POST_PACKET]
         if dual_source and not rerank_priors:
             return HISA_ROUTE_SOURCE_POLICIES[
                 HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE
@@ -402,9 +412,7 @@ def _resolve_route_source_policy(
             ),
             hard_rerank_key="post_packet_rotated_global_k",
             selected_prior_key=(
-                "post_packet_rotated_global_k"
-                if rerank_priors
-                else "base_global_k"
+                "post_packet_rotated_global_k" if rerank_priors else "base_global_k"
             ),
             route_aux_teacher_key="post_packet_rotated_global_k",
         )
@@ -434,8 +442,7 @@ def _resolve_route_source_policy(
     ]
     if conflicts:
         raise ValueError(
-            "route source policy conflicts with legacy flags: "
-            + ", ".join(conflicts)
+            "route source policy conflicts with legacy flags: " + ", ".join(conflicts)
         )
     return policy
 
@@ -504,13 +511,10 @@ def _validate_triton_geometry(
 ) -> None:
     """Validate only geometry consumed by the direct complete-page kernel."""
     if head_dim < 16 or not _is_power_of_two(head_dim):
-        raise ValueError(
-            "Triton HISA requires a power-of-two head dimension >=16"
-        )
+        raise ValueError("Triton HISA requires a power-of-two head dimension >=16")
     if max(16, _next_pow2(tokens_per_chunk)) > 256:
-        raise ValueError(
-            "Triton HISA supports at most 256 tokens per complete chunk"
-        )
+        raise ValueError("Triton HISA supports at most 256 tokens per complete chunk")
+
 
 def _to_heads(
     tensor: torch.Tensor,
@@ -629,8 +633,7 @@ def _combined_lse_diagnostics(
     batch_size, heads, seq_len = combined_lse.shape
     positions = torch.arange(seq_len, device=combined_lse.device).reshape(1, 1, -1)
     expected = (
-        (positions > 0)
-        & (positions < valid_lengths.reshape(batch_size, 1, 1))
+        (positions > 0) & (positions < valid_lengths.reshape(batch_size, 1, 1))
     ).expand(batch_size, heads, seq_len)
     finite = torch.isfinite(combined_lse)
     expected_count = expected.sum()
@@ -645,21 +648,21 @@ def _combined_lse_diagnostics(
         "combined_lse_finite_expected_causal_row_count": (
             finite_expected_count.detach()
         ),
-        "combined_lse_unexpected_nonfinite_count": (
-            expected & ~finite
-        ).sum().detach(),
+        "combined_lse_unexpected_nonfinite_count": (expected & ~finite).sum().detach(),
         "combined_lse_structural_neg_inf_count": (
             ~expected & torch.isneginf(combined_lse)
-        ).sum().detach(),
+        )
+        .sum()
+        .detach(),
         "combined_lse_finite_rate": finite_rate.detach(),
     }
 
 
 @dataclass(frozen=True)
 class HISAMetadata:
-    top_chunk_idx: torch.Tensor          # int32 [B,H,T,K]
-    tile_starts: torch.Tensor            # int32 [T]
-    valid_lengths: torch.Tensor          # int32 [B]
+    top_chunk_idx: torch.Tensor  # int32 [B,H,T,K]
+    tile_starts: torch.Tensor  # int32 [T]
+    valid_lengths: torch.Tensor  # int32 [B]
     chunk_size: int
     selector_tile_size: int
     query_chunk_idx: torch.Tensor | None = None  # int32 [B,H,N,K] for token routing
@@ -668,6 +671,7 @@ class HISAMetadata:
 @dataclass(frozen=True)
 class HISASelectionCapture:
     """Ephemeral routing evidence produced only on explicit metadata requests."""
+
     anchor_logits: torch.Tensor
     metadata: HISAMetadata
     auxiliary_loss: torch.Tensor
@@ -728,8 +732,8 @@ class HISARouterAuxiliary:
 class HISARouteEvidence:
     """Per-route normalized evidence and route log-partition values."""
 
-    output: torch.Tensor       # [B,H,N,K,E]
-    lse: torch.Tensor          # fp32 [B,H,N,K]
+    output: torch.Tensor  # [B,H,N,K,E]
+    lse: torch.Tensor  # fp32 [B,H,N,K]
 
 
 @dataclass
@@ -774,22 +778,17 @@ def _forced_route_coverage_diagnostics(
         if forced.shape[:3] != (batch_size, heads, seq_len):
             raise ValueError("forced_route_chunk_ids must have shape [B,H,N,P]")
     else:
-        raise ValueError(
-            "forced_route_chunk_ids must have shape [B,N,P] or [B,H,N,P]"
-        )
+        raise ValueError("forced_route_chunk_ids must have shape [B,N,P] or [B,H,N,P]")
     forced = forced.to(device=route_indices.device, dtype=torch.int64)
     routes = route_indices.to(torch.int64)
     valid_target = forced >= 0
-    covered = (
-        forced[..., None] == routes[..., None, :]
-    ).any(-1) & valid_target
+    covered = (forced[..., None] == routes[..., None, :]).any(-1) & valid_target
     target_count = valid_target.sum().clamp_min(1)
     target_coverage = covered.sum().float() / target_count.float()
     valid_row = valid_target.any(-1)
-    row_any = (covered.any(-1) & valid_row)
+    row_any = covered.any(-1) & valid_row
     row_all = (
-        torch.where(valid_target, covered, torch.ones_like(covered)).all(-1)
-        & valid_row
+        torch.where(valid_target, covered, torch.ones_like(covered)).all(-1) & valid_row
     )
     row_count = valid_row.sum().clamp_min(1)
     by_head_count = valid_target.sum((0, 2, 3)).clamp_min(1)
@@ -844,8 +843,6 @@ def _direct_kernel_geometry_diagnostics(
     }
 
 
-
-
 def _chunk_layout(seq_len: int, chunk_size: int) -> tuple[int, int]:
     chunks = max(1, math.ceil(seq_len / chunk_size))
     return chunks, chunks * chunk_size
@@ -858,7 +855,9 @@ def _chunk_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, heads, seq_len, head_dim = key.shape
     chunks, padded_len = _chunk_layout(seq_len, chunk_size)
-    padded = F.pad(key, (0, 0, 0, padded_len - seq_len)) if padded_len > seq_len else key
+    padded = (
+        F.pad(key, (0, 0, 0, padded_len - seq_len)) if padded_len > seq_len else key
+    )
     values = padded.reshape(batch_size, heads, chunks, chunk_size, head_dim)
     ids = torch.arange(padded_len, device=key.device, dtype=torch.int32).reshape(
         1, 1, chunks, chunk_size
@@ -942,9 +941,7 @@ def _completed_chunk_addresses(
         )
 
     if address_values.ndim == 4:
-        address_values = address_values.masked_fill(
-            ~chunk_valid[:, None, :, None], 0.0
-        )
+        address_values = address_values.masked_fill(~chunk_valid[:, None, :, None], 0.0)
     else:
         address_values = address_values.masked_fill(
             ~chunk_valid[:, None, :, None, None], 0.0
@@ -960,17 +957,20 @@ def _completed_chunk_addresses(
         padded_children = math.ceil(child_count / group_size) * group_size
         child_pad = padded_children - child_count
         directions_parent = (
-            F.pad(directions, (0, 0, 0, 0, 0, child_pad))
-            if child_pad else directions
+            F.pad(directions, (0, 0, 0, 0, 0, child_pad)) if child_pad else directions
         )
         token_valid_parent = (
             F.pad(token_valid, (0, 0, 0, child_pad), value=False)
-            if child_pad else token_valid
+            if child_pad
+            else token_valid
         )
         parent_count = padded_children // group_size
         directions_parent = directions_parent.reshape(
-            values.shape[0], values.shape[1], parent_count,
-            group_size * int(chunk_size), values.shape[-1]
+            values.shape[0],
+            values.shape[1],
+            parent_count,
+            group_size * int(chunk_size),
+            values.shape[-1],
         )
         token_valid_parent = token_valid_parent.reshape(
             values.shape[0], 1, parent_count, group_size * int(chunk_size)
@@ -980,15 +980,14 @@ def _completed_chunk_addresses(
         )
         parent_starts = (
             torch.arange(parent_count, device=key.device, dtype=torch.int32)
-            * group_size * int(chunk_size)
+            * group_size
+            * int(chunk_size)
         )
-        parent_valid = parent_starts.reshape(1, parent_count) < valid_lengths.reshape(-1, 1)
-        parent_values = parent_values.masked_fill(
-            ~parent_valid[:, None, :, None], 0.0
+        parent_valid = parent_starts.reshape(1, parent_count) < valid_lengths.reshape(
+            -1, 1
         )
-        parent_coherence = parent_coherence.masked_fill(
-            ~parent_valid[:, None], 0.0
-        )
+        parent_values = parent_values.masked_fill(~parent_valid[:, None, :, None], 0.0)
+        parent_coherence = parent_coherence.masked_fill(~parent_valid[:, None], 0.0)
 
     diagnostics: HISAAddressDiagnostics | None = None
     if collect_diagnostics:
@@ -998,7 +997,9 @@ def _completed_chunk_addresses(
         chunk_indices = torch.arange(
             values.shape[2], device=values.device, dtype=torch.int64
         ).reshape(1, 1, -1)
-        max_positions = chunk_indices * int(chunk_size) + best.squeeze(-1).to(torch.int64)
+        max_positions = chunk_indices * int(chunk_size) + best.squeeze(-1).to(
+            torch.int64
+        )
         max_positions = torch.where(
             chunk_valid[:, None], max_positions, torch.full_like(max_positions, -1)
         )
@@ -1056,25 +1057,30 @@ def _empty_incremental_address_cache(
         )
     else:
         values = torch.empty(
-            batch_size, heads, 0, len(address_names), head_dim,
-            device=device, dtype=torch.float32,
+            batch_size,
+            heads,
+            0,
+            len(address_names),
+            head_dim,
+            device=device,
+            dtype=torch.float32,
         )
     group = max(1, int(hierarchy_group_size))
     parent_values = (
         torch.empty(batch_size, heads, 0, head_dim, device=device, dtype=torch.float32)
-        if group > 1 else None
+        if group > 1
+        else None
     )
     parent_coherence = (
         torch.empty(batch_size, heads, 0, device=device, dtype=torch.float32)
-        if group > 1 else None
+        if group > 1
+        else None
     )
     return HISAChunkAddresses(
         values=values,
         address_names=address_names,
         chunk_valid=torch.empty(batch_size, 0, device=device, dtype=torch.bool),
-        coherence=torch.empty(
-            batch_size, heads, 0, device=device, dtype=torch.float32
-        ),
+        coherence=torch.empty(batch_size, heads, 0, device=device, dtype=torch.float32),
         parent_values=parent_values,
         parent_coherence=parent_coherence,
         parent_group_size=group,
@@ -1094,7 +1100,9 @@ def _append_incremental_address_cache(
 ) -> HISAChunkAddresses:
     """Append one child address and, when complete, one fixed-group parent."""
     if page_key.ndim != 4 or page_key.shape[2] != int(chunk_size):
-        raise ValueError("completed incremental page must have shape [B,H,chunk_size,D]")
+        raise ValueError(
+            "completed incremental page must have shape [B,H,chunk_size,D]"
+        )
     batch_size, heads, _, head_dim = page_key.shape
     full_lengths = torch.full(
         (batch_size,), int(chunk_size), device=page_key.device, dtype=torch.int32
@@ -1127,19 +1135,26 @@ def _append_incremental_address_cache(
     if group > 1 and completed_count % group == 0:
         if all_pages.ndim != 5 or all_pages.shape[2] != completed_count:
             raise ValueError("all_pages must include the newly completed page")
-        group_pages = all_pages[:, :, completed_count - group:completed_count]
+        group_pages = all_pages[:, :, completed_count - group : completed_count]
         directions = F.normalize(group_pages.float(), dim=-1, eps=1e-6)
         mean_pre = directions.mean(dim=(2, 3))
         parent = F.normalize(mean_pre, dim=-1, eps=1e-6)
         parent_strength = mean_pre.norm(dim=-1)
         if parent_values is None or parent_coherence is None:
             parent_values = torch.empty(
-                batch_size, heads, 0, head_dim,
-                device=page_key.device, dtype=torch.float32,
+                batch_size,
+                heads,
+                0,
+                head_dim,
+                device=page_key.device,
+                dtype=torch.float32,
             )
             parent_coherence = torch.empty(
-                batch_size, heads, 0,
-                device=page_key.device, dtype=torch.float32,
+                batch_size,
+                heads,
+                0,
+                device=page_key.device,
+                dtype=torch.float32,
             )
         parent_values = torch.cat((parent_values, parent[:, :, None]), dim=2)
         parent_coherence = torch.cat(
@@ -1240,9 +1255,12 @@ def _dense_routing_score_surface(
         address_values = addresses
     with torch.autocast(device_type=query_normalized.device.type, enabled=False):
         return _score_chunk_addresses(
-            query_normalized.float(), address_values.float(),
-            reduction=reduction, temperature=temperature,
-            coherence=coherence, coherence_weight=coherence_weight,
+            query_normalized.float(),
+            address_values.float(),
+            reduction=reduction,
+            temperature=temperature,
+            coherence=coherence,
+            coherence_weight=coherence_weight,
             coherence_log_floor=coherence_log_floor,
         ).float()
 
@@ -1260,7 +1278,12 @@ def _gather_chunk_values(values: torch.Tensor, chunk_idx: torch.Tensor) -> torch
         return torch.gather(expanded, 3, index)
     if values.ndim == 5:
         expanded = values[:, :, None].expand(
-            batch_size, heads, seq_len, values.shape[2], values.shape[3], values.shape[4]
+            batch_size,
+            heads,
+            seq_len,
+            values.shape[2],
+            values.shape[3],
+            values.shape[4],
         )
         index = safe[..., None, None].expand(
             batch_size, heads, seq_len, slots, values.shape[3], values.shape[4]
@@ -1325,8 +1348,10 @@ def _selected_routing_scores(
             coherence_weight
             if torch.is_tensor(coherence_weight)
             else torch.full(
-                (heads,), float(coherence_weight),
-                device=query_normalized.device, dtype=torch.float32,
+                (heads,),
+                float(coherence_weight),
+                device=query_normalized.device,
+                dtype=torch.float32,
             )
         )
         return _selected_address_score_triton_apply(
@@ -1369,13 +1394,11 @@ def _selected_routing_scores(
             selected_coherence, coherence_weight, log_floor=coherence_log_floor
         )
         if selected.ndim == 5:
-            block_scores = (
-                block_query[..., None, :] * selected.float()
-            ).sum(-1) + correction
+            block_scores = (block_query[..., None, :] * selected.float()).sum(
+                -1
+            ) + correction
         else:
-            per_address = (
-                block_query[..., None, None, :] * selected.float()
-            ).sum(-1)
+            per_address = (block_query[..., None, None, :] * selected.float()).sum(-1)
             per_address = per_address.clone()
             per_address[..., 0] = per_address[..., 0] + correction
             if reduction == "max":
@@ -1397,7 +1420,9 @@ def _selected_routing_scores(
     return scores
 
 
-def _representative_diagnostics(addresses: HISAChunkAddresses) -> dict[str, torch.Tensor]:
+def _representative_diagnostics(
+    addresses: HISAChunkAddresses,
+) -> dict[str, torch.Tensor]:
     diagnostics = addresses.diagnostics
     if diagnostics is None:
         raise RuntimeError("representative diagnostics were not collected")
@@ -1407,7 +1432,11 @@ def _representative_diagnostics(addresses: HISAChunkAddresses) -> dict[str, torc
     def average(value: torch.Tensor) -> torch.Tensor:
         return torch.where(valid, value.float(), 0.0).sum() / count
 
-    primary = addresses.values.float() if addresses.values.ndim == 4 else addresses.values[..., 0, :].float()
+    primary = (
+        addresses.values.float()
+        if addresses.values.ndim == 4
+        else addresses.values[..., 0, :].float()
+    )
     primary = F.normalize(primary, dim=-1, eps=1e-6)
     similarity = torch.einsum("bhcd,bhkd->bhck", primary, primary)
     pair_valid = valid[..., :, None] & valid[..., None, :]
@@ -1416,9 +1445,10 @@ def _representative_diagnostics(addresses: HISAChunkAddresses) -> dict[str, torc
     ).reshape(1, 1, primary.shape[2], primary.shape[2])
     pair_valid = pair_valid & ~diagonal
     pair_count = pair_valid.sum().clamp_min(1)
-    cross_similarity = torch.where(
-        pair_valid, similarity, torch.zeros_like(similarity)
-    ).sum() / pair_count
+    cross_similarity = (
+        torch.where(pair_valid, similarity, torch.zeros_like(similarity)).sum()
+        / pair_count
+    )
     result = {
         "representative_mean_norm": average(diagnostics.mean_norm),
         "representative_max_norm": average(diagnostics.max_norm),
@@ -1428,15 +1458,17 @@ def _representative_diagnostics(addresses: HISAChunkAddresses) -> dict[str, torc
         "representative_max_winner_positions": diagnostics.max_token_positions.detach(),
     }
     if diagnostics.max_token_ids is not None:
-        result["representative_max_winner_token_ids"] = diagnostics.max_token_ids.detach()
+        result["representative_max_winner_token_ids"] = (
+            diagnostics.max_token_ids.detach()
+        )
     if addresses.parent_coherence is not None:
         parent_valid = addresses.parent_coherence > 0
         result["representative_parent_coherence"] = torch.where(
-            parent_valid, addresses.parent_coherence,
+            parent_valid,
+            addresses.parent_coherence,
             torch.zeros_like(addresses.parent_coherence),
         ).sum() / parent_valid.sum().clamp_min(1)
     return {name: value.detach() for name, value in result.items()}
-
 
 
 def _eligibility(
@@ -1446,20 +1478,22 @@ def _eligibility(
     valid_lengths: torch.Tensor,
     local_window: int,
 ) -> torch.Tensor:
-    chunk_starts = torch.arange(
-        num_chunks,
-        device=tile_starts.device,
-        dtype=torch.int32,
-    ) * chunk_size
+    chunk_starts = (
+        torch.arange(
+            num_chunks,
+            device=tile_starts.device,
+            dtype=torch.int32,
+        )
+        * chunk_size
+    )
     chunk_ends = chunk_starts + chunk_size
     tile_valid = tile_starts.reshape(1, -1) < valid_lengths.reshape(-1, 1)
     chunk_valid = chunk_starts.reshape(1, -1) < valid_lengths.reshape(-1, 1)
     # Route only chunks that are fully outside the local lane.
     globally_accessible_end = tile_starts - int(local_window)
-    completed_and_global = (
-        chunk_ends.reshape(1, 1, -1)
-        <= globally_accessible_end.reshape(1, -1, 1)
-    )
+    completed_and_global = chunk_ends.reshape(
+        1, 1, -1
+    ) <= globally_accessible_end.reshape(1, -1, 1)
     return completed_and_global & chunk_valid[:, None, :] & tile_valid[:, :, None]
 
 
@@ -1501,23 +1535,32 @@ def _streaming_topk_address_values(
     entry_count = values.shape[2]
     k = min(max(1, int(top_k)), entry_count)
     top_values = torch.full(
-        (batch_size, heads, seq_len, k), float("-inf"),
-        device=query_normalized.device, dtype=torch.float32,
+        (batch_size, heads, seq_len, k),
+        float("-inf"),
+        device=query_normalized.device,
+        dtype=torch.float32,
     )
     top_indices = torch.full(
-        (batch_size, heads, seq_len, k), -1,
-        device=query_normalized.device, dtype=torch.int64,
+        (batch_size, heads, seq_len, k),
+        -1,
+        device=query_normalized.device,
+        dtype=torch.int64,
     )
     eligibility = _entry_eligibility(
-        seq_len=seq_len, entry_count=entry_count, entry_span=entry_span,
-        valid_lengths=valid_lengths, local_window=local_window,
+        seq_len=seq_len,
+        entry_count=entry_count,
+        entry_span=entry_span,
+        valid_lengths=valid_lengths,
+        local_window=local_window,
     )
     step = max(1, int(block_size))
     for start in range(0, entry_count, step):
         end = min(start + step, entry_count)
         block_scores = _score_chunk_addresses(
-            query_normalized, values[:, :, start:end],
-            reduction=reduction, temperature=temperature,
+            query_normalized,
+            values[:, :, start:end],
+            reduction=reduction,
+            temperature=temperature,
             coherence=coherence[:, :, start:end],
             coherence_weight=coherence_weight,
             coherence_log_floor=coherence_log_floor,
@@ -1525,9 +1568,11 @@ def _streaming_topk_address_values(
         block_scores = block_scores.masked_fill(
             ~eligibility[:, None, :, start:end], float("-inf")
         )
-        block_ids = torch.arange(
-            start, end, device=query_normalized.device, dtype=torch.int64
-        ).reshape(1, 1, 1, -1).expand_as(block_scores)
+        block_ids = (
+            torch.arange(start, end, device=query_normalized.device, dtype=torch.int64)
+            .reshape(1, 1, 1, -1)
+            .expand_as(block_scores)
+        )
         merged_values = torch.cat((top_values, block_scores), dim=-1)
         merged_indices = torch.cat((top_indices, block_ids), dim=-1)
         top_values, order = merged_values.topk(k, dim=-1)
@@ -1548,8 +1593,10 @@ def _deduplicate_fixed_candidates(
     )
     ordered = sortable.sort(dim=-1).values
     unique = (ordered != sentinel) & torch.cat(
-        (torch.ones_like(ordered[..., :1], dtype=torch.bool),
-         ordered[..., 1:] != ordered[..., :-1]),
+        (
+            torch.ones_like(ordered[..., :1], dtype=torch.bool),
+            ordered[..., 1:] != ordered[..., :-1],
+        ),
         dim=-1,
     )
     return torch.where(unique, ordered, sentinel), unique
@@ -1576,39 +1623,54 @@ def _hierarchical_candidate_metadata(
     batch_size, heads, seq_len, _ = query_normalized.shape
     child_count = addresses.values.shape[2]
     use_hierarchy = bool(
-        hierarchical and addresses.parent_values is not None
+        hierarchical
+        and addresses.parent_values is not None
         and addresses.parent_coherence is not None
         and addresses.parent_group_size > 1
     )
     if not use_hierarchy:
         _, indices, valid = _streaming_topk_address_values(
-            query_normalized, addresses.values, addresses.coherence,
-            entry_span=int(chunk_size), valid_lengths=valid_lengths,
-            local_window=local_window, top_k=candidate_k,
-            block_size=streaming_block_size, reduction=reduction,
-            temperature=temperature, coherence_weight=coherence_weight,
+            query_normalized,
+            addresses.values,
+            addresses.coherence,
+            entry_span=int(chunk_size),
+            valid_lengths=valid_lengths,
+            local_window=local_window,
+            top_k=candidate_k,
+            block_size=streaming_block_size,
+            reduction=reduction,
+            temperature=temperature,
+            coherence_weight=coherence_weight,
             coherence_log_floor=coherence_log_floor,
         )
         indices = torch.where(valid, indices, torch.full_like(indices, -1))
     else:
         group = int(addresses.parent_group_size)
         _, parent_indices, parent_valid = _streaming_topk_address_values(
-            query_normalized, addresses.parent_values, addresses.parent_coherence,
-            entry_span=group * int(chunk_size), valid_lengths=valid_lengths,
-            local_window=local_window, top_k=parent_top_k,
-            block_size=streaming_block_size, reduction="max", temperature=1.0,
+            query_normalized,
+            addresses.parent_values,
+            addresses.parent_coherence,
+            entry_span=group * int(chunk_size),
+            valid_lengths=valid_lengths,
+            local_window=local_window,
+            top_k=parent_top_k,
+            block_size=streaming_block_size,
+            reduction="max",
+            temperature=1.0,
             coherence_weight=parent_coherence_weight,
             coherence_log_floor=coherence_log_floor,
         )
         child_offsets = torch.arange(
             group, device=query_normalized.device, dtype=torch.int64
         )
-        parent_children = (
-            parent_indices[..., None] * group + child_offsets
-        ).reshape(batch_size, heads, seq_len, -1)
-        parent_children_valid = parent_valid[..., None].expand(
-            *parent_valid.shape, group
-        ).reshape_as(parent_children)
+        parent_children = (parent_indices[..., None] * group + child_offsets).reshape(
+            batch_size, heads, seq_len, -1
+        )
+        parent_children_valid = (
+            parent_valid[..., None]
+            .expand(*parent_valid.shape, group)
+            .reshape_as(parent_children)
+        )
 
         cutoff = (
             torch.arange(seq_len, device=query_normalized.device, dtype=torch.int64)
@@ -1627,10 +1689,9 @@ def _hierarchical_candidate_metadata(
             batch_size, heads, seq_len, group
         )
         tail_valid = tail_valid.reshape(1, 1, seq_len, group).expand_as(tail)
-        query_valid = (
-            torch.arange(seq_len, device=query_normalized.device).reshape(1, 1, -1, 1)
-            < valid_lengths.reshape(batch_size, 1, 1, 1)
-        )
+        query_valid = torch.arange(seq_len, device=query_normalized.device).reshape(
+            1, 1, -1, 1
+        ) < valid_lengths.reshape(batch_size, 1, 1, 1)
         candidate_ids = torch.cat((parent_children, tail), dim=-1)
         candidate_valid = torch.cat((parent_children_valid, tail_valid), dim=-1)
         candidate_valid = candidate_valid & query_valid & (candidate_ids < child_count)
@@ -1642,12 +1703,13 @@ def _hierarchical_candidate_metadata(
         )
         # Qualified combined-v4 path: preserve invalid deduplicated entries as -1
         # rather than gathering a real chunk and masking it afterward.
-        safe_ids = torch.where(
-            unique, deduplicated, torch.full_like(deduplicated, -1)
-        )
+        safe_ids = torch.where(unique, deduplicated, torch.full_like(deduplicated, -1))
         candidate_scores = _selected_routing_scores(
-            query_normalized, addresses, safe_ids,
-            reduction=reduction, temperature=temperature,
+            query_normalized,
+            addresses,
+            safe_ids,
+            reduction=reduction,
+            temperature=temperature,
             coherence_weight=coherence_weight,
             coherence_log_floor=coherence_log_floor,
         ).masked_fill(~unique, float("-inf"))
@@ -1659,8 +1721,11 @@ def _hierarchical_candidate_metadata(
 
     return HISAMetadata(
         top_chunk_idx=indices.to(torch.int32),
-        tile_starts=torch.arange(seq_len, device=query_normalized.device, dtype=torch.int32),
-        valid_lengths=valid_lengths.detach(), chunk_size=int(chunk_size),
+        tile_starts=torch.arange(
+            seq_len, device=query_normalized.device, dtype=torch.int32
+        ),
+        valid_lengths=valid_lengths.detach(),
+        chunk_size=int(chunk_size),
         selector_tile_size=1,
     )
 
@@ -1678,12 +1743,18 @@ def _candidate_page_lse_reference(
     batch_size, heads, seq_len, head_dim = query.shape
     slots = candidate_chunks.shape[-1]
     result = torch.full(
-        (batch_size, heads, seq_len, slots), float("-inf"),
-        device=query.device, dtype=torch.float32,
+        (batch_size, heads, seq_len, slots),
+        float("-inf"),
+        device=query.device,
+        dtype=torch.float32,
     )
     scale = 1.0 / math.sqrt(head_dim)
-    within = torch.arange(int(chunk_size), device=query.device, dtype=torch.int64).reshape(1, 1, 1, -1)
-    batch_index = torch.arange(batch_size, device=query.device).reshape(batch_size, 1, 1, 1)
+    within = torch.arange(
+        int(chunk_size), device=query.device, dtype=torch.int64
+    ).reshape(1, 1, 1, -1)
+    batch_index = torch.arange(batch_size, device=query.device).reshape(
+        batch_size, 1, 1, 1
+    )
     head_index = torch.arange(heads, device=query.device).reshape(1, heads, 1, 1)
     block = max(1, int(query_block_size))
     for start in range(0, seq_len, block):
@@ -1719,12 +1790,20 @@ def _candidate_page_lse(
 ) -> torch.Tensor:
     if query.is_cuda and _TRITON_AVAILABLE:
         return _selected_page_lse_triton_apply(
-            query, global_key, candidate_chunks, valid_lengths,
-            int(chunk_size), int(local_window),
+            query,
+            global_key,
+            candidate_chunks,
+            valid_lengths,
+            int(chunk_size),
+            int(local_window),
         )
     return _candidate_page_lse_reference(
-        query, global_key, candidate_chunks, valid_lengths,
-        chunk_size=int(chunk_size), local_window=int(local_window),
+        query,
+        global_key,
+        candidate_chunks,
+        valid_lengths,
+        chunk_size=int(chunk_size),
+        local_window=int(local_window),
     )
 
 
@@ -1748,13 +1827,19 @@ def _rerank_candidate_metadata(
     if not exact_rerank or candidate_chunks.shape[-1] <= int(top_k):
         selected = candidate_chunks[..., : int(top_k)]
         return HISAMetadata(
-            top_chunk_idx=selected, tile_starts=candidate_metadata.tile_starts,
+            top_chunk_idx=selected,
+            tile_starts=candidate_metadata.tile_starts,
             valid_lengths=candidate_metadata.valid_lengths,
-            chunk_size=candidate_metadata.chunk_size, selector_tile_size=1,
+            chunk_size=candidate_metadata.chunk_size,
+            selector_tile_size=1,
         ), None
     exact_lse = _candidate_page_lse(
-        query, global_key, candidate_chunks, candidate_metadata.valid_lengths,
-        chunk_size=candidate_metadata.chunk_size, local_window=int(local_window),
+        query,
+        global_key,
+        candidate_chunks,
+        candidate_metadata.valid_lengths,
+        chunk_size=candidate_metadata.chunk_size,
+        local_window=int(local_window),
     )
     k = min(int(top_k), exact_lse.shape[-1])
     values, order = exact_lse.topk(k, dim=-1)
@@ -1765,7 +1850,8 @@ def _rerank_candidate_metadata(
         top_chunk_idx=selected.to(torch.int32),
         tile_starts=candidate_metadata.tile_starts,
         valid_lengths=candidate_metadata.valid_lengths,
-        chunk_size=candidate_metadata.chunk_size, selector_tile_size=1,
+        chunk_size=candidate_metadata.chunk_size,
+        selector_tile_size=1,
     ), exact_lse
 
 
@@ -1804,15 +1890,19 @@ def _inject_streaming_exploration(
         qpos = metadata.tile_starts.to(torch.int64)
         count = torch.div(
             (qpos - int(local_window)).clamp_min(0),
-            metadata.chunk_size, rounding_mode="floor",
+            metadata.chunk_size,
+            rounding_mode="floor",
         ).clamp(max=addresses.values.shape[2])
         query_live = qpos.reshape(1, -1) < metadata.valid_lengths.reshape(-1, 1)
         direct_eligible_count = torch.where(query_live, count.reshape(1, -1), 0)
         eligible = None
     else:
         eligible = _eligibility(
-            metadata.tile_starts, addresses.values.shape[2], metadata.chunk_size,
-            metadata.valid_lengths, int(local_window),
+            metadata.tile_starts,
+            addresses.values.shape[2],
+            metadata.chunk_size,
+            metadata.valid_lengths,
+            int(local_window),
         )
         direct_eligible_count = None
 
@@ -1823,9 +1913,9 @@ def _inject_streaming_exploration(
             else eligible.sum(-1, dtype=torch.int64)
         )
         eligible_count = counts[:, None].expand(batch_size, heads, seq_len)
-        selected_sorted = torch.where(
-            valid, indices, eligible_count[..., None]
-        ).sort(dim=-1).values
+        selected_sorted = (
+            torch.where(valid, indices, eligible_count[..., None]).sort(dim=-1).values
+        )
         unseen_count = eligible_count - valid.sum(-1, dtype=torch.int64)
         has = unseen_count > 0
         choice = torch.floor(
@@ -1833,7 +1923,9 @@ def _inject_streaming_exploration(
             * unseen_count.clamp_min(1).float()
         ).to(torch.int64)
         for slot_index in range(slots):
-            choice = choice + (selected_sorted[..., slot_index] <= choice).to(choice.dtype)
+            choice = choice + (selected_sorted[..., slot_index] <= choice).to(
+                choice.dtype
+            )
         return choice, has
 
     if policy == "uniform_unseen_ablation":
@@ -1846,7 +1938,10 @@ def _inject_streaming_exploration(
             raise ValueError("candidate scores must align with all candidate-tail IDs")
         if candidate_scores is None:
             candidate_scores = _selected_routing_scores(
-                query_normalized, addresses, candidates, reduction=reduction,
+                query_normalized,
+                addresses,
+                candidates,
+                reduction=reduction,
                 temperature=representative_temperature,
                 coherence_weight=coherence_weight,
                 coherence_log_floor=coherence_log_floor,
@@ -1860,15 +1955,12 @@ def _inject_streaming_exploration(
             - torch.log(-torch.log(noise))
         ).masked_fill(~unseen, float("-inf"))
         tail_value, tail_offset = sampled.max(-1)
-        tail_choice = torch.gather(
-            candidates, -1, tail_offset[..., None]
-        ).squeeze(-1)
+        tail_choice = torch.gather(candidates, -1, tail_offset[..., None]).squeeze(-1)
         tail_has = torch.isfinite(tail_value)
         global_choice, global_has = uniform_unseen()
-        use_global = (
-            torch.rand(batch_size, heads, seq_len, device=indices.device)
-            < float(uniform_global_fraction)
-        )
+        use_global = torch.rand(
+            batch_size, heads, seq_len, device=indices.device
+        ) < float(uniform_global_fraction)
         choice = torch.where(use_global, global_choice, tail_choice)
         has_candidate = torch.where(use_global, global_has, tail_has)
         fallback = torch.where(global_has, global_choice, tail_choice)
@@ -1876,16 +1968,20 @@ def _inject_streaming_exploration(
         has_candidate = has_candidate | global_has | tail_has
     elif policy == "tail_softmax":
         best_value = torch.full(
-            (batch_size, heads, seq_len), float("-inf"),
-            device=indices.device, dtype=torch.float32,
+            (batch_size, heads, seq_len),
+            float("-inf"),
+            device=indices.device,
+            dtype=torch.float32,
         )
         best_index = torch.full_like(best_value, -1, dtype=torch.int64)
         entry_count = addresses.values.shape[2]
         for start in range(0, entry_count, max(1, int(block_size))):
             end = min(start + max(1, int(block_size)), entry_count)
             scores = _score_chunk_addresses(
-                query_normalized, addresses.values[:, :, start:end],
-                reduction=reduction, temperature=representative_temperature,
+                query_normalized,
+                addresses.values[:, :, start:end],
+                reduction=reduction,
+                temperature=representative_temperature,
                 coherence=addresses.coherence[:, :, start:end],
                 coherence_weight=coherence_weight,
                 coherence_log_floor=coherence_log_floor,
@@ -1923,7 +2019,8 @@ def _inject_streaming_exploration(
         top_chunk_idx=indices.to(torch.int32),
         tile_starts=metadata.tile_starts,
         valid_lengths=metadata.valid_lengths,
-        chunk_size=metadata.chunk_size, selector_tile_size=1,
+        chunk_size=metadata.chunk_size,
+        selector_tile_size=1,
     )
 
 
@@ -1942,7 +2039,6 @@ def _annealed_exploration_probability(
         return float(initial)
     progress = min(max(int(step), 0), int(anneal_steps)) / float(anneal_steps)
     return float(initial) + progress * (float(final) - float(initial))
-
 
 
 def _global_ids(
@@ -1964,9 +2060,9 @@ def _semantic_route_chunks(metadata: HISAMetadata, seq_len: int) -> torch.Tensor
     """Return the K semantic candidate IDs owned by each query row."""
     if metadata.query_chunk_idx is not None:
         return metadata.query_chunk_idx[:, :, :seq_len]
-    return metadata.top_chunk_idx.repeat_interleave(
-        metadata.selector_tile_size, dim=2
-    )[:, :, :seq_len]
+    return metadata.top_chunk_idx.repeat_interleave(metadata.selector_tile_size, dim=2)[
+        :, :, :seq_len
+    ]
 
 
 def _semantic_route_priors(
@@ -1980,12 +2076,15 @@ def _semantic_route_priors(
         metadata.selector_tile_size, dim=2
     )[:, :, :seq_len]
     physical_route = route[:, :, :seq_len]
-    matches = (
-        semantic_chunks[..., None] == physical_chunks[..., None, :]
-    ) & (semantic_chunks[..., None] >= 0)
-    return physical_route[..., None, :].masked_fill(~matches, float("-inf")).max(
-        dim=-1
-    ).values
+    matches = (semantic_chunks[..., None] == physical_chunks[..., None, :]) & (
+        semantic_chunks[..., None] >= 0
+    )
+    return (
+        physical_route[..., None, :]
+        .masked_fill(~matches, float("-inf"))
+        .max(dim=-1)
+        .values
+    )
 
 
 def _route_identity_features(
@@ -2005,9 +2104,12 @@ def _route_identity_features(
     """
     valid = chunk_idx >= 0
     count = valid.sum(-1, keepdim=True).clamp_min(1)
-    mean = torch.where(valid, similarity, torch.zeros_like(similarity)).sum(
-        -1, keepdim=True
-    ) / count
+    mean = (
+        torch.where(valid, similarity, torch.zeros_like(similarity)).sum(
+            -1, keepdim=True
+        )
+        / count
+    )
     relative_prior = (
         (similarity - mean)
         * route_scale_by_head.reshape(1, -1, 1, 1).float()
@@ -2049,9 +2151,7 @@ def _route_identity_features(
     safe_logits = masked.masked_fill(~valid, -1e9)
     probability = torch.softmax(safe_logits, dim=-1)
     entropy = -(probability * torch.log_softmax(safe_logits, dim=-1)).sum(-1)
-    entropy = torch.where(
-        valid.any(-1), entropy, torch.zeros_like(entropy)
-    )
+    entropy = torch.where(valid.any(-1), entropy, torch.zeros_like(entropy))
     summary = torch.stack((absolute_max, absolute_mean, entropy), dim=-1)
     return features, summary
 
@@ -2076,9 +2176,7 @@ def _strict_local_or_boundary_key_mask(
     has_boundary = cutoff > 0
     boundary_start = (cutoff // int(chunk_size)) * int(chunk_size)
     boundary = (
-        has_boundary
-        & (key_positions >= boundary_start)
-        & (key_positions < cutoff)
+        has_boundary & (key_positions >= boundary_start) & (key_positions < cutoff)
     )
     return local | boundary
 
@@ -2129,7 +2227,11 @@ def _resolve_route_aux_tile_ids(
     if torch.compiler.is_compiling():
         return tile_ids
     ordered = tile_ids.sort().values
-    unique = torch.ones((), dtype=torch.bool, device=device) if ordered.numel() <= 1 else (ordered[1:] != ordered[:-1]).all()
+    unique = (
+        torch.ones((), dtype=torch.bool, device=device)
+        if ordered.numel() <= 1
+        else (ordered[1:] != ordered[:-1]).all()
+    )
     valid_ids = (tile_ids >= first_competitive_tile) & (tile_ids < tiles)
     valid = valid_ids.all() & unique
     message = "route_aux_tile_ids must be unique and in the competitive tile range"
@@ -2139,7 +2241,9 @@ def _resolve_route_aux_tile_ids(
         if bool(((tile_ids < 0) | (tile_ids >= tiles)).any()):
             raise ValueError("route_aux_tile_ids contains an out-of-range ID")
         if bool((tile_ids < first_competitive_tile).any()):
-            raise ValueError("route_aux_tile_ids contains a row without more eligible chunks than final route slots")
+            raise ValueError(
+                "route_aux_tile_ids contains a row without more eligible chunks than final route slots"
+            )
         raise ValueError("route_aux_tile_ids must be unique")
     return tile_ids
 
@@ -2183,8 +2287,11 @@ def _sampled_router_teacher_targets(
         )
     chunk_count, token_count = route_chunks.shape[2:4]
     eligible = _eligibility(
-        sampled_positions.to(torch.int32), chunk_count, chunk_size,
-        valid_lengths, local_window,
+        sampled_positions.to(torch.int32),
+        chunk_count,
+        chunk_size,
+        valid_lengths,
+        local_window,
     )
     token_positions = torch.arange(
         chunk_count * token_count, device=query.device, dtype=torch.int32
@@ -2211,9 +2318,8 @@ def _sampled_router_teacher_targets(
         actual_scores = (
             route_scores
             if same_key_stream
-            else torch.einsum(
-                "bhsd,bhcmd->bhscm", query.float(), actual_chunks.float()
-            ) * float(attention_scale)
+            else torch.einsum("bhsd,bhcmd->bhscm", query.float(), actual_chunks.float())
+            * float(attention_scale)
         )
         local_scores = torch.einsum(
             "bhsd,bhnd->bhsn", query.float(), local_key.float()
@@ -2222,19 +2328,23 @@ def _sampled_router_teacher_targets(
         qdir = F.normalize(query.float(), dim=-1, eps=1e-6)
         route_scores = torch.einsum(
             "bhsd,bhcmd->bhscm",
-            qdir, F.normalize(route_chunks.float(), dim=-1, eps=1e-6),
+            qdir,
+            F.normalize(route_chunks.float(), dim=-1, eps=1e-6),
         ) / float(cosine_temperature)
         actual_scores = (
             route_scores
             if same_key_stream
             else torch.einsum(
                 "bhsd,bhcmd->bhscm",
-                qdir, F.normalize(actual_chunks.float(), dim=-1, eps=1e-6),
-            ) / float(cosine_temperature)
+                qdir,
+                F.normalize(actual_chunks.float(), dim=-1, eps=1e-6),
+            )
+            / float(cosine_temperature)
         )
         local_scores = torch.einsum(
             "bhsd,bhnd->bhsn",
-            qdir, F.normalize(local_key.float(), dim=-1, eps=1e-6),
+            qdir,
+            F.normalize(local_key.float(), dim=-1, eps=1e-6),
         ) / float(cosine_temperature)
     else:
         raise ValueError("route_aux_teacher must be dense_attention or cosine_ablation")
@@ -2242,12 +2352,15 @@ def _sampled_router_teacher_targets(
     route_chunk_lse = torch.logsumexp(
         route_scores.masked_fill(~route_mask, float("-inf")), dim=-1
     )
-    route_conditional = torch.softmax(
-        (route_chunk_lse / float(target_temperature)).masked_fill(
-            ~eligible[:, None], -1e9
-        ),
-        dim=-1,
-    ) * eligible[:, None]
+    route_conditional = (
+        torch.softmax(
+            (route_chunk_lse / float(target_temperature)).masked_fill(
+                ~eligible[:, None], -1e9
+            ),
+            dim=-1,
+        )
+        * eligible[:, None]
+    )
     route_conditional = route_conditional / route_conditional.sum(
         -1, keepdim=True
     ).clamp_min(1e-12)
@@ -2255,9 +2368,10 @@ def _sampled_router_teacher_targets(
     actual_chunk_lse = torch.logsumexp(
         actual_scores.masked_fill(~actual_mask, float("-inf")), dim=-1
     )
-    actual_conditional = torch.softmax(
-        actual_chunk_lse.masked_fill(~eligible[:, None], -1e9), dim=-1
-    ) * eligible[:, None]
+    actual_conditional = (
+        torch.softmax(actual_chunk_lse.masked_fill(~eligible[:, None], -1e9), dim=-1)
+        * eligible[:, None]
+    )
     actual_conditional = actual_conditional / actual_conditional.sum(
         -1, keepdim=True
     ).clamp_min(1e-12)
@@ -2313,9 +2427,12 @@ def _teacher_weighted_coverage_loss(
     expanded_eligible = (
         eligible[:, None] if eligible.ndim == route_logits.ndim - 1 else eligible
     )
-    probabilities = torch.softmax(
-        route_logits.float().masked_fill(~expanded_eligible, -1e9), dim=-1
-    ) * expanded_eligible
+    probabilities = (
+        torch.softmax(
+            route_logits.float().masked_fill(~expanded_eligible, -1e9), dim=-1
+        )
+        * expanded_eligible
+    )
     covered = 1.0 - (1.0 - probabilities).clamp_min(0.0).pow(int(route_slots))
     covered_teacher_mass = (teacher_mass.float() * covered).sum(-1)
     valid = expanded_eligible.any(-1).expand_as(covered_teacher_mass)
@@ -2368,8 +2485,11 @@ def _router_auxiliary_loss(
     same_key_stream: bool = False,
 ) -> HISARouterAuxiliary:
     resolved_ids = _resolve_route_aux_tile_ids(
-        selected_metadata, samples=samples, route_slots=route_slots,
-        local_window=local_window, tile_ids=tile_ids,
+        selected_metadata,
+        samples=samples,
+        route_slots=route_slots,
+        local_window=local_window,
+        tile_ids=tile_ids,
         device=query_normalized.device,
     )
     chunk_count = addresses.values.shape[2]
@@ -2382,51 +2502,68 @@ def _router_auxiliary_loss(
         )
         zero = query_normalized.new_zeros(())
         return HISARouterAuxiliary(
-            loss=zero, cross_entropy=zero, parent_cross_entropy=zero,
-            coverage_loss=zero, sampled_anchor_logits=empty,
-            sampled_tile_ids=resolved_ids, teacher_mass=empty,
+            loss=zero,
+            cross_entropy=zero,
+            parent_cross_entropy=zero,
+            coverage_loss=zero,
+            sampled_anchor_logits=empty,
+            sampled_tile_ids=resolved_ids,
+            teacher_mass=empty,
             teacher_actual_chunk_mass=empty,
             teacher_full_global_mass=empty_global,
             teacher_selected_global_mass=empty_global,
             teacher_capture_fraction=empty_global,
             eligible=torch.empty(
-                query_normalized.shape[0], 0, chunk_count,
-                device=query_normalized.device, dtype=torch.bool,
+                query_normalized.shape[0],
+                0,
+                chunk_count,
+                device=query_normalized.device,
+                dtype=torch.bool,
             ),
         )
 
     sampled_q = query_normalized[:, :, resolved_ids]
     sampled_anchor_logits = _dense_routing_score_surface(
-        sampled_q, addresses, reduction=representative_reduction,
+        sampled_q,
+        addresses,
+        reduction=representative_reduction,
         temperature=representative_temperature,
         coherence_weight=coherence_weight,
         coherence_log_floor=coherence_log_floor,
     ).float() / float(routing_temperature)
     sampled_positions = selected_metadata.tile_starts[resolved_ids]
     eligible = _eligibility(
-        sampled_positions, chunk_count, selected_metadata.chunk_size,
-        selected_metadata.valid_lengths, local_window,
+        sampled_positions,
+        chunk_count,
+        selected_metadata.chunk_size,
+        selected_metadata.valid_lengths,
+        local_window,
     )
-    selected_chunks = selected_metadata.top_chunk_idx[:, :, resolved_ids].to(torch.int64)
+    selected_chunks = selected_metadata.top_chunk_idx[:, :, resolved_ids].to(
+        torch.int64
+    )
     with torch.no_grad():
-        target, actual_mass, full_mass, selected_mass = (
-            _sampled_router_teacher_targets(
-                attention_query[:, :, resolved_ids].detach(),
-                route_teacher_key, local_key, actual_global_key, selected_chunks,
-                sampled_positions=sampled_positions,
-                chunk_size=selected_metadata.chunk_size,
-                valid_lengths=selected_metadata.valid_lengths,
-                local_window=local_window, mode=teacher_mode,
-                attention_scale=1.0 / math.sqrt(attention_query.shape[-1]),
-                cosine_temperature=oracle_temperature,
-                target_temperature=target_temperature,
-                count_normalize_lanes=lane_count_normalization,
-                same_key_stream=same_key_stream,
-            )
+        target, actual_mass, full_mass, selected_mass = _sampled_router_teacher_targets(
+            attention_query[:, :, resolved_ids].detach(),
+            route_teacher_key,
+            local_key,
+            actual_global_key,
+            selected_chunks,
+            sampled_positions=sampled_positions,
+            chunk_size=selected_metadata.chunk_size,
+            valid_lengths=selected_metadata.valid_lengths,
+            local_window=local_window,
+            mode=teacher_mode,
+            attention_scale=1.0 / math.sqrt(attention_query.shape[-1]),
+            cosine_temperature=oracle_temperature,
+            target_temperature=target_temperature,
+            count_normalize_lanes=lane_count_normalization,
+            same_key_stream=same_key_stream,
         )
     route = (
         torch.where(
-            eligible[:, None], sampled_anchor_logits,
+            eligible[:, None],
+            sampled_anchor_logits,
             torch.zeros_like(sampled_anchor_logits),
         )
         * route_scale_by_head.reshape(1, query_normalized.shape[1], 1, 1).float()
@@ -2444,12 +2581,21 @@ def _router_auxiliary_loss(
     ):
         group = int(addresses.parent_group_size)
         parent_count = addresses.parent_values.shape[2]
-        target_parent = F.pad(
-            target, (0, parent_count * group - target.shape[-1])
-        ).reshape(*target.shape[:-1], parent_count, group).sum(-1)
+        target_parent = (
+            F.pad(target, (0, parent_count * group - target.shape[-1]))
+            .reshape(*target.shape[:-1], parent_count, group)
+            .sum(-1)
+        )
         parent_ends = (
-            torch.arange(parent_count, device=query_normalized.device, dtype=torch.int32) + 1
-        ) * group * int(selected_metadata.chunk_size)
+            (
+                torch.arange(
+                    parent_count, device=query_normalized.device, dtype=torch.int32
+                )
+                + 1
+            )
+            * group
+            * int(selected_metadata.chunk_size)
+        )
         parent_eligible = (
             parent_ends.reshape(1, 1, -1)
             <= sampled_positions.reshape(1, -1, 1) - int(local_window)
@@ -2461,12 +2607,19 @@ def _router_auxiliary_loss(
         target_parent = target_parent * expanded_parent_eligible
         parent_target_sum = target_parent.sum(-1, keepdim=True)
         target_parent = target_parent / parent_target_sum.clamp_min(1e-12)
-        parent_scores = _score_chunk_addresses(
-            sampled_q, addresses.parent_values, reduction="max", temperature=1.0,
-            coherence=addresses.parent_coherence,
-            coherence_weight=parent_coherence_weight,
-            coherence_log_floor=coherence_log_floor,
-        ).float().masked_fill(~expanded_parent_eligible, -1e9)
+        parent_scores = (
+            _score_chunk_addresses(
+                sampled_q,
+                addresses.parent_values,
+                reduction="max",
+                temperature=1.0,
+                coherence=addresses.parent_coherence,
+                coherence_weight=parent_coherence_weight,
+                coherence_log_floor=coherence_log_floor,
+            )
+            .float()
+            .masked_fill(~expanded_parent_eligible, -1e9)
+        )
         parent_per_row = -(
             target_parent * torch.log_softmax(parent_scores, dim=-1)
         ).sum(-1)
@@ -2488,17 +2641,23 @@ def _router_auxiliary_loss(
         + float(parent_aux_weight) * parent_cross_entropy
     )
     capture = torch.where(
-        full_mass > 0.0, selected_mass / full_mass.clamp_min(1e-12),
+        full_mass > 0.0,
+        selected_mass / full_mass.clamp_min(1e-12),
         torch.zeros_like(full_mass),
     ).clamp(0.0, 1.0)
     return HISARouterAuxiliary(
-        loss=loss, cross_entropy=cross_entropy,
-        parent_cross_entropy=parent_cross_entropy, coverage_loss=coverage_loss,
-        sampled_anchor_logits=sampled_anchor_logits, sampled_tile_ids=resolved_ids,
-        teacher_mass=target, teacher_actual_chunk_mass=actual_mass,
+        loss=loss,
+        cross_entropy=cross_entropy,
+        parent_cross_entropy=parent_cross_entropy,
+        coverage_loss=coverage_loss,
+        sampled_anchor_logits=sampled_anchor_logits,
+        sampled_tile_ids=resolved_ids,
+        teacher_mass=target,
+        teacher_actual_chunk_mass=actual_mass,
         teacher_full_global_mass=full_mass,
         teacher_selected_global_mass=selected_mass,
-        teacher_capture_fraction=capture, eligible=eligible,
+        teacher_capture_fraction=capture,
+        eligible=eligible,
     )
 
 
@@ -2511,9 +2670,7 @@ def _eligible_route_entropy(
 ) -> torch.Tensor:
     logits = anchor_logits if tile_ids is None else anchor_logits[:, :, tile_ids]
     tile_starts = (
-        metadata.tile_starts
-        if tile_ids is None
-        else metadata.tile_starts[tile_ids]
+        metadata.tile_starts if tile_ids is None else metadata.tile_starts[tile_ids]
     )
     eligible = _eligibility(
         tile_starts,
@@ -2543,8 +2700,10 @@ def _eager_local_lane(
     batch_size, heads, seq_len, head_dim = query.shape
     output = torch.zeros_like(query)
     lse = torch.full(
-        (batch_size, heads, seq_len), float("-inf"),
-        device=query.device, dtype=torch.float32,
+        (batch_size, heads, seq_len),
+        float("-inf"),
+        device=query.device,
+        dtype=torch.float32,
     )
     lane_span = local_window + chunk_size - 1
     offsets = torch.arange(lane_span, device=query.device, dtype=torch.int32)
@@ -2570,7 +2729,9 @@ def _eager_local_lane(
         scores = torch.einsum("bhqd,bhqwd->bhqw", q, keys) * scale
         scores = scores.masked_fill(~valid[:, None], float("-inf"))
         maximum = scores.max(-1).values
-        safe_max = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
+        safe_max = torch.where(
+            torch.isfinite(maximum), maximum, torch.zeros_like(maximum)
+        )
         weights = torch.where(
             torch.isfinite(scores),
             torch.exp(scores.float() - safe_max[..., None].float()),
@@ -2584,7 +2745,8 @@ def _eager_local_lane(
             q_valid[:, None, :, None], lane, torch.zeros_like(lane)
         )
         lse[:, :, start:end] = torch.where(
-            denominator > 0, safe_max.float() + denominator.log(),
+            denominator > 0,
+            safe_max.float() + denominator.log(),
             torch.full_like(safe_max.float(), float("-inf")),
         )
     return output, lse
@@ -2603,8 +2765,10 @@ def _eager_global_lane(
     batch_size, heads, seq_len, head_dim = query.shape
     output = torch.zeros_like(query)
     lse = torch.full(
-        (batch_size, heads, seq_len), float("-inf"),
-        device=query.device, dtype=torch.float32,
+        (batch_size, heads, seq_len),
+        float("-inf"),
+        device=query.device,
+        dtype=torch.float32,
     )
     all_ids, all_valid = _global_ids(metadata, seq_len)
     scale = 1.0 / math.sqrt(head_dim)
@@ -2615,7 +2779,9 @@ def _eager_global_lane(
             break
         positions = torch.arange(start, end, device=query.device, dtype=torch.int32)
         q = query[:, :, start:end]
-        q_valid = positions.reshape(1, -1) < metadata.valid_lengths.reshape(batch_size, 1)
+        q_valid = positions.reshape(1, -1) < metadata.valid_lengths.reshape(
+            batch_size, 1
+        )
         ids = all_ids[:, :, tile].reshape(batch_size, heads, -1)
         id_valid = all_valid[:, :, tile].reshape(batch_size, heads, -1)
         safe_ids = ids.clamp(0, max(seq_len - 1, 0)).long()
@@ -2641,19 +2807,24 @@ def _eager_global_lane(
         )
         scores = scores.masked_fill(~valid, float("-inf"))
         maximum = scores.max(-1).values
-        safe_max = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
+        safe_max = torch.where(
+            torch.isfinite(maximum), maximum, torch.zeros_like(maximum)
+        )
         weights = torch.where(
             torch.isfinite(scores),
             torch.exp(scores.float() - safe_max[..., None].float()),
             torch.zeros_like(scores.float()),
         )
         denominator = weights.sum(-1)
-        lane = torch.matmul(weights.to(values.dtype), values) / denominator.clamp_min(1.0)[..., None].to(values.dtype)
+        lane = torch.matmul(weights.to(values.dtype), values) / denominator.clamp_min(
+            1.0
+        )[..., None].to(values.dtype)
         output[:, :, start:end] = torch.where(
             q_valid[:, None, :, None], lane, torch.zeros_like(lane)
         )
         lse[:, :, start:end] = torch.where(
-            denominator > 0, safe_max.float() + denominator.log(),
+            denominator > 0,
+            safe_max.float() + denominator.log(),
             torch.full_like(safe_max.float(), float("-inf")),
         )
     return output, lse
@@ -2892,12 +3063,12 @@ class _MergeAttentionLanesFn(torch.autograd.Function):
             local_weight[..., None] * local_output.float()
             + global_weight[..., None] * global_output.float()
         )
-        grad_local_output = (
-            grad_output_float * local_weight[..., None]
-        ).to(local_output.dtype)
-        grad_global_output = (
-            grad_output_float * global_weight[..., None]
-        ).to(global_output.dtype)
+        grad_local_output = (grad_output_float * local_weight[..., None]).to(
+            local_output.dtype
+        )
+        grad_global_output = (grad_output_float * global_weight[..., None]).to(
+            global_output.dtype
+        )
         grad_local_lse = (
             grad_output_float
             * local_weight[..., None]
@@ -2908,9 +3079,7 @@ class _MergeAttentionLanesFn(torch.autograd.Function):
             * global_weight[..., None]
             * (global_output.float() - output_float)
         ).sum(-1) + grad_combined_float * global_weight
-        mass_gradient = (
-            grad_global_weight_float * local_weight * global_weight
-        )
+        mass_gradient = grad_global_weight_float * local_weight * global_weight
         grad_local_lse = grad_local_lse - mass_gradient
         grad_global_lse = grad_global_lse + mass_gradient
         return (
@@ -2936,21 +3105,46 @@ def _merge_attention_lanes_with_mass(
     )
 
 
-
 if _TRITON_AVAILABLE:
 
     @triton.jit
     def _selected_address_score_forward_kernel(
-        QUERY, VALUES, COHERENCE, COHERENCE_WEIGHT, CHUNKS, OUT,
-        sqb, sqh, sqn, sqd,
-        svb, svh, svc, sva, svd,
-        scob, scoh, scoc,
-        sckb, sckh, sckn, sckk,
-        sob, soh, son, sok,
-        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
-        HD: tl.constexpr, A: tl.constexpr, A_PAD: tl.constexpr,
-        K_VAL: tl.constexpr, REDUCTION: tl.constexpr,
-        TEMPERATURE: tl.constexpr, LOG_A: tl.constexpr,
+        QUERY,
+        VALUES,
+        COHERENCE,
+        COHERENCE_WEIGHT,
+        CHUNKS,
+        OUT,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        svb,
+        svh,
+        svc,
+        sva,
+        svd,
+        scob,
+        scoh,
+        scoc,
+        sckb,
+        sckh,
+        sckn,
+        sckk,
+        sob,
+        soh,
+        son,
+        sok,
+        B: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        HD: tl.constexpr,
+        A: tl.constexpr,
+        A_PAD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        REDUCTION: tl.constexpr,
+        TEMPERATURE: tl.constexpr,
+        LOG_A: tl.constexpr,
         COHERENCE_LOG_FLOOR: tl.constexpr,
     ):
         program = tl.program_id(0)
@@ -2968,17 +3162,24 @@ if _TRITON_AVAILABLE:
         address_ids = tl.arange(0, A_PAD)
         query = tl.load(
             QUERY + batch * sqb + head * sqh + qpos * sqn + dims * sqd,
-            mask=valid, other=0.0,
+            mask=valid,
+            other=0.0,
         ).to(tl.float32)
         addresses = tl.load(
-            VALUES + batch * svb + head * svh + chunk * svc
-            + address_ids[:, None] * sva + dims[None, :] * svd,
-            mask=valid & (address_ids[:, None] < A), other=0.0,
+            VALUES
+            + batch * svb
+            + head * svh
+            + chunk * svc
+            + address_ids[:, None] * sva
+            + dims[None, :] * svd,
+            mask=valid & (address_ids[:, None] < A),
+            other=0.0,
         ).to(tl.float32)
         per_address = tl.sum(addresses * query[None, :], axis=1)
         coherence = tl.load(
             COHERENCE + batch * scob + head * scoh + chunk * scoc,
-            mask=valid, other=1.0,
+            mask=valid,
+            other=1.0,
         ).to(tl.float32)
         weight = tl.load(COHERENCE_WEIGHT + head).to(tl.float32)
         log_coherence = tl.maximum(
@@ -2997,7 +3198,9 @@ if _TRITON_AVAILABLE:
                 tl.exp((per_address - maximum) / TEMPERATURE),
                 0.0,
             )
-            score = maximum + TEMPERATURE * (tl.log(tl.sum(probability, axis=0)) - LOG_A)
+            score = maximum + TEMPERATURE * (
+                tl.log(tl.sum(probability, axis=0)) - LOG_A
+            )
         tl.store(
             OUT + batch * sob + head * soh + qpos * son + slot * sok,
             tl.where(valid, score, float("-inf")),
@@ -3005,17 +3208,47 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _selected_address_score_backward_query_kernel(
-        QUERY, VALUES, COHERENCE, COHERENCE_WEIGHT, CHUNKS, DOUT, DQUERY,
-        sqb, sqh, sqn, sqd,
-        svb, svh, svc, sva, svd,
-        scob, scoh, scoc,
-        sckb, sckh, sckn, sckk,
-        sdob, sdoh, sdon, sdok,
-        sdqb, sdqh, sdqn, sdqd,
-        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
-        HD: tl.constexpr, A: tl.constexpr, A_PAD: tl.constexpr,
-        K_VAL: tl.constexpr, REDUCTION: tl.constexpr,
-        TEMPERATURE: tl.constexpr, COHERENCE_LOG_FLOOR: tl.constexpr,
+        QUERY,
+        VALUES,
+        COHERENCE,
+        COHERENCE_WEIGHT,
+        CHUNKS,
+        DOUT,
+        DQUERY,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        svb,
+        svh,
+        svc,
+        sva,
+        svd,
+        scob,
+        scoh,
+        scoc,
+        sckb,
+        sckh,
+        sckn,
+        sckk,
+        sdob,
+        sdoh,
+        sdon,
+        sdok,
+        sdqb,
+        sdqh,
+        sdqn,
+        sdqd,
+        B: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        HD: tl.constexpr,
+        A: tl.constexpr,
+        A_PAD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        REDUCTION: tl.constexpr,
+        TEMPERATURE: tl.constexpr,
+        COHERENCE_LOG_FLOOR: tl.constexpr,
     ):
         program = tl.program_id(0)
         qpos = program % N
@@ -3024,9 +3257,9 @@ if _TRITON_AVAILABLE:
         head = batch_head % H
         dims = tl.arange(0, HD)
         address_ids = tl.arange(0, A_PAD)
-        query = tl.load(
-            QUERY + batch * sqb + head * sqh + qpos * sqn + dims * sqd
-        ).to(tl.float32)
+        query = tl.load(QUERY + batch * sqb + head * sqh + qpos * sqn + dims * sqd).to(
+            tl.float32
+        )
         dquery = tl.zeros([HD], tl.float32)
         for slot in range(K_VAL):
             chunk = tl.load(
@@ -3034,14 +3267,20 @@ if _TRITON_AVAILABLE:
             ).to(tl.int32)
             valid = chunk >= 0
             addresses = tl.load(
-                VALUES + batch * svb + head * svh + chunk * svc
-                + address_ids[:, None] * sva + dims[None, :] * svd,
-                mask=valid & (address_ids[:, None] < A), other=0.0,
+                VALUES
+                + batch * svb
+                + head * svh
+                + chunk * svc
+                + address_ids[:, None] * sva
+                + dims[None, :] * svd,
+                mask=valid & (address_ids[:, None] < A),
+                other=0.0,
             ).to(tl.float32)
             per_address = tl.sum(addresses * query[None, :], axis=1)
             coherence = tl.load(
                 COHERENCE + batch * scob + head * scoh + chunk * scoc,
-                mask=valid, other=1.0,
+                mask=valid,
+                other=1.0,
             ).to(tl.float32)
             coherence_weight = tl.load(COHERENCE_WEIGHT + head).to(tl.float32)
             log_coherence = tl.maximum(
@@ -3066,7 +3305,8 @@ if _TRITON_AVAILABLE:
                 address_weight = unnormalized / tl.sum(unnormalized, axis=0)
             grad = tl.load(
                 DOUT + batch * sdob + head * sdoh + qpos * sdon + slot * sdok,
-                mask=valid, other=0.0,
+                mask=valid,
+                other=0.0,
             ).to(tl.float32)
             dquery += grad * tl.sum(address_weight[:, None] * addresses, axis=0)
         tl.store(
@@ -3076,19 +3316,50 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _selected_address_score_backward_source_kernel(
-        QUERY, VALUES, COHERENCE, COHERENCE_WEIGHT, CHUNKS, DOUT,
-        DVALUE_EDGE_PARTIALS, DCOHERENCE_EDGE_PARTIALS,
+        QUERY,
+        VALUES,
+        COHERENCE,
+        COHERENCE_WEIGHT,
+        CHUNKS,
+        DOUT,
+        DVALUE_EDGE_PARTIALS,
+        DCOHERENCE_EDGE_PARTIALS,
         DCOHERENCE_WEIGHT_PARTIALS,
-        sqb, sqh, sqn, sqd,
-        svb, svh, svc, sva, svd,
-        scob, scoh, scoc,
-        sckb, sckh, sckn, sckk,
-        sdob, sdoh, sdon, sdok,
-        sdpeb, sdpeh, sdpen, sdpek, sdpea,
-        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
-        HD: tl.constexpr, A: tl.constexpr, A_PAD: tl.constexpr,
-        K_VAL: tl.constexpr, REDUCTION: tl.constexpr,
-        TEMPERATURE: tl.constexpr, COHERENCE_LOG_FLOOR: tl.constexpr,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        svb,
+        svh,
+        svc,
+        sva,
+        svd,
+        scob,
+        scoh,
+        scoc,
+        sckb,
+        sckh,
+        sckn,
+        sckk,
+        sdob,
+        sdoh,
+        sdon,
+        sdok,
+        sdpeb,
+        sdpeh,
+        sdpen,
+        sdpek,
+        sdpea,
+        B: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        HD: tl.constexpr,
+        A: tl.constexpr,
+        A_PAD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        REDUCTION: tl.constexpr,
+        TEMPERATURE: tl.constexpr,
+        COHERENCE_LOG_FLOOR: tl.constexpr,
     ):
         program = tl.program_id(0)
         slot = program % K_VAL
@@ -3105,16 +3376,23 @@ if _TRITON_AVAILABLE:
         address_ids = tl.arange(0, A_PAD)
         query = tl.load(
             QUERY + batch * sqb + head * sqh + qpos * sqn + dims * sqd,
-            mask=valid, other=0.0,
+            mask=valid,
+            other=0.0,
         ).to(tl.float32)
         addresses = tl.load(
-            VALUES + batch * svb + head * svh + chunk * svc
-            + address_ids[:, None] * sva + dims[None, :] * svd,
-            mask=valid & (address_ids[:, None] < A), other=0.0,
+            VALUES
+            + batch * svb
+            + head * svh
+            + chunk * svc
+            + address_ids[:, None] * sva
+            + dims[None, :] * svd,
+            mask=valid & (address_ids[:, None] < A),
+            other=0.0,
         ).to(tl.float32)
         coherence = tl.load(
             COHERENCE + batch * scob + head * scoh + chunk * scoc,
-            mask=valid, other=1.0,
+            mask=valid,
+            other=1.0,
         ).to(tl.float32)
         coherence_weight = tl.load(COHERENCE_WEIGHT + head).to(tl.float32)
         raw_log_coherence = tl.log(tl.maximum(coherence, 1.0e-4))
@@ -3139,22 +3417,27 @@ if _TRITON_AVAILABLE:
             address_weight = unnormalized / tl.sum(unnormalized, axis=0)
         grad = tl.load(
             DOUT + batch * sdob + head * sdoh + qpos * sdon + slot * sdok,
-            mask=valid, other=0.0,
+            mask=valid,
+            other=0.0,
         ).to(tl.float32)
         # Preserve one scalar address coefficient per edge.  A later stable
         # source-owned pass consumes q-major CSR edges in a fixed order, rather
         # than atomically reducing concurrent query/slot programs into VALUES.
         tl.store(
-            DVALUE_EDGE_PARTIALS + batch * sdpeb + head * sdpeh
-            + qpos * sdpen + slot * sdpek + address_ids * sdpea,
+            DVALUE_EDGE_PARTIALS
+            + batch * sdpeb
+            + head * sdpeh
+            + qpos * sdpen
+            + slot * sdpek
+            + address_ids * sdpea,
             grad * address_weight,
             mask=valid & (address_ids < A),
         )
         mean_gradient = grad * tl.sum(
             tl.where(address_ids == 0, address_weight, 0.0), axis=0
         )
-        coherence_active = (
-            (coherence > 1.0e-4) & (raw_log_coherence > COHERENCE_LOG_FLOOR)
+        coherence_active = (coherence > 1.0e-4) & (
+            raw_log_coherence > COHERENCE_LOG_FLOOR
         )
         dcoherence = tl.where(
             coherence_active,
@@ -3162,31 +3445,66 @@ if _TRITON_AVAILABLE:
             0.0,
         )
         tl.store(
-            DCOHERENCE_EDGE_PARTIALS + batch * sdob + head * sdoh
-            + qpos * sdon + slot * sdok,
+            DCOHERENCE_EDGE_PARTIALS
+            + batch * sdob
+            + head * sdoh
+            + qpos * sdon
+            + slot * sdok,
             tl.where(valid, dcoherence, 0.0),
         )
         # One source program owns this [B,H,N,K] contribution.  Reducing it
         # in PyTorch below fixes the head-scalar addition order.
         tl.store(
-            DCOHERENCE_WEIGHT_PARTIALS + batch * sdob + head * sdoh
-            + qpos * sdon + slot * sdok,
+            DCOHERENCE_WEIGHT_PARTIALS
+            + batch * sdob
+            + head * sdoh
+            + qpos * sdon
+            + slot * sdok,
             tl.where(valid, mean_gradient * log_coherence, 0.0),
         )
 
     @triton.jit
     def _selected_address_score_backward_source_reduce_kernel(
-        QUERY, DVALUE_EDGE_PARTIALS, DCOHERENCE_EDGE_PARTIALS,
-        REVERSE_EDGES, CHUNK_OFFSETS, DVALUES, DCOHERENCE,
-        sqb, sqh, sqn, sqd,
-        sdpeb, sdpeh, sdpen, sdpek, sdpea,
-        sdob, sdoh, sdon, sdok,
-        sreb, sreh, sree,
-        soffb, soffh, soffc,
-        sdvb, sdvh, sdvc, sdva, sdvd,
-        sdcob, sdcoh, sdcoc,
-        B: tl.constexpr, H: tl.constexpr, N: tl.constexpr,
-        HD: tl.constexpr, A: tl.constexpr, K_VAL: tl.constexpr,
+        QUERY,
+        DVALUE_EDGE_PARTIALS,
+        DCOHERENCE_EDGE_PARTIALS,
+        REVERSE_EDGES,
+        CHUNK_OFFSETS,
+        DVALUES,
+        DCOHERENCE,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        sdpeb,
+        sdpeh,
+        sdpen,
+        sdpek,
+        sdpea,
+        sdob,
+        sdoh,
+        sdon,
+        sdok,
+        sreb,
+        sreh,
+        sree,
+        soffb,
+        soffh,
+        soffc,
+        sdvb,
+        sdvh,
+        sdvc,
+        sdva,
+        sdvd,
+        sdcob,
+        sdcoh,
+        sdcoc,
+        B: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        HD: tl.constexpr,
+        A: tl.constexpr,
+        K_VAL: tl.constexpr,
         NUM_CHUNKS: tl.constexpr,
     ):
         program = tl.program_id(0)
@@ -3201,8 +3519,7 @@ if _TRITON_AVAILABLE:
             CHUNK_OFFSETS + batch * soffb + head * soffh + source_chunk * soffc
         ).to(tl.int32)
         edge_end = tl.load(
-            CHUNK_OFFSETS + batch * soffb + head * soffh
-            + (source_chunk + 1) * soffc
+            CHUNK_OFFSETS + batch * soffb + head * soffh + (source_chunk + 1) * soffc
         ).to(tl.int32)
         dvalue = tl.zeros([HD], tl.float32)
         dcoherence = 0.0
@@ -3219,18 +3536,30 @@ if _TRITON_AVAILABLE:
                 QUERY + batch * sqb + head * sqh + qpos * sqn + dimensions * sqd
             ).to(tl.float32)
             dvalue_partial = tl.load(
-                DVALUE_EDGE_PARTIALS + batch * sdpeb + head * sdpeh
-                + qpos * sdpen + slot * sdpek + address * sdpea
+                DVALUE_EDGE_PARTIALS
+                + batch * sdpeb
+                + head * sdpeh
+                + qpos * sdpen
+                + slot * sdpek
+                + address * sdpea
             ).to(tl.float32)
             dvalue += dvalue_partial * query
             dcoherence += tl.load(
-                DCOHERENCE_EDGE_PARTIALS + batch * sdob + head * sdoh
-                + qpos * sdon + slot * sdok,
-                mask=is_address_zero, other=0.0,
+                DCOHERENCE_EDGE_PARTIALS
+                + batch * sdob
+                + head * sdoh
+                + qpos * sdon
+                + slot * sdok,
+                mask=is_address_zero,
+                other=0.0,
             ).to(tl.float32)
         tl.store(
-            DVALUES + batch * sdvb + head * sdvh + source_chunk * sdvc
-            + address * sdva + dimensions * sdvd,
+            DVALUES
+            + batch * sdvb
+            + head * sdvh
+            + source_chunk * sdvc
+            + address * sdva
+            + dimensions * sdvd,
             dvalue,
         )
         tl.store(
@@ -3242,11 +3571,22 @@ if _TRITON_AVAILABLE:
     # Qualified combined-v4 schedules used by the canonical K222 path.
     @triton.jit
     def _selected_page_lse_packed_kernel(
-        Q, G, C, L, O,
-        QS: tl.constexpr, GS: tl.constexpr, CS: tl.constexpr,
-        H: tl.constexpr, N: tl.constexpr, D: tl.constexpr,
-        K: tl.constexpr, CHUNK: tl.constexpr, CP: tl.constexpr,
-        W: tl.constexpr, EP: tl.constexpr,
+        Q,
+        G,
+        C,
+        L,
+        O,
+        QS: tl.constexpr,
+        GS: tl.constexpr,
+        CS: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        K: tl.constexpr,
+        CHUNK: tl.constexpr,
+        CP: tl.constexpr,
+        W: tl.constexpr,
+        EP: tl.constexpr,
     ):
         bh, tile = tl.program_id(0), tl.program_id(1)
         b, h = bh // H, bh % H
@@ -3256,22 +3596,33 @@ if _TRITON_AVAILABLE:
         live = (e < N * K) & (n < length)
         ch = tl.load(
             C + b * CS[0] + h * CS[1] + n * CS[2] + k * CS[3],
-            mask=live, other=-1,
+            mask=live,
+            other=-1,
         )
         ds, tt = tl.arange(0, D), tl.arange(0, CP)
         ids = ch[:, None] * CHUNK + tt[None, :]
         valid = (
-            live[:, None] & (ch[:, None] >= 0) & (tt[None, :] < CHUNK)
-            & (ids >= 0) & (ids < N) & (ids < length) & (ids < n[:, None] - W)
+            live[:, None]
+            & (ch[:, None] >= 0)
+            & (tt[None, :] < CHUNK)
+            & (ids >= 0)
+            & (ids < N)
+            & (ids < length)
+            & (ids < n[:, None] - W)
         )
         q = tl.load(
             Q + b * QS[0] + h * QS[1] + n[:, None] * QS[2] + ds[None, :] * QS[3],
-            mask=live[:, None], other=0.0,
+            mask=live[:, None],
+            other=0.0,
         ).to(tl.float32)
         keys = tl.load(
-            G + b * GS[0] + h * GS[1] + ids[:, :, None] * GS[2]
+            G
+            + b * GS[0]
+            + h * GS[1]
+            + ids[:, :, None] * GS[2]
             + ds[None, None, :] * GS[3],
-            mask=valid[:, :, None], other=0.0,
+            mask=valid[:, :, None],
+            other=0.0,
         ).to(tl.float32)
         scores = tl.sum(keys * q[:, None, :], axis=2) / tl.sqrt(D * 1.0)
         scores = tl.where(valid, scores, float("-inf"))
@@ -3284,11 +3635,32 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _selected_address_score_backward_packed_kernel(
-        Q, V, CO, CW, C, GO, DQ, EPART, CPART, WPART,
-        QS: tl.constexpr, VS: tl.constexpr, COS: tl.constexpr, CS: tl.constexpr,
-        H: tl.constexpr, N: tl.constexpr, D: tl.constexpr, NC: tl.constexpr,
-        A: tl.constexpr, AP: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
-        QP: tl.constexpr, RED: tl.constexpr, TEMP: tl.constexpr, FLOOR: tl.constexpr,
+        Q,
+        V,
+        CO,
+        CW,
+        C,
+        GO,
+        DQ,
+        EPART,
+        CPART,
+        WPART,
+        QS: tl.constexpr,
+        VS: tl.constexpr,
+        COS: tl.constexpr,
+        CS: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        NC: tl.constexpr,
+        A: tl.constexpr,
+        AP: tl.constexpr,
+        K: tl.constexpr,
+        KP: tl.constexpr,
+        QP: tl.constexpr,
+        RED: tl.constexpr,
+        TEMP: tl.constexpr,
+        FLOOR: tl.constexpr,
     ):
         bh, tile = tl.program_id(0), tl.program_id(1)
         b, h = bh // H, bh % H
@@ -3296,17 +3668,24 @@ if _TRITON_AVAILABLE:
         kk, aa, dd = tl.arange(0, KP), tl.arange(0, AP), tl.arange(0, D)
         ch = tl.load(
             C + b * CS[0] + h * CS[1] + n[:, None] * CS[2] + kk[None, :] * CS[3],
-            mask=(n[:, None] < N) & (kk[None, :] < K), other=-1,
+            mask=(n[:, None] < N) & (kk[None, :] < K),
+            other=-1,
         )
         valid = (n[:, None] < N) & (kk[None, :] < K) & (ch >= 0) & (ch < NC)
         q = tl.load(
             Q + b * QS[0] + h * QS[1] + n[:, None] * QS[2] + dd[None, :] * QS[3],
-            mask=n[:, None] < N, other=0.0,
+            mask=n[:, None] < N,
+            other=0.0,
         ).to(tl.float32)
         values = tl.load(
-            V + b * VS[0] + h * VS[1] + ch[:, :, None, None] * VS[2]
-            + aa[None, None, :, None] * VS[3] + dd[None, None, None, :] * VS[4],
-            mask=valid[:, :, None, None] & (aa[None, None, :, None] < A), other=0.0,
+            V
+            + b * VS[0]
+            + h * VS[1]
+            + ch[:, :, None, None] * VS[2]
+            + aa[None, None, :, None] * VS[3]
+            + dd[None, None, None, :] * VS[4],
+            mask=valid[:, :, None, None] & (aa[None, None, :, None] < A),
+            other=0.0,
         ).to(tl.float32)
         co = tl.load(
             CO + b * COS[0] + h * COS[1] + ch * COS[2], mask=valid, other=1.0
@@ -3334,8 +3713,11 @@ if _TRITON_AVAILABLE:
         tl.store(DQ + (bh * N + n[:, None]) * D + dd[None, :], dq, mask=n[:, None] < N)
         edge = (bh * N + n[:, None]) * K + kk[None, :]
         tl.store(
-            EPART + edge[:, :, None] * A + aa[None, None, :], coeff,
-            mask=(n[:, None, None] < N) & (kk[None, :, None] < K) & (aa[None, None, :] < A),
+            EPART + edge[:, :, None] * A + aa[None, None, :],
+            coeff,
+            mask=(n[:, None, None] < N)
+            & (kk[None, :, None] < K)
+            & (aa[None, None, :] < A),
         )
         mean_grad = tl.sum(tl.where(aa[None, None, :] == 0, coeff, 0.0), axis=2)
         dc = tl.where(valid & (co > 1.0e-4) & (raw > FLOOR), mean_grad * w / co, 0.0)
@@ -3345,10 +3727,23 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _selected_address_score_backward_source_packed_reduce_kernel(
-        Q, EPART, CPART, RE, OFF, DV, DC,
-        QS: tl.constexpr, RES: tl.constexpr, OS: tl.constexpr,
-        H: tl.constexpr, N: tl.constexpr, D: tl.constexpr, NC: tl.constexpr,
-        A: tl.constexpr, K: tl.constexpr, ET: tl.constexpr,
+        Q,
+        EPART,
+        CPART,
+        RE,
+        OFF,
+        DV,
+        DC,
+        QS: tl.constexpr,
+        RES: tl.constexpr,
+        OS: tl.constexpr,
+        H: tl.constexpr,
+        N: tl.constexpr,
+        D: tl.constexpr,
+        NC: tl.constexpr,
+        A: tl.constexpr,
+        K: tl.constexpr,
+        ET: tl.constexpr,
     ):
         bh, ca = tl.program_id(0), tl.program_id(1)
         b, h = bh // H, bh % H
@@ -3366,7 +3761,8 @@ if _TRITON_AVAILABLE:
             n = edge // K
             q = tl.load(
                 Q + b * QS[0] + h * QS[1] + n[:, None] * QS[2] + dd[None, :] * QS[3],
-                mask=(ix < hi)[:, None], other=0.0,
+                mask=(ix < hi)[:, None],
+                other=0.0,
             ).to(tl.float32)
             coeff = tl.load(
                 EPART + (bh * N * K + edge) * A + a, mask=ix < hi, other=0.0
@@ -3380,14 +3776,35 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _selected_page_lse_kernel(
-        Q, GLOBAL_K, CHUNKS, LENGTHS, OUT,
-        sqb, sqh, sqn, sqd,
-        sgkb, sgkh, sgkn, sgkd,
-        scb, sch, scn, sck,
-        sob, soh, son, sok,
-        B: tl.constexpr, N: tl.constexpr, H: tl.constexpr, HD: tl.constexpr,
-        K_VAL: tl.constexpr, CHUNK_SIZE: tl.constexpr,
-        CHUNK_PAD: tl.constexpr, LOCAL_WINDOW: tl.constexpr,
+        Q,
+        GLOBAL_K,
+        CHUNKS,
+        LENGTHS,
+        OUT,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        sgkb,
+        sgkh,
+        sgkn,
+        sgkd,
+        scb,
+        sch,
+        scn,
+        sck,
+        sob,
+        soh,
+        son,
+        sok,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        CHUNK_PAD: tl.constexpr,
+        LOCAL_WINDOW: tl.constexpr,
     ):
         program = tl.program_id(0)
         slot = program % K_VAL
@@ -3400,25 +3817,35 @@ if _TRITON_AVAILABLE:
         query_valid = query_position < valid_length
         chunk = tl.load(
             CHUNKS + batch * scb + head * sch + query_position * scn + slot * sck,
-            mask=query_valid, other=-1,
+            mask=query_valid,
+            other=-1,
         ).to(tl.int32)
         dimensions = tl.arange(0, HD)
         token_offsets = tl.arange(0, CHUNK_PAD)
         query = tl.load(
             Q + batch * sqb + head * sqh + query_position * sqn + dimensions * sqd,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         ids = chunk * CHUNK_SIZE + token_offsets
         selected = (
-            query_valid & (chunk >= 0) & (token_offsets < CHUNK_SIZE)
-            & (ids >= 0) & (ids < N) & (ids < valid_length)
+            query_valid
+            & (chunk >= 0)
+            & (token_offsets < CHUNK_SIZE)
+            & (ids >= 0)
+            & (ids < N)
+            & (ids < valid_length)
             & (ids < query_position - LOCAL_WINDOW)
         )
         safe_ids = tl.maximum(tl.minimum(ids, N - 1), 0)
         keys = tl.load(
-            GLOBAL_K + batch * sgkb + head * sgkh
-            + safe_ids[:, None] * sgkn + dimensions[None, :] * sgkd,
-            mask=selected[:, None], other=0.0,
+            GLOBAL_K
+            + batch * sgkb
+            + head * sgkh
+            + safe_ids[:, None] * sgkn
+            + dimensions[None, :] * sgkd,
+            mask=selected[:, None],
+            other=0.0,
         ).to(tl.float32)
         score = tl.sum(keys * query[None, :], axis=1) / tl.sqrt(HD * 1.0)
         score = tl.where(selected, score, float("-inf"))
@@ -3429,28 +3856,75 @@ if _TRITON_AVAILABLE:
         lse = tl.where(denominator > 0.0, maximum + tl.log(denominator), float("-inf"))
         tl.store(
             OUT + batch * sob + head * soh + query_position * son + slot * sok,
-            lse, mask=query_valid,
+            lse,
+            mask=query_valid,
         )
 
     @triton.jit
     def _direct_global_lane_forward_kernel(
-        Q, GLOBAL_K, GLOBAL_V, PROJECTED_V, ROUTE, CHUNKS, LENGTHS,
-        OUT, LSE, ROUTE_OUT, ROUTE_LSE,
-        sqb, sqh, sqn, sqd,
-        sgkb, sgkh, sgkn, sgkd,
-        sgvb, sgvh, sgvn, sgvd,
-        spvb, spvh, spvn, spvd,
-        srb, srh, srn, srk,
-        scb, sch, scn, sck,
-        sob, soh, son, sod,
-        slseb, slseh, slsen,
-        srob, sroh, sron, srok, srod,
-        srlb, srlh, srln, srlk,
-        B: tl.constexpr, N: tl.constexpr, H: tl.constexpr, HD: tl.constexpr,
-        RANK: tl.constexpr, RANK_PAD: tl.constexpr,
-        K_VAL: tl.constexpr, CHUNK_SIZE: tl.constexpr,
-        CHUNK_PAD: tl.constexpr, LOCAL_WINDOW: tl.constexpr,
-        HAS_EVIDENCE: tl.constexpr, ARCH: tl.constexpr,
+        Q,
+        GLOBAL_K,
+        GLOBAL_V,
+        PROJECTED_V,
+        ROUTE,
+        CHUNKS,
+        LENGTHS,
+        OUT,
+        LSE,
+        ROUTE_OUT,
+        ROUTE_LSE,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        sgkb,
+        sgkh,
+        sgkn,
+        sgkd,
+        sgvb,
+        sgvh,
+        sgvn,
+        sgvd,
+        spvb,
+        spvh,
+        spvn,
+        spvd,
+        srb,
+        srh,
+        srn,
+        srk,
+        scb,
+        sch,
+        scn,
+        sck,
+        sob,
+        soh,
+        son,
+        sod,
+        slseb,
+        slseh,
+        slsen,
+        srob,
+        sroh,
+        sron,
+        srok,
+        srod,
+        srlb,
+        srlh,
+        srln,
+        srlk,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        RANK: tl.constexpr,
+        RANK_PAD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        CHUNK_PAD: tl.constexpr,
+        LOCAL_WINDOW: tl.constexpr,
+        HAS_EVIDENCE: tl.constexpr,
+        ARCH: tl.constexpr,
     ):
         program = tl.program_id(0)
         query_position = program % N
@@ -3464,7 +3938,8 @@ if _TRITON_AVAILABLE:
         token_offsets = tl.arange(0, CHUNK_PAD)
         query = tl.load(
             Q + batch * sqb + head * sqh + query_position * sqn + dimensions * sqd,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         scale = 1.0 / tl.sqrt(HD * 1.0)
         running_max = tl.full([], float("-inf"), tl.float32)
@@ -3476,25 +3951,38 @@ if _TRITON_AVAILABLE:
             chunk = tl.load(chunk_base + slot * sck).to(tl.int32)
             prior = tl.load(
                 route_base + slot * srk,
-                mask=query_valid & (chunk >= 0), other=float("-inf"),
+                mask=query_valid & (chunk >= 0),
+                other=float("-inf"),
             ).to(tl.float32)
             ids = chunk * CHUNK_SIZE + token_offsets
             selected = (
-                query_valid & (chunk >= 0) & (token_offsets < CHUNK_SIZE)
-                & (ids >= 0) & (ids < N) & (ids < valid_length)
+                query_valid
+                & (chunk >= 0)
+                & (token_offsets < CHUNK_SIZE)
+                & (ids >= 0)
+                & (ids < N)
+                & (ids < valid_length)
                 & (ids < query_position - LOCAL_WINDOW)
                 & (prior > float("-inf"))
             )
             safe_ids = tl.maximum(tl.minimum(ids, N - 1), 0)
             keys = tl.load(
-                GLOBAL_K + batch * sgkb + head * sgkh
-                + safe_ids[:, None] * sgkn + dimensions[None, :] * sgkd,
-                mask=selected[:, None], other=0.0,
+                GLOBAL_K
+                + batch * sgkb
+                + head * sgkh
+                + safe_ids[:, None] * sgkn
+                + dimensions[None, :] * sgkd,
+                mask=selected[:, None],
+                other=0.0,
             ).to(tl.float32)
             values = tl.load(
-                GLOBAL_V + batch * sgvb + head * sgvh
-                + safe_ids[:, None] * sgvn + dimensions[None, :] * sgvd,
-                mask=selected[:, None], other=0.0,
+                GLOBAL_V
+                + batch * sgvb
+                + head * sgvh
+                + safe_ids[:, None] * sgvn
+                + dimensions[None, :] * sgvd,
+                mask=selected[:, None],
+                other=0.0,
             ).to(tl.float32)
             scores = tl.sum(keys * query[None, :], axis=1) * scale + prior
             scores = tl.where(selected, scores, float("-inf"))
@@ -3503,32 +3991,44 @@ if _TRITON_AVAILABLE:
             route_probability = tl.where(selected, tl.exp(scores - route_safe_max), 0.0)
             route_sum = tl.sum(route_probability, axis=0)
             route_denominator = tl.where(route_sum > 0.0, route_sum, 1.0)
-            page_output = tl.sum(route_probability[:, None] * values, axis=0) / route_denominator
+            page_output = (
+                tl.sum(route_probability[:, None] * values, axis=0) / route_denominator
+            )
             route_slot_lse = tl.where(
                 route_sum > 0.0, route_max + tl.log(route_sum), float("-inf")
             )
             if HAS_EVIDENCE:
                 projected_values = tl.load(
-                    PROJECTED_V + batch * spvb + head * spvh
+                    PROJECTED_V
+                    + batch * spvb
+                    + head * spvh
                     + safe_ids[:, None] * spvn
                     + projected_dimensions[None, :] * spvd,
                     mask=selected[:, None] & (projected_dimensions[None, :] < RANK),
                     other=0.0,
                 ).to(tl.float32)
-                route_projected = tl.sum(
-                    route_probability[:, None] * projected_values, axis=0
-                ) / route_denominator
+                route_projected = (
+                    tl.sum(route_probability[:, None] * projected_values, axis=0)
+                    / route_denominator
+                )
                 tl.store(
-                    ROUTE_OUT + batch * srob + head * sroh
-                    + query_position * sron + slot * srok
+                    ROUTE_OUT
+                    + batch * srob
+                    + head * sroh
+                    + query_position * sron
+                    + slot * srok
                     + projected_dimensions * srod,
                     route_projected,
                     mask=query_valid & (projected_dimensions < RANK),
                 )
                 tl.store(
-                    ROUTE_LSE + batch * srlb + head * srlh
-                    + query_position * srln + slot * srlk,
-                    route_slot_lse, mask=query_valid,
+                    ROUTE_LSE
+                    + batch * srlb
+                    + head * srlh
+                    + query_position * srln
+                    + slot * srlk,
+                    route_slot_lse,
+                    mask=query_valid,
                 )
             has_route = route_sum > 0.0
             merged_max = tl.maximum(running_max, route_slot_lse)
@@ -3537,7 +4037,8 @@ if _TRITON_AVAILABLE:
             )
             old_scale = tl.where(
                 running_max > float("-inf"),
-                tl.exp(running_max - safe_merged_max), 0.0,
+                tl.exp(running_max - safe_merged_max),
+                0.0,
             )
             page_scale = tl.where(
                 has_route, tl.exp(route_slot_lse - safe_merged_max), 0.0
@@ -3550,43 +4051,117 @@ if _TRITON_AVAILABLE:
         denominator = tl.where(running_sum > 0.0, running_sum, 1.0)
         tl.store(
             OUT + batch * sob + head * soh + query_position * son + dimensions * sod,
-            accumulator / denominator, mask=query_valid,
+            accumulator / denominator,
+            mask=query_valid,
         )
         lse = tl.where(
             running_sum > 0.0, running_max + tl.log(running_sum), float("-inf")
         )
         tl.store(
             LSE + batch * slseb + head * slseh + query_position * slsen,
-            lse, mask=query_valid,
+            lse,
+            mask=query_valid,
         )
 
     @triton.jit
     def _direct_global_lane_query_backward_kernel(
-        Q, GLOBAL_K, GLOBAL_V, PROJECTED_V, OUT, DOUT, DLSE, LSE,
-        ROUTE_OUT, DROUTE_OUT, DROUTE_LSE, ROUTE_LSE,
-        ROUTE, CHUNKS, LENGTHS, DQ, DROUTE, DELTA,
-        sqb, sqh, sqn, sqd,
-        sgkb, sgkh, sgkn, sgkd,
-        sgvb, sgvh, sgvn, sgvd,
-        spvb, spvh, spvn, spvd,
-        sob, soh, son, sod,
-        sdob, sdoh, sdon, sdod,
-        sdlb, sdlh, sdln,
-        slseb, slseh, slsen,
-        srob, sroh, sron, srok, srod,
-        sdrob, sdroh, sdron, sdrok, sdrod,
-        sdrlb, sdrlh, sdrln, sdrlk,
-        srlb, srlh, srln, srlk,
-        srb, srh, srn, srk,
-        scb, sch, scn, sck,
-        sdqb, sdqh, sdqn, sdqd,
-        sdrb, sdrh, sdrn, sdrk,
-        sdeb, sdeh, sden,
-        B: tl.constexpr, N: tl.constexpr, H: tl.constexpr, HD: tl.constexpr,
-        RANK: tl.constexpr, RANK_PAD: tl.constexpr,
-        K_VAL: tl.constexpr, CHUNK_SIZE: tl.constexpr,
-        CHUNK_PAD: tl.constexpr, LOCAL_WINDOW: tl.constexpr,
-        HAS_EVIDENCE: tl.constexpr, ARCH: tl.constexpr,
+        Q,
+        GLOBAL_K,
+        GLOBAL_V,
+        PROJECTED_V,
+        OUT,
+        DOUT,
+        DLSE,
+        LSE,
+        ROUTE_OUT,
+        DROUTE_OUT,
+        DROUTE_LSE,
+        ROUTE_LSE,
+        ROUTE,
+        CHUNKS,
+        LENGTHS,
+        DQ,
+        DROUTE,
+        DELTA,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        sgkb,
+        sgkh,
+        sgkn,
+        sgkd,
+        sgvb,
+        sgvh,
+        sgvn,
+        sgvd,
+        spvb,
+        spvh,
+        spvn,
+        spvd,
+        sob,
+        soh,
+        son,
+        sod,
+        sdob,
+        sdoh,
+        sdon,
+        sdod,
+        sdlb,
+        sdlh,
+        sdln,
+        slseb,
+        slseh,
+        slsen,
+        srob,
+        sroh,
+        sron,
+        srok,
+        srod,
+        sdrob,
+        sdroh,
+        sdron,
+        sdrok,
+        sdrod,
+        sdrlb,
+        sdrlh,
+        sdrln,
+        sdrlk,
+        srlb,
+        srlh,
+        srln,
+        srlk,
+        srb,
+        srh,
+        srn,
+        srk,
+        scb,
+        sch,
+        scn,
+        sck,
+        sdqb,
+        sdqh,
+        sdqn,
+        sdqd,
+        sdrb,
+        sdrh,
+        sdrn,
+        sdrk,
+        sdeb,
+        sdeh,
+        sden,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        RANK: tl.constexpr,
+        RANK_PAD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        CHUNK_PAD: tl.constexpr,
+        LOCAL_WINDOW: tl.constexpr,
+        HAS_EVIDENCE: tl.constexpr,
+        ARCH: tl.constexpr,
     ):
         program = tl.program_id(0)
         query_position = program % N
@@ -3600,30 +4175,40 @@ if _TRITON_AVAILABLE:
         token_offsets = tl.arange(0, CHUNK_PAD)
         query = tl.load(
             Q + batch * sqb + head * sqh + query_position * sqn + dimensions * sqd,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         output = tl.load(
             OUT + batch * sob + head * soh + query_position * son + dimensions * sod,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         output_gradient = tl.load(
-            DOUT + batch * sdob + head * sdoh + query_position * sdon + dimensions * sdod,
-            mask=query_valid, other=0.0,
+            DOUT
+            + batch * sdob
+            + head * sdoh
+            + query_position * sdon
+            + dimensions * sdod,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         lse = tl.load(
             LSE + batch * slseb + head * slseh + query_position * slsen,
-            mask=query_valid, other=float("-inf"),
+            mask=query_valid,
+            other=float("-inf"),
         ).to(tl.float32)
         lse_gradient = tl.load(
             DLSE + batch * sdlb + head * sdlh + query_position * sdln,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         lse_valid = lse > float("-inf")
         safe_lse = tl.where(lse_valid, lse, 0.0)
         delta = tl.sum(output_gradient * output, axis=0)
         tl.store(
             DELTA + batch * sdeb + head * sdeh + query_position * sden,
-            delta, mask=query_valid,
+            delta,
+            mask=query_valid,
         )
         dquery = tl.zeros([HD], tl.float32)
         scale = 1.0 / tl.sqrt(HD * 1.0)
@@ -3634,59 +4219,90 @@ if _TRITON_AVAILABLE:
             chunk = tl.load(chunk_base + slot * sck).to(tl.int32)
             prior = tl.load(
                 route_base + slot * srk,
-                mask=query_valid & (chunk >= 0), other=float("-inf"),
+                mask=query_valid & (chunk >= 0),
+                other=float("-inf"),
             ).to(tl.float32)
             ids = chunk * CHUNK_SIZE + token_offsets
             selected = (
-                query_valid & (chunk >= 0) & (token_offsets < CHUNK_SIZE)
-                & (ids >= 0) & (ids < N) & (ids < valid_length)
+                query_valid
+                & (chunk >= 0)
+                & (token_offsets < CHUNK_SIZE)
+                & (ids >= 0)
+                & (ids < N)
+                & (ids < valid_length)
                 & (ids < query_position - LOCAL_WINDOW)
-                & (prior > float("-inf")) & lse_valid
+                & (prior > float("-inf"))
+                & lse_valid
             )
             safe_ids = tl.maximum(tl.minimum(ids, N - 1), 0)
             keys = tl.load(
-                GLOBAL_K + batch * sgkb + head * sgkh
-                + safe_ids[:, None] * sgkn + dimensions[None, :] * sgkd,
-                mask=selected[:, None], other=0.0,
+                GLOBAL_K
+                + batch * sgkb
+                + head * sgkh
+                + safe_ids[:, None] * sgkn
+                + dimensions[None, :] * sgkd,
+                mask=selected[:, None],
+                other=0.0,
             ).to(tl.float32)
             values = tl.load(
-                GLOBAL_V + batch * sgvb + head * sgvh
-                + safe_ids[:, None] * sgvn + dimensions[None, :] * sgvd,
-                mask=selected[:, None], other=0.0,
+                GLOBAL_V
+                + batch * sgvb
+                + head * sgvh
+                + safe_ids[:, None] * sgvn
+                + dimensions[None, :] * sgvd,
+                mask=selected[:, None],
+                other=0.0,
             ).to(tl.float32)
             scores = tl.sum(keys * query[None, :], axis=1) * scale + prior
             probability = tl.where(selected, tl.exp(scores - safe_lse), 0.0)
             dscore = probability * (
-                tl.sum(values * output_gradient[None, :], axis=1)
-                - delta + lse_gradient
+                tl.sum(values * output_gradient[None, :], axis=1) - delta + lse_gradient
             )
             if HAS_EVIDENCE:
                 route_slot_lse = tl.load(
-                    ROUTE_LSE + batch * srlb + head * srlh
-                    + query_position * srln + slot * srlk,
-                    mask=query_valid, other=float("-inf"),
+                    ROUTE_LSE
+                    + batch * srlb
+                    + head * srlh
+                    + query_position * srln
+                    + slot * srlk,
+                    mask=query_valid,
+                    other=float("-inf"),
                 ).to(tl.float32)
                 route_lse_valid = route_slot_lse > float("-inf")
                 safe_route_lse = tl.where(route_lse_valid, route_slot_lse, 0.0)
                 route_output = tl.load(
-                    ROUTE_OUT + batch * srob + head * sroh
-                    + query_position * sron + slot * srok
+                    ROUTE_OUT
+                    + batch * srob
+                    + head * sroh
+                    + query_position * sron
+                    + slot * srok
                     + projected_dimensions * srod,
-                    mask=query_valid & (projected_dimensions < RANK), other=0.0,
+                    mask=query_valid & (projected_dimensions < RANK),
+                    other=0.0,
                 ).to(tl.float32)
                 route_output_gradient = tl.load(
-                    DROUTE_OUT + batch * sdrob + head * sdroh
-                    + query_position * sdron + slot * sdrok
+                    DROUTE_OUT
+                    + batch * sdrob
+                    + head * sdroh
+                    + query_position * sdron
+                    + slot * sdrok
                     + projected_dimensions * sdrod,
-                    mask=query_valid & (projected_dimensions < RANK), other=0.0,
+                    mask=query_valid & (projected_dimensions < RANK),
+                    other=0.0,
                 ).to(tl.float32)
                 route_lse_gradient = tl.load(
-                    DROUTE_LSE + batch * sdrlb + head * sdrlh
-                    + query_position * sdrln + slot * sdrlk,
-                    mask=query_valid & route_lse_valid, other=0.0,
+                    DROUTE_LSE
+                    + batch * sdrlb
+                    + head * sdrlh
+                    + query_position * sdrln
+                    + slot * sdrlk,
+                    mask=query_valid & route_lse_valid,
+                    other=0.0,
                 ).to(tl.float32)
                 projected_values = tl.load(
-                    PROJECTED_V + batch * spvb + head * spvh
+                    PROJECTED_V
+                    + batch * spvb
+                    + head * spvh
                     + safe_ids[:, None] * spvn
                     + projected_dimensions[None, :] * spvd,
                     mask=selected[:, None] & (projected_dimensions[None, :] < RANK),
@@ -3694,55 +4310,137 @@ if _TRITON_AVAILABLE:
                 ).to(tl.float32)
                 route_probability = tl.where(
                     selected & route_lse_valid,
-                    tl.exp(scores - safe_route_lse), 0.0,
+                    tl.exp(scores - safe_route_lse),
+                    0.0,
                 )
                 route_delta = tl.sum(route_output_gradient * route_output, axis=0)
                 route_dscore = route_probability * (
                     tl.sum(projected_values * route_output_gradient[None, :], axis=1)
-                    - route_delta + route_lse_gradient
+                    - route_delta
+                    + route_lse_gradient
                 )
                 dscore += route_dscore
             dquery += tl.sum(dscore[:, None] * keys, axis=0) * scale
             tl.store(
-                droute_base + slot * sdrk, tl.sum(dscore, axis=0),
+                droute_base + slot * sdrk,
+                tl.sum(dscore, axis=0),
                 mask=query_valid & (chunk >= 0),
             )
         tl.store(
             DQ + batch * sdqb + head * sdqh + query_position * sdqn + dimensions * sdqd,
-            dquery, mask=query_valid,
+            dquery,
+            mask=query_valid,
         )
 
     @triton.jit
     def _direct_global_lane_source_block_backward_kernel(
-        Q, GLOBAL_K, GLOBAL_V, PROJECTED_V, DOUT, DLSE, LSE, DELTA,
-        ROUTE_OUT, DROUTE_OUT, DROUTE_LSE, ROUTE_LSE,
-        ROUTE, CHUNKS, LENGTHS, REVERSE_EDGES, CHUNK_OFFSETS,
-        DGLOBAL_K, DGLOBAL_V, DPROJECTED_V,
-        sqb, sqh, sqn, sqd,
-        sgkb, sgkh, sgkn, sgkd,
-        sgvb, sgvh, sgvn, sgvd,
-        spvb, spvh, spvn, spvd,
-        sdob, sdoh, sdon, sdod,
-        sdlb, sdlh, sdln,
-        slseb, slseh, slsen,
-        sdeb, sdeh, sden,
-        srob, sroh, sron, srok, srod,
-        sdrob, sdroh, sdron, sdrok, sdrod,
-        sdrlb, sdrlh, sdrln, sdrlk,
-        srlb, srlh, srln, srlk,
-        srb, srh, srn, srk,
-        scb, sch, scn, sck,
-        sreb, sreh, sree,
-        soffb, soffh, soffc,
-        sdgkb, sdgkh, sdgkn, sdgkd,
-        sdgvb, sdgvh, sdgvn, sdgvd,
-        sdpvb, sdpvh, sdpvn, sdpvd,
-        B: tl.constexpr, N: tl.constexpr, H: tl.constexpr, HD: tl.constexpr,
-        RANK: tl.constexpr, RANK_PAD: tl.constexpr,
-        K_VAL: tl.constexpr, CHUNK_SIZE: tl.constexpr,
-        NUM_CHUNKS: tl.constexpr, LOCAL_WINDOW: tl.constexpr,
-        SOURCE_BLOCK: tl.constexpr, BLOCKS_PER_CHUNK: tl.constexpr,
-        HAS_EVIDENCE: tl.constexpr, ARCH: tl.constexpr,
+        Q,
+        GLOBAL_K,
+        GLOBAL_V,
+        PROJECTED_V,
+        DOUT,
+        DLSE,
+        LSE,
+        DELTA,
+        ROUTE_OUT,
+        DROUTE_OUT,
+        DROUTE_LSE,
+        ROUTE_LSE,
+        ROUTE,
+        CHUNKS,
+        LENGTHS,
+        REVERSE_EDGES,
+        CHUNK_OFFSETS,
+        DGLOBAL_K,
+        DGLOBAL_V,
+        DPROJECTED_V,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        sgkb,
+        sgkh,
+        sgkn,
+        sgkd,
+        sgvb,
+        sgvh,
+        sgvn,
+        sgvd,
+        spvb,
+        spvh,
+        spvn,
+        spvd,
+        sdob,
+        sdoh,
+        sdon,
+        sdod,
+        sdlb,
+        sdlh,
+        sdln,
+        slseb,
+        slseh,
+        slsen,
+        sdeb,
+        sdeh,
+        sden,
+        srob,
+        sroh,
+        sron,
+        srok,
+        srod,
+        sdrob,
+        sdroh,
+        sdron,
+        sdrok,
+        sdrod,
+        sdrlb,
+        sdrlh,
+        sdrln,
+        sdrlk,
+        srlb,
+        srlh,
+        srln,
+        srlk,
+        srb,
+        srh,
+        srn,
+        srk,
+        scb,
+        sch,
+        scn,
+        sck,
+        sreb,
+        sreh,
+        sree,
+        soffb,
+        soffh,
+        soffc,
+        sdgkb,
+        sdgkh,
+        sdgkn,
+        sdgkd,
+        sdgvb,
+        sdgvh,
+        sdgvn,
+        sdgvd,
+        sdpvb,
+        sdpvh,
+        sdpvn,
+        sdpvd,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        RANK: tl.constexpr,
+        RANK_PAD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        NUM_CHUNKS: tl.constexpr,
+        LOCAL_WINDOW: tl.constexpr,
+        SOURCE_BLOCK: tl.constexpr,
+        BLOCKS_PER_CHUNK: tl.constexpr,
+        HAS_EVIDENCE: tl.constexpr,
+        ARCH: tl.constexpr,
     ):
         program = tl.program_id(0)
         block_in_chunk = program % BLOCKS_PER_CHUNK
@@ -3755,24 +4453,35 @@ if _TRITON_AVAILABLE:
         local_offsets = block_in_chunk * SOURCE_BLOCK + tl.arange(0, SOURCE_BLOCK)
         key_positions = source_chunk * CHUNK_SIZE + local_offsets
         source_valid = (
-            (local_offsets < CHUNK_SIZE) & (key_positions < N)
+            (local_offsets < CHUNK_SIZE)
+            & (key_positions < N)
             & (key_positions < valid_length)
         )
         dimensions = tl.arange(0, HD)
         projected_dimensions = tl.arange(0, RANK_PAD)
         keys = tl.load(
-            GLOBAL_K + batch * sgkb + head * sgkh
-            + key_positions[:, None] * sgkn + dimensions[None, :] * sgkd,
-            mask=source_valid[:, None], other=0.0,
+            GLOBAL_K
+            + batch * sgkb
+            + head * sgkh
+            + key_positions[:, None] * sgkn
+            + dimensions[None, :] * sgkd,
+            mask=source_valid[:, None],
+            other=0.0,
         ).to(tl.float32)
         values = tl.load(
-            GLOBAL_V + batch * sgvb + head * sgvh
-            + key_positions[:, None] * sgvn + dimensions[None, :] * sgvd,
-            mask=source_valid[:, None], other=0.0,
+            GLOBAL_V
+            + batch * sgvb
+            + head * sgvh
+            + key_positions[:, None] * sgvn
+            + dimensions[None, :] * sgvd,
+            mask=source_valid[:, None],
+            other=0.0,
         ).to(tl.float32)
         if HAS_EVIDENCE:
             projected_values = tl.load(
-                PROJECTED_V + batch * spvb + head * spvh
+                PROJECTED_V
+                + batch * spvb
+                + head * spvh
                 + key_positions[:, None] * spvn
                 + projected_dimensions[None, :] * spvd,
                 mask=source_valid[:, None] & (projected_dimensions[None, :] < RANK),
@@ -3787,44 +4496,56 @@ if _TRITON_AVAILABLE:
         if HAS_EVIDENCE:
             dprojected = tl.zeros([SOURCE_BLOCK, RANK_PAD], tl.float32)
         scale = 1.0 / tl.sqrt(HD * 1.0)
-        for reverse_offset in tl.range(edge_start, edge_end, num_stages=1, loop_unroll_factor=1):
+        for reverse_offset in tl.range(
+            edge_start, edge_end, num_stages=1, loop_unroll_factor=1
+        ):
             edge = tl.load(edge_base + reverse_offset * sree).to(tl.int32)
             query_position = edge // K_VAL
             slot = edge - query_position * K_VAL
             routed_chunk = tl.load(
-                CHUNKS + batch * scb + head * sch
-                + query_position * scn + slot * sck
+                CHUNKS + batch * scb + head * sch + query_position * scn + slot * sck
             ).to(tl.int32)
             prior = tl.load(
-                ROUTE + batch * srb + head * srh
-                + query_position * srn + slot * srk
+                ROUTE + batch * srb + head * srh + query_position * srn + slot * srk
             ).to(tl.float32)
             base_selected = (
-                (routed_chunk == source_chunk) & (query_position < valid_length)
+                (routed_chunk == source_chunk)
+                & (query_position < valid_length)
                 & (prior > float("-inf"))
             )
-            selected = source_valid & base_selected & (key_positions < query_position - LOCAL_WINDOW)
+            selected = (
+                source_valid
+                & base_selected
+                & (key_positions < query_position - LOCAL_WINDOW)
+            )
             query = tl.load(
-                Q + batch * sqb + head * sqh
-                + query_position * sqn + dimensions * sqd,
-                mask=base_selected, other=0.0,
+                Q + batch * sqb + head * sqh + query_position * sqn + dimensions * sqd,
+                mask=base_selected,
+                other=0.0,
             ).to(tl.float32)
             output_gradient = tl.load(
-                DOUT + batch * sdob + head * sdoh
-                + query_position * sdon + dimensions * sdod,
-                mask=base_selected, other=0.0,
+                DOUT
+                + batch * sdob
+                + head * sdoh
+                + query_position * sdon
+                + dimensions * sdod,
+                mask=base_selected,
+                other=0.0,
             ).to(tl.float32)
             lse = tl.load(
                 LSE + batch * slseb + head * slseh + query_position * slsen,
-                mask=base_selected, other=float("-inf"),
+                mask=base_selected,
+                other=float("-inf"),
             ).to(tl.float32)
             lse_gradient = tl.load(
                 DLSE + batch * sdlb + head * sdlh + query_position * sdln,
-                mask=base_selected, other=0.0,
+                mask=base_selected,
+                other=0.0,
             ).to(tl.float32)
             delta = tl.load(
                 DELTA + batch * sdeb + head * sdeh + query_position * sden,
-                mask=base_selected, other=0.0,
+                mask=base_selected,
+                other=0.0,
             ).to(tl.float32)
             lse_valid = lse > float("-inf")
             selected = selected & lse_valid
@@ -3832,33 +4553,48 @@ if _TRITON_AVAILABLE:
             score = tl.sum(keys * query[None, :], axis=1) * scale + prior
             probability = tl.where(selected, tl.exp(score - safe_lse), 0.0)
             dscore = probability * (
-                tl.sum(output_gradient[None, :] * values, axis=1)
-                - delta + lse_gradient
+                tl.sum(output_gradient[None, :] * values, axis=1) - delta + lse_gradient
             )
             if HAS_EVIDENCE:
                 route_slot_lse = tl.load(
-                    ROUTE_LSE + batch * srlb + head * srlh
-                    + query_position * srln + slot * srlk,
-                    mask=base_selected, other=float("-inf"),
+                    ROUTE_LSE
+                    + batch * srlb
+                    + head * srlh
+                    + query_position * srln
+                    + slot * srlk,
+                    mask=base_selected,
+                    other=float("-inf"),
                 ).to(tl.float32)
                 route_lse_valid = route_slot_lse > float("-inf")
                 safe_route_lse = tl.where(route_lse_valid, route_slot_lse, 0.0)
                 route_output = tl.load(
-                    ROUTE_OUT + batch * srob + head * sroh
-                    + query_position * sron + slot * srok
+                    ROUTE_OUT
+                    + batch * srob
+                    + head * sroh
+                    + query_position * sron
+                    + slot * srok
                     + projected_dimensions * srod,
-                    mask=base_selected & (projected_dimensions < RANK), other=0.0,
+                    mask=base_selected & (projected_dimensions < RANK),
+                    other=0.0,
                 ).to(tl.float32)
                 route_output_gradient = tl.load(
-                    DROUTE_OUT + batch * sdrob + head * sdroh
-                    + query_position * sdron + slot * sdrok
+                    DROUTE_OUT
+                    + batch * sdrob
+                    + head * sdroh
+                    + query_position * sdron
+                    + slot * sdrok
                     + projected_dimensions * sdrod,
-                    mask=base_selected & (projected_dimensions < RANK), other=0.0,
+                    mask=base_selected & (projected_dimensions < RANK),
+                    other=0.0,
                 ).to(tl.float32)
                 route_lse_gradient = tl.load(
-                    DROUTE_LSE + batch * sdrlb + head * sdrlh
-                    + query_position * sdrln + slot * sdrlk,
-                    mask=base_selected & route_lse_valid, other=0.0,
+                    DROUTE_LSE
+                    + batch * sdrlb
+                    + head * sdrlh
+                    + query_position * sdrln
+                    + slot * sdrlk,
+                    mask=base_selected & route_lse_valid,
+                    other=0.0,
                 ).to(tl.float32)
                 route_probability = tl.where(
                     selected & route_lse_valid, tl.exp(score - safe_route_lse), 0.0
@@ -3866,25 +4602,38 @@ if _TRITON_AVAILABLE:
                 route_delta = tl.sum(route_output_gradient * route_output, axis=0)
                 route_dscore = route_probability * (
                     tl.sum(route_output_gradient[None, :] * projected_values, axis=1)
-                    - route_delta + route_lse_gradient
+                    - route_delta
+                    + route_lse_gradient
                 )
                 dscore += route_dscore
-                dprojected += route_probability[:, None] * route_output_gradient[None, :]
+                dprojected += (
+                    route_probability[:, None] * route_output_gradient[None, :]
+                )
             dkeys += dscore[:, None] * query[None, :] * scale
             dvalues += probability[:, None] * output_gradient[None, :]
         tl.store(
-            DGLOBAL_K + batch * sdgkb + head * sdgkh
-            + key_positions[:, None] * sdgkn + dimensions[None, :] * sdgkd,
-            dkeys, mask=source_valid[:, None],
+            DGLOBAL_K
+            + batch * sdgkb
+            + head * sdgkh
+            + key_positions[:, None] * sdgkn
+            + dimensions[None, :] * sdgkd,
+            dkeys,
+            mask=source_valid[:, None],
         )
         tl.store(
-            DGLOBAL_V + batch * sdgvb + head * sdgvh
-            + key_positions[:, None] * sdgvn + dimensions[None, :] * sdgvd,
-            dvalues, mask=source_valid[:, None],
+            DGLOBAL_V
+            + batch * sdgvb
+            + head * sdgvh
+            + key_positions[:, None] * sdgvn
+            + dimensions[None, :] * sdgvd,
+            dvalues,
+            mask=source_valid[:, None],
         )
         if HAS_EVIDENCE:
             tl.store(
-                DPROJECTED_V + batch * sdpvb + head * sdpvh
+                DPROJECTED_V
+                + batch * sdpvb
+                + head * sdpvh
                 + key_positions[:, None] * sdpvn
                 + projected_dimensions[None, :] * sdpvd,
                 dprojected,
@@ -3893,31 +4642,103 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _direct_global_lane_atomic_source_backward_kernel(
-        Q, GLOBAL_K, GLOBAL_V, PROJECTED_V, DOUT, DLSE, LSE, DELTA,
-        ROUTE_OUT, DROUTE_OUT, DROUTE_LSE, ROUTE_LSE,
-        ROUTE, CHUNKS, LENGTHS, DGLOBAL_K, DGLOBAL_V, DPROJECTED_V,
-        sqb, sqh, sqn, sqd,
-        sgkb, sgkh, sgkn, sgkd,
-        sgvb, sgvh, sgvn, sgvd,
-        spvb, spvh, spvn, spvd,
-        sdob, sdoh, sdon, sdod,
-        sdlb, sdlh, sdln,
-        slseb, slseh, slsen,
-        sdeb, sdeh, sden,
-        srob, sroh, sron, srok, srod,
-        sdrob, sdroh, sdron, sdrok, sdrod,
-        sdrlb, sdrlh, sdrln, sdrlk,
-        srlb, srlh, srln, srlk,
-        srb, srh, srn, srk,
-        scb, sch, scn, sck,
-        sdgkb, sdgkh, sdgkn, sdgkd,
-        sdgvb, sdgvh, sdgvn, sdgvd,
-        sdpvb, sdpvh, sdpvn, sdpvd,
-        B: tl.constexpr, N: tl.constexpr, H: tl.constexpr, HD: tl.constexpr,
-        RANK: tl.constexpr, RANK_PAD: tl.constexpr,
-        K_VAL: tl.constexpr, CHUNK_SIZE: tl.constexpr,
-        CHUNK_PAD: tl.constexpr, LOCAL_WINDOW: tl.constexpr,
-        HAS_EVIDENCE: tl.constexpr, ARCH: tl.constexpr,
+        Q,
+        GLOBAL_K,
+        GLOBAL_V,
+        PROJECTED_V,
+        DOUT,
+        DLSE,
+        LSE,
+        DELTA,
+        ROUTE_OUT,
+        DROUTE_OUT,
+        DROUTE_LSE,
+        ROUTE_LSE,
+        ROUTE,
+        CHUNKS,
+        LENGTHS,
+        DGLOBAL_K,
+        DGLOBAL_V,
+        DPROJECTED_V,
+        sqb,
+        sqh,
+        sqn,
+        sqd,
+        sgkb,
+        sgkh,
+        sgkn,
+        sgkd,
+        sgvb,
+        sgvh,
+        sgvn,
+        sgvd,
+        spvb,
+        spvh,
+        spvn,
+        spvd,
+        sdob,
+        sdoh,
+        sdon,
+        sdod,
+        sdlb,
+        sdlh,
+        sdln,
+        slseb,
+        slseh,
+        slsen,
+        sdeb,
+        sdeh,
+        sden,
+        srob,
+        sroh,
+        sron,
+        srok,
+        srod,
+        sdrob,
+        sdroh,
+        sdron,
+        sdrok,
+        sdrod,
+        sdrlb,
+        sdrlh,
+        sdrln,
+        sdrlk,
+        srlb,
+        srlh,
+        srln,
+        srlk,
+        srb,
+        srh,
+        srn,
+        srk,
+        scb,
+        sch,
+        scn,
+        sck,
+        sdgkb,
+        sdgkh,
+        sdgkn,
+        sdgkd,
+        sdgvb,
+        sdgvh,
+        sdgvn,
+        sdgvd,
+        sdpvb,
+        sdpvh,
+        sdpvn,
+        sdpvd,
+        B: tl.constexpr,
+        N: tl.constexpr,
+        H: tl.constexpr,
+        HD: tl.constexpr,
+        RANK: tl.constexpr,
+        RANK_PAD: tl.constexpr,
+        K_VAL: tl.constexpr,
+        CHUNK_SIZE: tl.constexpr,
+        CHUNK_PAD: tl.constexpr,
+        LOCAL_WINDOW: tl.constexpr,
+        HAS_EVIDENCE: tl.constexpr,
+        ARCH: tl.constexpr,
     ):
         program = tl.program_id(0)
         slot = program % K_VAL
@@ -3930,53 +4751,75 @@ if _TRITON_AVAILABLE:
         query_valid = query_position < valid_length
         chunk = tl.load(
             CHUNKS + batch * scb + head * sch + query_position * scn + slot * sck,
-            mask=query_valid, other=-1,
+            mask=query_valid,
+            other=-1,
         ).to(tl.int32)
         prior = tl.load(
             ROUTE + batch * srb + head * srh + query_position * srn + slot * srk,
-            mask=query_valid & (chunk >= 0), other=float("-inf"),
+            mask=query_valid & (chunk >= 0),
+            other=float("-inf"),
         ).to(tl.float32)
         dimensions = tl.arange(0, HD)
         projected_dimensions = tl.arange(0, RANK_PAD)
         token_offsets = tl.arange(0, CHUNK_PAD)
         ids = chunk * CHUNK_SIZE + token_offsets
         selected = (
-            query_valid & (chunk >= 0) & (token_offsets < CHUNK_SIZE)
-            & (ids >= 0) & (ids < N) & (ids < valid_length)
+            query_valid
+            & (chunk >= 0)
+            & (token_offsets < CHUNK_SIZE)
+            & (ids >= 0)
+            & (ids < N)
+            & (ids < valid_length)
             & (ids < query_position - LOCAL_WINDOW)
             & (prior > float("-inf"))
         )
         safe_ids = tl.maximum(tl.minimum(ids, N - 1), 0)
         query = tl.load(
             Q + batch * sqb + head * sqh + query_position * sqn + dimensions * sqd,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         keys = tl.load(
-            GLOBAL_K + batch * sgkb + head * sgkh
-            + safe_ids[:, None] * sgkn + dimensions[None, :] * sgkd,
-            mask=selected[:, None], other=0.0,
+            GLOBAL_K
+            + batch * sgkb
+            + head * sgkh
+            + safe_ids[:, None] * sgkn
+            + dimensions[None, :] * sgkd,
+            mask=selected[:, None],
+            other=0.0,
         ).to(tl.float32)
         values = tl.load(
-            GLOBAL_V + batch * sgvb + head * sgvh
-            + safe_ids[:, None] * sgvn + dimensions[None, :] * sgvd,
-            mask=selected[:, None], other=0.0,
+            GLOBAL_V
+            + batch * sgvb
+            + head * sgvh
+            + safe_ids[:, None] * sgvn
+            + dimensions[None, :] * sgvd,
+            mask=selected[:, None],
+            other=0.0,
         ).to(tl.float32)
         output_gradient = tl.load(
-            DOUT + batch * sdob + head * sdoh
-            + query_position * sdon + dimensions * sdod,
-            mask=query_valid, other=0.0,
+            DOUT
+            + batch * sdob
+            + head * sdoh
+            + query_position * sdon
+            + dimensions * sdod,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         lse = tl.load(
             LSE + batch * slseb + head * slseh + query_position * slsen,
-            mask=query_valid, other=float("-inf"),
+            mask=query_valid,
+            other=float("-inf"),
         ).to(tl.float32)
         lse_gradient = tl.load(
             DLSE + batch * sdlb + head * sdlh + query_position * sdln,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         delta = tl.load(
             DELTA + batch * sdeb + head * sdeh + query_position * sden,
-            mask=query_valid, other=0.0,
+            mask=query_valid,
+            other=0.0,
         ).to(tl.float32)
         lse_valid = lse > float("-inf")
         selected = selected & lse_valid
@@ -3988,31 +4831,49 @@ if _TRITON_AVAILABLE:
         )
         if HAS_EVIDENCE:
             route_slot_lse = tl.load(
-                ROUTE_LSE + batch * srlb + head * srlh
-                + query_position * srln + slot * srlk,
-                mask=query_valid, other=float("-inf"),
+                ROUTE_LSE
+                + batch * srlb
+                + head * srlh
+                + query_position * srln
+                + slot * srlk,
+                mask=query_valid,
+                other=float("-inf"),
             ).to(tl.float32)
             route_lse_valid = route_slot_lse > float("-inf")
             safe_route_lse = tl.where(route_lse_valid, route_slot_lse, 0.0)
             route_output = tl.load(
-                ROUTE_OUT + batch * srob + head * sroh
-                + query_position * sron + slot * srok
+                ROUTE_OUT
+                + batch * srob
+                + head * sroh
+                + query_position * sron
+                + slot * srok
                 + projected_dimensions * srod,
-                mask=query_valid & (projected_dimensions < RANK), other=0.0,
+                mask=query_valid & (projected_dimensions < RANK),
+                other=0.0,
             ).to(tl.float32)
             route_output_gradient = tl.load(
-                DROUTE_OUT + batch * sdrob + head * sdroh
-                + query_position * sdron + slot * sdrok
+                DROUTE_OUT
+                + batch * sdrob
+                + head * sdroh
+                + query_position * sdron
+                + slot * sdrok
                 + projected_dimensions * sdrod,
-                mask=query_valid & (projected_dimensions < RANK), other=0.0,
+                mask=query_valid & (projected_dimensions < RANK),
+                other=0.0,
             ).to(tl.float32)
             route_lse_gradient = tl.load(
-                DROUTE_LSE + batch * sdrlb + head * sdrlh
-                + query_position * sdrln + slot * sdrlk,
-                mask=query_valid & route_lse_valid, other=0.0,
+                DROUTE_LSE
+                + batch * sdrlb
+                + head * sdrlh
+                + query_position * sdrln
+                + slot * sdrlk,
+                mask=query_valid & route_lse_valid,
+                other=0.0,
             ).to(tl.float32)
             projected_values = tl.load(
-                PROJECTED_V + batch * spvb + head * spvh
+                PROJECTED_V
+                + batch * spvb
+                + head * spvh
                 + safe_ids[:, None] * spvn
                 + projected_dimensions[None, :] * spvd,
                 mask=selected[:, None] & (projected_dimensions[None, :] < RANK),
@@ -4024,34 +4885,46 @@ if _TRITON_AVAILABLE:
             route_delta = tl.sum(route_output_gradient * route_output, axis=0)
             route_dscore = route_probability * (
                 tl.sum(projected_values * route_output_gradient[None, :], axis=1)
-                - route_delta + route_lse_gradient
+                - route_delta
+                + route_lse_gradient
             )
             dscore += route_dscore
             tl.atomic_add(
-                DPROJECTED_V + batch * sdpvb + head * sdpvh
+                DPROJECTED_V
+                + batch * sdpvb
+                + head * sdpvh
                 + safe_ids[:, None] * sdpvn
                 + projected_dimensions[None, :] * sdpvd,
                 route_probability[:, None] * route_output_gradient[None, :],
                 mask=selected[:, None] & (projected_dimensions[None, :] < RANK),
             )
         tl.atomic_add(
-            DGLOBAL_K + batch * sdgkb + head * sdgkh
-            + safe_ids[:, None] * sdgkn + dimensions[None, :] * sdgkd,
+            DGLOBAL_K
+            + batch * sdgkb
+            + head * sdgkh
+            + safe_ids[:, None] * sdgkn
+            + dimensions[None, :] * sdgkd,
             dscore[:, None] * query[None, :] / tl.sqrt(HD * 1.0),
             mask=selected[:, None],
         )
         tl.atomic_add(
-            DGLOBAL_V + batch * sdgvb + head * sdgvh
-            + safe_ids[:, None] * sdgvn + dimensions[None, :] * sdgvd,
+            DGLOBAL_V
+            + batch * sdgvb
+            + head * sdgvh
+            + safe_ids[:, None] * sdgvn
+            + dimensions[None, :] * sdgvd,
             probability[:, None] * output_gradient[None, :],
             mask=selected[:, None],
         )
 
     @triton.jit
     def _reverse_edge_count_kernel(
-        FLAT_CHUNKS, COUNTS,
-        TOTAL: tl.constexpr, EDGES: tl.constexpr,
-        NUM_CHUNKS: tl.constexpr, BLOCK: tl.constexpr,
+        FLAT_CHUNKS,
+        COUNTS,
+        TOTAL: tl.constexpr,
+        EDGES: tl.constexpr,
+        NUM_CHUNKS: tl.constexpr,
+        BLOCK: tl.constexpr,
     ):
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         valid = offsets < TOTAL
@@ -4062,9 +4935,14 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _reverse_edge_scatter_kernel(
-        FLAT_CHUNKS, OFFSETS, CURSORS, REVERSE_EDGES,
-        TOTAL: tl.constexpr, EDGES: tl.constexpr,
-        NUM_CHUNKS: tl.constexpr, BLOCK: tl.constexpr,
+        FLAT_CHUNKS,
+        OFFSETS,
+        CURSORS,
+        REVERSE_EDGES,
+        TOTAL: tl.constexpr,
+        EDGES: tl.constexpr,
+        NUM_CHUNKS: tl.constexpr,
+        BLOCK: tl.constexpr,
     ):
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         valid = offsets < TOTAL
@@ -4072,12 +4950,11 @@ if _TRITON_AVAILABLE:
         row = offsets // EDGES
         chunk = tl.load(FLAT_CHUNKS + offsets, mask=valid, other=-1).to(tl.int32)
         selected = valid & (chunk >= 0) & (chunk < NUM_CHUNKS)
-        cursor = tl.atomic_add(
-            CURSORS + row * NUM_CHUNKS + chunk, 1, mask=selected
-        )
+        cursor = tl.atomic_add(CURSORS + row * NUM_CHUNKS + chunk, 1, mask=selected)
         base = tl.load(
             OFFSETS + row * (NUM_CHUNKS + 1) + chunk,
-            mask=selected, other=0,
+            mask=selected,
+            other=0,
         ).to(tl.int32)
         tl.store(REVERSE_EDGES + row * EDGES + base + cursor, edge, mask=selected)
 
@@ -4086,7 +4963,9 @@ if _TRITON_AVAILABLE:
     _direct_forward_autotuned_kernel = triton.autotune(
         configs=[
             triton.Config({}, num_warps=warps, num_stages=stages)
-            for warps, stages in _direct_global_autotune_contract()["forward"]["configs"]
+            for warps, stages in _direct_global_autotune_contract()["forward"][
+                "configs"
+            ]
         ],
         key=list(_DIRECT_GLOBAL_AUTOTUNE_KEY),
         restore_value=["OUT", "LSE", "ROUTE_OUT", "ROUTE_LSE"],
@@ -4095,7 +4974,9 @@ if _TRITON_AVAILABLE:
     _direct_query_backward_autotuned_kernel = triton.autotune(
         configs=[
             triton.Config({}, num_warps=warps, num_stages=stages)
-            for warps, stages in _direct_global_autotune_contract()["query_backward"]["configs"]
+            for warps, stages in _direct_global_autotune_contract()["query_backward"][
+                "configs"
+            ]
         ],
         key=list(_DIRECT_GLOBAL_AUTOTUNE_KEY),
         reset_to_zero=["DQ", "DROUTE", "DELTA"],
@@ -4104,7 +4985,9 @@ if _TRITON_AVAILABLE:
     _direct_source_backward_autotuned_kernel = triton.autotune(
         configs=[
             triton.Config({}, num_warps=warps, num_stages=stages)
-            for warps, stages in _direct_global_autotune_contract()["source_backward"]["configs"]
+            for warps, stages in _direct_global_autotune_contract()["source_backward"][
+                "configs"
+            ]
         ],
         key=list(_DIRECT_SOURCE_AUTOTUNE_KEY),
         reset_to_zero=["DGLOBAL_K", "DGLOBAL_V", "DPROJECTED_V"],
@@ -4156,9 +5039,13 @@ def _stable_chunk_reverse_edges(
     sentinel = torch.full_like(flat, int(num_chunks))
     sortable = torch.where((flat >= 0) & (flat < int(num_chunks)), flat, sentinel)
     sorted_chunks, reverse_edges = torch.sort(sortable, dim=-1, stable=True)
-    boundaries = torch.arange(
-        int(num_chunks) + 1, device=chunks.device, dtype=sorted_chunks.dtype
-    ).reshape(1, 1, -1).expand(*chunks.shape[:2], -1)
+    boundaries = (
+        torch.arange(
+            int(num_chunks) + 1, device=chunks.device, dtype=sorted_chunks.dtype
+        )
+        .reshape(1, 1, -1)
+        .expand(*chunks.shape[:2], -1)
+    )
     offsets = torch.searchsorted(
         sorted_chunks.contiguous(), boundaries.contiguous(), right=False
     )
@@ -4184,11 +5071,16 @@ def _counting_chunk_reverse_edges(
     total = flat.numel()
     count_kernel = (
         torch.library.wrap_triton(_reverse_edge_count_kernel)
-        if use_wrap_triton else _reverse_edge_count_kernel
+        if use_wrap_triton
+        else _reverse_edge_count_kernel
     )
     count_kernel[(math.ceil(total / block),)](
-        flat, counts,
-        TOTAL=total, EDGES=edges, NUM_CHUNKS=int(num_chunks), BLOCK=block,
+        flat,
+        counts,
+        TOTAL=total,
+        EDGES=edges,
+        NUM_CHUNKS=int(num_chunks),
+        BLOCK=block,
         num_warps=4,
     )
     offsets = torch.cat(
@@ -4198,11 +5090,18 @@ def _counting_chunk_reverse_edges(
     reverse_edges = torch.empty_like(flat)
     scatter_kernel = (
         torch.library.wrap_triton(_reverse_edge_scatter_kernel)
-        if use_wrap_triton else _reverse_edge_scatter_kernel
+        if use_wrap_triton
+        else _reverse_edge_scatter_kernel
     )
     scatter_kernel[(math.ceil(total / block),)](
-        flat, offsets, cursors, reverse_edges,
-        TOTAL=total, EDGES=edges, NUM_CHUNKS=int(num_chunks), BLOCK=block,
+        flat,
+        offsets,
+        cursors,
+        reverse_edges,
+        TOTAL=total,
+        EDGES=edges,
+        NUM_CHUNKS=int(num_chunks),
+        BLOCK=block,
         num_warps=4,
     )
     return (
@@ -4252,8 +5151,12 @@ def _selected_page_lse_triton_apply(
 ) -> torch.Tensor:
     if not query.is_cuda or not _TRITON_AVAILABLE:
         return _candidate_page_lse_reference(
-            query, global_key, chunks, valid_lengths,
-            chunk_size=int(chunk_size), local_window=int(local_window),
+            query,
+            global_key,
+            chunks,
+            valid_lengths,
+            chunk_size=int(chunk_size),
+            local_window=int(local_window),
         )
     batch_size, heads, seq_len, head_dim = query.shape
     slots = int(chunks.shape[-1])
@@ -4263,14 +5166,28 @@ def _selected_page_lse_triton_apply(
     pack = 4
     kernel = (
         torch.library.wrap_triton(_selected_page_lse_packed_kernel)
-        if _TRITON_LIBRARY_API_AVAILABLE else _selected_page_lse_packed_kernel
+        if _TRITON_LIBRARY_API_AVAILABLE
+        else _selected_page_lse_packed_kernel
     )
     kernel[(batch_size * heads, triton.cdiv(seq_len * slots, pack))](
-        query, global_key, chunks, lengths, output,
-        query.stride(), global_key.stride(), chunks.stride(),
-        H=heads, N=seq_len, D=head_dim, K=slots,
-        CHUNK=int(chunk_size), CP=chunk_pad, W=int(local_window), EP=pack,
-        num_warps=4, num_stages=1,
+        query,
+        global_key,
+        chunks,
+        lengths,
+        output,
+        query.stride(),
+        global_key.stride(),
+        chunks.stride(),
+        H=heads,
+        N=seq_len,
+        D=head_dim,
+        K=slots,
+        CHUNK=int(chunk_size),
+        CP=chunk_pad,
+        W=int(local_window),
+        EP=pack,
+        num_warps=4,
+        num_stages=1,
     )
     return output
 
@@ -4325,18 +5242,34 @@ def _selected_address_score_forward_impl(
     )
     kernel = (
         torch.library.wrap_triton(_selected_address_score_forward_kernel)
-        if use_wrap_triton else _selected_address_score_forward_kernel
+        if use_wrap_triton
+        else _selected_address_score_forward_kernel
     )
     kernel[(batch * heads * seq_len * slots,)](
-        query, values, coherence, coherence_weight, chunks, output,
-        *query.stride(), *values.stride(), *coherence.stride(),
-        *chunks.stride(), *output.stride(),
-        B=batch, H=heads, N=seq_len, HD=head_dim,
-        A=addresses, A_PAD=_next_pow2(addresses), K_VAL=slots,
-        REDUCTION=int(reduction), TEMPERATURE=float(temperature),
+        query,
+        values,
+        coherence,
+        coherence_weight,
+        chunks,
+        output,
+        *query.stride(),
+        *values.stride(),
+        *coherence.stride(),
+        *chunks.stride(),
+        *output.stride(),
+        B=batch,
+        H=heads,
+        N=seq_len,
+        HD=head_dim,
+        A=addresses,
+        A_PAD=_next_pow2(addresses),
+        K_VAL=slots,
+        REDUCTION=int(reduction),
+        TEMPERATURE=float(temperature),
         LOG_A=math.log(addresses),
         COHERENCE_LOG_FLOOR=float(coherence_log_floor),
-        num_warps=4, num_stages=2,
+        num_warps=4,
+        num_stages=2,
     )
     return output
 
@@ -4374,7 +5307,8 @@ def _selected_address_score_backward_impl(
     )
     edge_partials = torch.empty(
         (batch, heads, seq_len, slots, addresses),
-        device=query.device, dtype=torch.float32,
+        device=query.device,
+        dtype=torch.float32,
     )
     coherence_partials = torch.empty(
         (batch, heads, seq_len, slots), device=query.device, dtype=torch.float32
@@ -4384,7 +5318,8 @@ def _selected_address_score_backward_impl(
     edge_tile = 4
     query_kernel = (
         torch.library.wrap_triton(_selected_address_score_backward_packed_kernel)
-        if use_wrap_triton else _selected_address_score_backward_packed_kernel
+        if use_wrap_triton
+        else _selected_address_score_backward_packed_kernel
     )
     source_kernel = (
         torch.library.wrap_triton(
@@ -4394,23 +5329,60 @@ def _selected_address_score_backward_impl(
         else _selected_address_score_backward_source_packed_reduce_kernel
     )
     query_kernel[(batch * heads, triton.cdiv(seq_len, query_pack))](
-        query, values, coherence, coherence_weight, chunks, grad_output,
-        dquery, edge_partials, coherence_partials, weight_partials,
-        query.stride(), values.stride(), coherence.stride(), chunks.stride(),
-        H=heads, N=seq_len, D=head_dim, NC=values.shape[2],
-        A=addresses, AP=_next_pow2(addresses), K=slots, KP=_next_pow2(slots),
-        QP=query_pack, RED=int(reduction), TEMP=float(temperature),
-        FLOOR=float(coherence_log_floor), num_warps=4, num_stages=1,
+        query,
+        values,
+        coherence,
+        coherence_weight,
+        chunks,
+        grad_output,
+        dquery,
+        edge_partials,
+        coherence_partials,
+        weight_partials,
+        query.stride(),
+        values.stride(),
+        coherence.stride(),
+        chunks.stride(),
+        H=heads,
+        N=seq_len,
+        D=head_dim,
+        NC=values.shape[2],
+        A=addresses,
+        AP=_next_pow2(addresses),
+        K=slots,
+        KP=_next_pow2(slots),
+        QP=query_pack,
+        RED=int(reduction),
+        TEMP=float(temperature),
+        FLOOR=float(coherence_log_floor),
+        num_warps=4,
+        num_stages=1,
     )
     source_kernel[(batch * heads, values.shape[2] * addresses)](
-        query, edge_partials, coherence_partials, reverse_edges, chunk_offsets,
-        dvalues, dcoherence, query.stride(), reverse_edges.stride(),
-        chunk_offsets.stride(), H=heads, N=seq_len, D=head_dim,
-        NC=values.shape[2], A=addresses, K=slots, ET=edge_tile,
-        num_warps=4, num_stages=1,
+        query,
+        edge_partials,
+        coherence_partials,
+        reverse_edges,
+        chunk_offsets,
+        dvalues,
+        dcoherence,
+        query.stride(),
+        reverse_edges.stride(),
+        chunk_offsets.stride(),
+        H=heads,
+        N=seq_len,
+        D=head_dim,
+        NC=values.shape[2],
+        A=addresses,
+        K=slots,
+        ET=edge_tile,
+        num_warps=4,
+        num_stages=1,
     )
-    dweight = weight_partials.permute(1, 0, 2, 3).reshape(heads, -1).sum(
-        dim=1, dtype=torch.float32
+    dweight = (
+        weight_partials.permute(1, 0, 2, 3)
+        .reshape(heads, -1)
+        .sum(dim=1, dtype=torch.float32)
     )
     return dquery, dvalues, dcoherence, dweight
 
@@ -4429,8 +5401,14 @@ if _TRITON_LIBRARY_API_AVAILABLE:
         coherence_log_floor: float,
     ) -> torch.Tensor:
         return _selected_address_score_forward_impl(
-            query, values, coherence, coherence_weight, chunks,
-            reduction, temperature, coherence_log_floor,
+            query,
+            values,
+            coherence,
+            coherence_weight,
+            chunks,
+            reduction,
+            temperature,
+            coherence_log_floor,
             use_wrap_triton=True,
         )
 
@@ -4449,15 +5427,28 @@ if _TRITON_LIBRARY_API_AVAILABLE:
         coherence_log_floor: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return _selected_address_score_backward_impl(
-            query, values, coherence, coherence_weight, chunks, grad_output,
-            reduction, temperature, coherence_log_floor,
+            query,
+            values,
+            coherence,
+            coherence_weight,
+            chunks,
+            grad_output,
+            reduction,
+            temperature,
+            coherence_log_floor,
             use_wrap_triton=True,
         )
 
     def _setup_selected_address_score_context(ctx, inputs, output) -> None:
         (
-            query, values, coherence, coherence_weight, chunks,
-            reduction, temperature, coherence_log_floor,
+            query,
+            values,
+            coherence,
+            coherence_weight,
+            chunks,
+            reduction,
+            temperature,
+            coherence_log_floor,
         ) = inputs
         ctx.save_for_backward(query, values, coherence, coherence_weight, chunks)
         ctx.reduction = int(reduction)
@@ -4467,8 +5458,15 @@ if _TRITON_LIBRARY_API_AVAILABLE:
     def _selected_address_score_registered_backward(ctx, grad_output):
         query, values, coherence, coherence_weight, chunks = ctx.saved_tensors
         dquery, dvalues, dcoherence, dweight = _selected_address_score_backward_op(
-            query, values, coherence, coherence_weight, chunks, grad_output,
-            ctx.reduction, ctx.temperature, ctx.coherence_log_floor,
+            query,
+            values,
+            coherence,
+            coherence_weight,
+            chunks,
+            grad_output,
+            ctx.reduction,
+            ctx.temperature,
+            ctx.coherence_log_floor,
         )
         return dquery, dvalues, dcoherence, dweight, None, None, None, None
 
@@ -4482,16 +5480,29 @@ if _TRITON_LIBRARY_API_AVAILABLE:
 class _LegacySelectedAddressScoreFn(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, query, values, coherence, coherence_weight, chunks,
-        reduction, temperature, coherence_log_floor,
+        ctx,
+        query,
+        values,
+        coherence,
+        coherence_weight,
+        chunks,
+        reduction,
+        temperature,
+        coherence_log_floor,
     ):
         ctx.save_for_backward(query, values, coherence, coherence_weight, chunks)
         ctx.reduction = int(reduction)
         ctx.temperature = float(temperature)
         ctx.coherence_log_floor = float(coherence_log_floor)
         return _selected_address_score_forward_impl(
-            query, values, coherence, coherence_weight, chunks,
-            ctx.reduction, ctx.temperature, ctx.coherence_log_floor,
+            query,
+            values,
+            coherence,
+            coherence_weight,
+            chunks,
+            ctx.reduction,
+            ctx.temperature,
+            ctx.coherence_log_floor,
             use_wrap_triton=False,
         )
 
@@ -4499,8 +5510,15 @@ class _LegacySelectedAddressScoreFn(torch.autograd.Function):
     def backward(ctx, grad_output):
         query, values, coherence, coherence_weight, chunks = ctx.saved_tensors
         gradients = _selected_address_score_backward_impl(
-            query, values, coherence, coherence_weight, chunks, grad_output,
-            ctx.reduction, ctx.temperature, ctx.coherence_log_floor,
+            query,
+            values,
+            coherence,
+            coherence_weight,
+            chunks,
+            grad_output,
+            ctx.reduction,
+            ctx.temperature,
+            ctx.coherence_log_floor,
             use_wrap_triton=False,
         )
         return (*gradients, None, None, None, None)
@@ -4526,12 +5544,24 @@ def _selected_address_score_triton_apply(
     weight = coherence_weight.to(device=query.device, dtype=torch.float32)
     if _TRITON_LIBRARY_API_AVAILABLE:
         return _selected_address_score_op(
-            query.float(), values5.float(), coherence.float(), weight, chunks,
-            reduction_code, float(temperature), float(coherence_log_floor),
+            query.float(),
+            values5.float(),
+            coherence.float(),
+            weight,
+            chunks,
+            reduction_code,
+            float(temperature),
+            float(coherence_log_floor),
         )
     return _LegacySelectedAddressScoreFn.apply(
-        query.float(), values5.float(), coherence.float(), weight, chunks,
-        reduction_code, float(temperature), float(coherence_log_floor),
+        query.float(),
+        values5.float(),
+        coherence.float(),
+        weight,
+        chunks,
+        reduction_code,
+        float(temperature),
+        float(coherence_log_floor),
     )
 
 
@@ -4560,18 +5590,29 @@ def _direct_global_forward_impl(
     lengths = valid_lengths.reshape(-1).contiguous()
     output = torch.zeros_like(query)
     lse = torch.full(
-        (batch_size, heads, seq_len), float("-inf"),
-        device=query.device, dtype=torch.float32,
+        (batch_size, heads, seq_len),
+        float("-inf"),
+        device=query.device,
+        dtype=torch.float32,
     )
-    projected_kernel = projected_value if projected_value is not None else global_value[..., :1]
+    projected_kernel = (
+        projected_value if projected_value is not None else global_value[..., :1]
+    )
     if has_evidence:
         route_output = torch.zeros(
-            batch_size, heads, seq_len, chunks.shape[-1], rank,
-            device=projected_kernel.device, dtype=projected_kernel.dtype,
+            batch_size,
+            heads,
+            seq_len,
+            chunks.shape[-1],
+            rank,
+            device=projected_kernel.device,
+            dtype=projected_kernel.dtype,
         )
         route_lse = torch.full(
-            (batch_size, heads, seq_len, chunks.shape[-1]), float("-inf"),
-            device=query.device, dtype=torch.float32,
+            (batch_size, heads, seq_len, chunks.shape[-1]),
+            float("-inf"),
+            device=query.device,
+            dtype=torch.float32,
         )
         route_output_strides = route_output.stride()
         route_lse_strides = route_lse.stride()
@@ -4582,18 +5623,32 @@ def _direct_global_forward_impl(
         route_lse_strides = (0, 0, 0, 0)
     selected_kernel = (
         _direct_forward_autotuned_kernel
-        if _DIRECT_GLOBAL_AUTOTUNE_ENABLED else _direct_global_lane_forward_kernel
+        if _DIRECT_GLOBAL_AUTOTUNE_ENABLED
+        else _direct_global_lane_forward_kernel
     )
     if selected_kernel is None:
         raise RuntimeError("direct forward Triton kernel is unavailable")
-    cache_entries_before = len(selected_kernel.cache) if _DIRECT_GLOBAL_AUTOTUNE_ENABLED else 0
-    kernel = torch.library.wrap_triton(selected_kernel) if use_wrap_triton else selected_kernel
+    cache_entries_before = (
+        len(selected_kernel.cache) if _DIRECT_GLOBAL_AUTOTUNE_ENABLED else 0
+    )
+    kernel = (
+        torch.library.wrap_triton(selected_kernel)
+        if use_wrap_triton
+        else selected_kernel
+    )
     grid = (batch_size * heads * seq_len,)
     launch_kwargs = {
-        "B": batch_size, "N": seq_len, "H": heads, "HD": head_dim,
-        "RANK": rank, "RANK_PAD": rank_pad, "K_VAL": chunks.shape[-1],
-        "CHUNK_SIZE": int(chunk_size), "CHUNK_PAD": chunk_pad,
-        "LOCAL_WINDOW": int(local_window), "HAS_EVIDENCE": has_evidence,
+        "B": batch_size,
+        "N": seq_len,
+        "H": heads,
+        "HD": head_dim,
+        "RANK": rank,
+        "RANK_PAD": rank_pad,
+        "K_VAL": chunks.shape[-1],
+        "CHUNK_SIZE": int(chunk_size),
+        "CHUNK_PAD": chunk_pad,
+        "LOCAL_WINDOW": int(local_window),
+        "HAS_EVIDENCE": has_evidence,
         "ARCH": _cuda_arch_code(query.device),
     }
     if not _DIRECT_GLOBAL_AUTOTUNE_ENABLED:
@@ -4601,19 +5656,40 @@ def _direct_global_forward_impl(
 
     def launch() -> None:
         kernel[grid](
-            query, global_key, global_value, projected_kernel, route, chunks, lengths,
-            output, lse, route_output, route_lse,
-            *query.stride(), *global_key.stride(), *global_value.stride(),
-            *projected_kernel.stride(), *route.stride(), *chunks.stride(),
-            *output.stride(), *lse.stride(),
-            *route_output_strides, *route_lse_strides,
+            query,
+            global_key,
+            global_value,
+            projected_kernel,
+            route,
+            chunks,
+            lengths,
+            output,
+            lse,
+            route_output,
+            route_lse,
+            *query.stride(),
+            *global_key.stride(),
+            *global_value.stride(),
+            *projected_kernel.stride(),
+            *route.stride(),
+            *chunks.stride(),
+            *output.stride(),
+            *lse.stride(),
+            *route_output_strides,
+            *route_lse_strides,
             **launch_kwargs,
         )
+
     launch()
-    if _DIRECT_GLOBAL_AUTOTUNE_ENABLED and len(selected_kernel.cache) > cache_entries_before:
-        output.zero_(); lse.fill_(float("-inf"))
+    if (
+        _DIRECT_GLOBAL_AUTOTUNE_ENABLED
+        and len(selected_kernel.cache) > cache_entries_before
+    ):
+        output.zero_()
+        lse.fill_(float("-inf"))
         if has_evidence:
-            route_output.zero_(); route_lse.fill_(float("-inf"))
+            route_output.zero_()
+            route_lse.fill_(float("-inf"))
         launch()
     return output, lse, route_output, route_lse
 
@@ -4630,7 +5706,9 @@ def _prepare_direct_global_gradients(
     *,
     has_evidence: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    grad_output = torch.zeros_like(output) if grad_output is None else grad_output.contiguous()
+    grad_output = (
+        torch.zeros_like(output) if grad_output is None else grad_output.contiguous()
+    )
     grad_lse = torch.zeros_like(lse) if grad_lse is None else grad_lse.contiguous()
     lane_valid = torch.isfinite(lse)
     grad_output = torch.where(
@@ -4641,16 +5719,20 @@ def _prepare_direct_global_gradients(
     ).contiguous()
     if not has_evidence:
         return (
-            grad_output, grad_lse,
-            torch.zeros_like(route_output), torch.zeros_like(route_lse),
+            grad_output,
+            grad_lse,
+            torch.zeros_like(route_output),
+            torch.zeros_like(route_lse),
         )
     grad_route_output = (
         torch.zeros_like(route_output)
-        if grad_route_output is None else grad_route_output.contiguous()
+        if grad_route_output is None
+        else grad_route_output.contiguous()
     )
     grad_route_lse = (
         torch.zeros_like(route_lse)
-        if grad_route_lse is None else grad_route_lse.contiguous()
+        if grad_route_lse is None
+        else grad_route_lse.contiguous()
     )
     route_valid = torch.isfinite(route_lse)
     grad_route_output = torch.where(
@@ -4658,7 +5740,8 @@ def _prepare_direct_global_gradients(
     ).contiguous()
     grad_route_lse = torch.where(
         route_valid & torch.isfinite(grad_route_lse),
-        grad_route_lse, torch.zeros_like(grad_route_lse),
+        grad_route_lse,
+        torch.zeros_like(grad_route_lse),
     ).contiguous()
     return grad_output, grad_lse, grad_route_output, grad_route_lse
 
@@ -4693,7 +5776,9 @@ def _direct_global_backward_impl(
     )
     mode = _backward_impl_code(backward_mode)
     lengths = valid_lengths.reshape(-1).contiguous()
-    projected_kernel = projected_value if projected_value is not None else global_value[..., :1]
+    projected_kernel = (
+        projected_value if projected_value is not None else global_value[..., :1]
+    )
     dquery = torch.zeros_like(query)
     droute = torch.zeros_like(route)
     delta = torch.zeros_like(lse, dtype=torch.float32)
@@ -4701,37 +5786,75 @@ def _direct_global_backward_impl(
     rank_pad = _next_pow2(rank)
     route_output_strides = route_output.stride() if has_evidence else (0, 0, 0, 0, 0)
     route_lse_strides = route_lse.stride() if has_evidence else (0, 0, 0, 0)
-    grad_route_output_strides = grad_route_output.stride() if has_evidence else (0, 0, 0, 0, 0)
+    grad_route_output_strides = (
+        grad_route_output.stride() if has_evidence else (0, 0, 0, 0, 0)
+    )
     grad_route_lse_strides = grad_route_lse.stride() if has_evidence else (0, 0, 0, 0)
 
     selected_query_kernel = (
         _direct_query_backward_autotuned_kernel
-        if _DIRECT_GLOBAL_AUTOTUNE_ENABLED else _direct_global_lane_query_backward_kernel
+        if _DIRECT_GLOBAL_AUTOTUNE_ENABLED
+        else _direct_global_lane_query_backward_kernel
     )
     if selected_query_kernel is None:
         raise RuntimeError("direct query-backward Triton kernel is unavailable")
-    query_kernel = torch.library.wrap_triton(selected_query_kernel) if use_wrap_triton else selected_query_kernel
+    query_kernel = (
+        torch.library.wrap_triton(selected_query_kernel)
+        if use_wrap_triton
+        else selected_query_kernel
+    )
     query_kwargs = {
-        "B": batch_size, "N": seq_len, "H": heads, "HD": head_dim,
-        "RANK": rank, "RANK_PAD": rank_pad, "K_VAL": chunks.shape[-1],
-        "CHUNK_SIZE": int(chunk_size), "CHUNK_PAD": chunk_pad,
-        "LOCAL_WINDOW": int(local_window), "HAS_EVIDENCE": has_evidence,
+        "B": batch_size,
+        "N": seq_len,
+        "H": heads,
+        "HD": head_dim,
+        "RANK": rank,
+        "RANK_PAD": rank_pad,
+        "K_VAL": chunks.shape[-1],
+        "CHUNK_SIZE": int(chunk_size),
+        "CHUNK_PAD": chunk_pad,
+        "LOCAL_WINDOW": int(local_window),
+        "HAS_EVIDENCE": has_evidence,
         "ARCH": _cuda_arch_code(query.device),
     }
     if not _DIRECT_GLOBAL_AUTOTUNE_ENABLED:
         query_kwargs.update(num_warps=4, num_stages=2)
     query_kernel[(batch_size * heads * seq_len,)](
-        query, global_key, global_value, projected_kernel,
-        output, grad_output, grad_lse, lse,
-        route_output, grad_route_output, grad_route_lse, route_lse,
-        route, chunks, lengths, dquery, droute, delta,
-        *query.stride(), *global_key.stride(), *global_value.stride(),
-        *projected_kernel.stride(), *output.stride(), *grad_output.stride(),
-        *grad_lse.stride(), *lse.stride(),
-        *route_output_strides, *grad_route_output_strides,
-        *grad_route_lse_strides, *route_lse_strides,
-        *route.stride(), *chunks.stride(), *dquery.stride(),
-        *droute.stride(), *delta.stride(),
+        query,
+        global_key,
+        global_value,
+        projected_kernel,
+        output,
+        grad_output,
+        grad_lse,
+        lse,
+        route_output,
+        grad_route_output,
+        grad_route_lse,
+        route_lse,
+        route,
+        chunks,
+        lengths,
+        dquery,
+        droute,
+        delta,
+        *query.stride(),
+        *global_key.stride(),
+        *global_value.stride(),
+        *projected_kernel.stride(),
+        *output.stride(),
+        *grad_output.stride(),
+        *grad_lse.stride(),
+        *lse.stride(),
+        *route_output_strides,
+        *grad_route_output_strides,
+        *grad_route_lse_strides,
+        *route_lse_strides,
+        *route.stride(),
+        *chunks.stride(),
+        *dquery.stride(),
+        *droute.stride(),
+        *delta.stride(),
         **query_kwargs,
     )
 
@@ -4740,36 +5863,71 @@ def _direct_global_backward_impl(
         dglobal_value_acc = torch.zeros_like(global_value, dtype=torch.float32)
         dprojected_acc = (
             torch.zeros_like(projected_kernel, dtype=torch.float32)
-            if has_evidence else torch.empty(1, device=query.device, dtype=torch.float32)
+            if has_evidence
+            else torch.empty(1, device=query.device, dtype=torch.float32)
         )
         dprojected_strides = dprojected_acc.stride() if has_evidence else (0, 0, 0, 0)
         atomic_kernel = (
             torch.library.wrap_triton(_direct_global_lane_atomic_source_backward_kernel)
-            if use_wrap_triton else _direct_global_lane_atomic_source_backward_kernel
+            if use_wrap_triton
+            else _direct_global_lane_atomic_source_backward_kernel
         )
         atomic_kernel[(batch_size * heads * seq_len * chunks.shape[-1],)](
-            query, global_key, global_value, projected_kernel,
-            grad_output, grad_lse, lse, delta,
-            route_output, grad_route_output, grad_route_lse, route_lse,
-            route, chunks, lengths,
-            dglobal_key_acc, dglobal_value_acc, dprojected_acc,
-            *query.stride(), *global_key.stride(), *global_value.stride(),
-            *projected_kernel.stride(), *grad_output.stride(), *grad_lse.stride(),
-            *lse.stride(), *delta.stride(),
-            *route_output_strides, *grad_route_output_strides,
-            *grad_route_lse_strides, *route_lse_strides,
-            *route.stride(), *chunks.stride(),
-            *dglobal_key_acc.stride(), *dglobal_value_acc.stride(),
+            query,
+            global_key,
+            global_value,
+            projected_kernel,
+            grad_output,
+            grad_lse,
+            lse,
+            delta,
+            route_output,
+            grad_route_output,
+            grad_route_lse,
+            route_lse,
+            route,
+            chunks,
+            lengths,
+            dglobal_key_acc,
+            dglobal_value_acc,
+            dprojected_acc,
+            *query.stride(),
+            *global_key.stride(),
+            *global_value.stride(),
+            *projected_kernel.stride(),
+            *grad_output.stride(),
+            *grad_lse.stride(),
+            *lse.stride(),
+            *delta.stride(),
+            *route_output_strides,
+            *grad_route_output_strides,
+            *grad_route_lse_strides,
+            *route_lse_strides,
+            *route.stride(),
+            *chunks.stride(),
+            *dglobal_key_acc.stride(),
+            *dglobal_value_acc.stride(),
             *dprojected_strides,
-            B=batch_size, N=seq_len, H=heads, HD=head_dim,
-            RANK=rank, RANK_PAD=rank_pad, K_VAL=chunks.shape[-1],
-            CHUNK_SIZE=int(chunk_size), CHUNK_PAD=chunk_pad,
-            LOCAL_WINDOW=int(local_window), HAS_EVIDENCE=has_evidence,
-            ARCH=_cuda_arch_code(query.device), num_warps=4, num_stages=1,
+            B=batch_size,
+            N=seq_len,
+            H=heads,
+            HD=head_dim,
+            RANK=rank,
+            RANK_PAD=rank_pad,
+            K_VAL=chunks.shape[-1],
+            CHUNK_SIZE=int(chunk_size),
+            CHUNK_PAD=chunk_pad,
+            LOCAL_WINDOW=int(local_window),
+            HAS_EVIDENCE=has_evidence,
+            ARCH=_cuda_arch_code(query.device),
+            num_warps=4,
+            num_stages=1,
         )
         dglobal_key = dglobal_key_acc.to(global_key.dtype)
         dglobal_value = dglobal_value_acc.to(global_value.dtype)
-        dprojected_value = dprojected_acc.to(projected_kernel.dtype) if has_evidence else None
+        dprojected_value = (
+            dprojected_acc.to(projected_kernel.dtype) if has_evidence else None
+        )
     else:
         num_chunks = math.ceil(seq_len / int(chunk_size))
         if mode == _BACKWARD_SOURCE_BLOCK_COUNTING:
@@ -4784,9 +5942,12 @@ def _direct_global_backward_impl(
         dglobal_value = torch.zeros_like(global_value)
         dprojected_kernel = (
             torch.zeros_like(projected_kernel)
-            if has_evidence else torch.empty(1, device=query.device, dtype=query.dtype)
+            if has_evidence
+            else torch.empty(1, device=query.device, dtype=query.dtype)
         )
-        dprojected_strides = dprojected_kernel.stride() if has_evidence else (0, 0, 0, 0)
+        dprojected_strides = (
+            dprojected_kernel.stride() if has_evidence else (0, 0, 0, 0)
+        )
         source_block = int(source_block_size)
         if source_block < 1 or not _is_power_of_two(source_block) or source_block > 32:
             raise ValueError("source_block_size must be a power of two in [1,32]")
@@ -4797,32 +5958,72 @@ def _direct_global_backward_impl(
             else _direct_global_lane_source_block_backward_kernel
         )
         if selected_source_kernel is None:
-            raise RuntimeError("direct source-block backward Triton kernel is unavailable")
-        source_kernel = torch.library.wrap_triton(selected_source_kernel) if use_wrap_triton else selected_source_kernel
+            raise RuntimeError(
+                "direct source-block backward Triton kernel is unavailable"
+            )
+        source_kernel = (
+            torch.library.wrap_triton(selected_source_kernel)
+            if use_wrap_triton
+            else selected_source_kernel
+        )
         source_kwargs = {
-            "B": batch_size, "N": seq_len, "H": heads, "HD": head_dim,
-            "RANK": rank, "RANK_PAD": rank_pad, "K_VAL": chunks.shape[-1],
-            "CHUNK_SIZE": int(chunk_size), "NUM_CHUNKS": num_chunks,
-            "LOCAL_WINDOW": int(local_window), "SOURCE_BLOCK": source_block,
+            "B": batch_size,
+            "N": seq_len,
+            "H": heads,
+            "HD": head_dim,
+            "RANK": rank,
+            "RANK_PAD": rank_pad,
+            "K_VAL": chunks.shape[-1],
+            "CHUNK_SIZE": int(chunk_size),
+            "NUM_CHUNKS": num_chunks,
+            "LOCAL_WINDOW": int(local_window),
+            "SOURCE_BLOCK": source_block,
             "BLOCKS_PER_CHUNK": blocks_per_chunk,
-            "HAS_EVIDENCE": has_evidence, "ARCH": _cuda_arch_code(query.device),
+            "HAS_EVIDENCE": has_evidence,
+            "ARCH": _cuda_arch_code(query.device),
         }
         if not _DIRECT_GLOBAL_AUTOTUNE_ENABLED:
             source_kwargs.update(num_warps=4, num_stages=1)
         source_kernel[(batch_size * heads * num_chunks * blocks_per_chunk,)](
-            query, global_key, global_value, projected_kernel,
-            grad_output, grad_lse, lse, delta,
-            route_output, grad_route_output, grad_route_lse, route_lse,
-            route, chunks, lengths, reverse_edges, chunk_offsets,
-            dglobal_key, dglobal_value, dprojected_kernel,
-            *query.stride(), *global_key.stride(), *global_value.stride(),
-            *projected_kernel.stride(), *grad_output.stride(), *grad_lse.stride(),
-            *lse.stride(), *delta.stride(),
-            *route_output_strides, *grad_route_output_strides,
-            *grad_route_lse_strides, *route_lse_strides,
-            *route.stride(), *chunks.stride(), *reverse_edges.stride(),
-            *chunk_offsets.stride(), *dglobal_key.stride(),
-            *dglobal_value.stride(), *dprojected_strides,
+            query,
+            global_key,
+            global_value,
+            projected_kernel,
+            grad_output,
+            grad_lse,
+            lse,
+            delta,
+            route_output,
+            grad_route_output,
+            grad_route_lse,
+            route_lse,
+            route,
+            chunks,
+            lengths,
+            reverse_edges,
+            chunk_offsets,
+            dglobal_key,
+            dglobal_value,
+            dprojected_kernel,
+            *query.stride(),
+            *global_key.stride(),
+            *global_value.stride(),
+            *projected_kernel.stride(),
+            *grad_output.stride(),
+            *grad_lse.stride(),
+            *lse.stride(),
+            *delta.stride(),
+            *route_output_strides,
+            *grad_route_output_strides,
+            *grad_route_lse_strides,
+            *route_lse_strides,
+            *route.stride(),
+            *chunks.stride(),
+            *reverse_edges.stride(),
+            *chunk_offsets.stride(),
+            *dglobal_key.stride(),
+            *dglobal_value.stride(),
+            *dprojected_strides,
             **source_kwargs,
         )
         dprojected_value = dprojected_kernel if has_evidence else None
@@ -4831,34 +6032,79 @@ def _direct_global_backward_impl(
 
 if _TRITON_LIBRARY_API_AVAILABLE:
 
-    @torch.library.triton_op("dwarf_hisa_v19::direct_global_lane_evidence", mutates_args={})
+    @torch.library.triton_op(
+        "dwarf_hisa_v19::direct_global_lane_evidence", mutates_args={}
+    )
     def _direct_global_hisa_evidence_op(
-        query: torch.Tensor, global_key: torch.Tensor, global_value: torch.Tensor,
-        projected_value: torch.Tensor, route: torch.Tensor, chunks: torch.Tensor,
-        valid_lengths: torch.Tensor, chunk_size: int, local_window: int,
-        backward_mode: int, source_block_size: int,
+        query: torch.Tensor,
+        global_key: torch.Tensor,
+        global_value: torch.Tensor,
+        projected_value: torch.Tensor,
+        route: torch.Tensor,
+        chunks: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        chunk_size: int,
+        local_window: int,
+        backward_mode: int,
+        source_block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return _direct_global_forward_impl(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, chunk_size, local_window, use_wrap_triton=True,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            chunk_size,
+            local_window,
+            use_wrap_triton=True,
         )
 
-    @torch.library.triton_op("dwarf_hisa_v19::direct_global_lane_evidence_backward", mutates_args={})
+    @torch.library.triton_op(
+        "dwarf_hisa_v19::direct_global_lane_evidence_backward", mutates_args={}
+    )
     def _direct_global_hisa_evidence_backward_op(
-        query: torch.Tensor, global_key: torch.Tensor, global_value: torch.Tensor,
-        projected_value: torch.Tensor, route: torch.Tensor, chunks: torch.Tensor,
-        valid_lengths: torch.Tensor, output: torch.Tensor, lse: torch.Tensor,
-        route_output: torch.Tensor, route_lse: torch.Tensor,
-        grad_output: torch.Tensor, grad_lse: torch.Tensor,
-        grad_route_output: torch.Tensor, grad_route_lse: torch.Tensor,
-        chunk_size: int, local_window: int, backward_mode: int,
+        query: torch.Tensor,
+        global_key: torch.Tensor,
+        global_value: torch.Tensor,
+        projected_value: torch.Tensor,
+        route: torch.Tensor,
+        chunks: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        route_output: torch.Tensor,
+        route_lse: torch.Tensor,
+        grad_output: torch.Tensor,
+        grad_lse: torch.Tensor,
+        grad_route_output: torch.Tensor,
+        grad_route_lse: torch.Tensor,
+        chunk_size: int,
+        local_window: int,
+        backward_mode: int,
         source_block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         result = _direct_global_backward_impl(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, output, lse, route_output, route_lse,
-            grad_output, grad_lse, grad_route_output, grad_route_lse,
-            chunk_size, local_window, backward_mode, source_block_size,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            route_output,
+            route_lse,
+            grad_output,
+            grad_lse,
+            grad_route_output,
+            grad_route_lse,
+            chunk_size,
+            local_window,
+            backward_mode,
+            source_block_size,
             use_wrap_triton=True,
         )
         assert result[3] is not None
@@ -4868,64 +6114,156 @@ if _TRITON_LIBRARY_API_AVAILABLE:
         (*tensors, chunk_size, local_window, backward_mode, source_block_size) = inputs
         output_tensor, lse, route_output, route_lse = output
         ctx.save_for_backward(*tensors, output_tensor, lse, route_output, route_lse)
-        ctx.chunk_size = int(chunk_size); ctx.local_window = int(local_window)
-        ctx.backward_mode = int(backward_mode); ctx.source_block_size = int(source_block_size)
+        ctx.chunk_size = int(chunk_size)
+        ctx.local_window = int(local_window)
+        ctx.backward_mode = int(backward_mode)
+        ctx.source_block_size = int(source_block_size)
 
-    def _evidence_registered_backward(ctx, grad_output, grad_lse, grad_route_output, grad_route_lse):
+    def _evidence_registered_backward(
+        ctx, grad_output, grad_lse, grad_route_output, grad_route_lse
+    ):
         (
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, output, lse, route_output, route_lse,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            route_output,
+            route_lse,
         ) = ctx.saved_tensors
         grads = _prepare_direct_global_gradients(
-            output, lse, route_output, route_lse,
-            grad_output, grad_lse, grad_route_output, grad_route_lse,
+            output,
+            lse,
+            route_output,
+            route_lse,
+            grad_output,
+            grad_lse,
+            grad_route_output,
+            grad_route_lse,
             has_evidence=True,
         )
-        dquery, dkey, dvalue, dprojected, droute = _direct_global_hisa_evidence_backward_op(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, output, lse, route_output, route_lse,
-            *grads, ctx.chunk_size, ctx.local_window,
-            ctx.backward_mode, ctx.source_block_size,
+        dquery, dkey, dvalue, dprojected, droute = (
+            _direct_global_hisa_evidence_backward_op(
+                query,
+                global_key,
+                global_value,
+                projected_value,
+                route,
+                chunks,
+                valid_lengths,
+                output,
+                lse,
+                route_output,
+                route_lse,
+                *grads,
+                ctx.chunk_size,
+                ctx.local_window,
+                ctx.backward_mode,
+                ctx.source_block_size,
+            )
         )
-        return dquery, dkey, dvalue, dprojected, droute, None, None, None, None, None, None
+        return (
+            dquery,
+            dkey,
+            dvalue,
+            dprojected,
+            droute,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
     torch.library.register_autograd(
         "dwarf_hisa_v19::direct_global_lane_evidence",
-        _evidence_registered_backward, setup_context=_setup_evidence_context,
+        _evidence_registered_backward,
+        setup_context=_setup_evidence_context,
     )
 
-    @torch.library.triton_op("dwarf_hisa_v19::direct_global_lane_aggregate", mutates_args={})
+    @torch.library.triton_op(
+        "dwarf_hisa_v19::direct_global_lane_aggregate", mutates_args={}
+    )
     def _direct_global_hisa_aggregate_op(
-        query: torch.Tensor, global_key: torch.Tensor, global_value: torch.Tensor,
-        route: torch.Tensor, chunks: torch.Tensor, valid_lengths: torch.Tensor,
-        chunk_size: int, local_window: int, backward_mode: int,
+        query: torch.Tensor,
+        global_key: torch.Tensor,
+        global_value: torch.Tensor,
+        route: torch.Tensor,
+        chunks: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        chunk_size: int,
+        local_window: int,
+        backward_mode: int,
         source_block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         output, lse, _, _ = _direct_global_forward_impl(
-            query, global_key, global_value, None, route, chunks, valid_lengths,
-            chunk_size, local_window, use_wrap_triton=True,
+            query,
+            global_key,
+            global_value,
+            None,
+            route,
+            chunks,
+            valid_lengths,
+            chunk_size,
+            local_window,
+            use_wrap_triton=True,
         )
         return output, lse
 
-    @torch.library.triton_op("dwarf_hisa_v19::direct_global_lane_aggregate_backward", mutates_args={})
+    @torch.library.triton_op(
+        "dwarf_hisa_v19::direct_global_lane_aggregate_backward", mutates_args={}
+    )
     def _direct_global_hisa_aggregate_backward_op(
-        query: torch.Tensor, global_key: torch.Tensor, global_value: torch.Tensor,
-        route: torch.Tensor, chunks: torch.Tensor, valid_lengths: torch.Tensor,
-        output: torch.Tensor, lse: torch.Tensor,
-        grad_output: torch.Tensor, grad_lse: torch.Tensor,
-        chunk_size: int, local_window: int, backward_mode: int,
+        query: torch.Tensor,
+        global_key: torch.Tensor,
+        global_value: torch.Tensor,
+        route: torch.Tensor,
+        chunks: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        grad_output: torch.Tensor,
+        grad_lse: torch.Tensor,
+        chunk_size: int,
+        local_window: int,
+        backward_mode: int,
         source_block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         dummy_output = torch.empty(1, device=query.device, dtype=query.dtype)
         dummy_lse = torch.empty(1, device=query.device, dtype=torch.float32)
         grads = _prepare_direct_global_gradients(
-            output, lse, dummy_output, dummy_lse,
-            grad_output, grad_lse, None, None, has_evidence=False,
+            output,
+            lse,
+            dummy_output,
+            dummy_lse,
+            grad_output,
+            grad_lse,
+            None,
+            None,
+            has_evidence=False,
         )
         result = _direct_global_backward_impl(
-            query, global_key, global_value, None, route, chunks, valid_lengths,
-            output, lse, dummy_output, dummy_lse, *grads,
-            chunk_size, local_window, backward_mode, source_block_size,
+            query,
+            global_key,
+            global_value,
+            None,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            dummy_output,
+            dummy_lse,
+            *grads,
+            chunk_size,
+            local_window,
+            backward_mode,
+            source_block_size,
             use_wrap_triton=True,
         )
         return result[0], result[1], result[2], result[4]
@@ -4934,91 +6272,220 @@ if _TRITON_LIBRARY_API_AVAILABLE:
         (*tensors, chunk_size, local_window, backward_mode, source_block_size) = inputs
         output_tensor, lse = output
         ctx.save_for_backward(*tensors, output_tensor, lse)
-        ctx.chunk_size = int(chunk_size); ctx.local_window = int(local_window)
-        ctx.backward_mode = int(backward_mode); ctx.source_block_size = int(source_block_size)
+        ctx.chunk_size = int(chunk_size)
+        ctx.local_window = int(local_window)
+        ctx.backward_mode = int(backward_mode)
+        ctx.source_block_size = int(source_block_size)
 
     def _aggregate_registered_backward(ctx, grad_output, grad_lse):
-        query, global_key, global_value, route, chunks, valid_lengths, output, lse = ctx.saved_tensors
+        query, global_key, global_value, route, chunks, valid_lengths, output, lse = (
+            ctx.saved_tensors
+        )
         dquery, dkey, dvalue, droute = _direct_global_hisa_aggregate_backward_op(
-            query, global_key, global_value, route, chunks, valid_lengths,
-            output, lse, grad_output, grad_lse,
-            ctx.chunk_size, ctx.local_window, ctx.backward_mode, ctx.source_block_size,
+            query,
+            global_key,
+            global_value,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            grad_output,
+            grad_lse,
+            ctx.chunk_size,
+            ctx.local_window,
+            ctx.backward_mode,
+            ctx.source_block_size,
         )
         return dquery, dkey, dvalue, droute, None, None, None, None, None, None
 
     torch.library.register_autograd(
         "dwarf_hisa_v19::direct_global_lane_aggregate",
-        _aggregate_registered_backward, setup_context=_setup_aggregate_context,
+        _aggregate_registered_backward,
+        setup_context=_setup_aggregate_context,
     )
 
 
 class _LegacyDirectGlobalHISAEvidenceFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, global_key, global_value, projected_value, route, chunks,
-                valid_lengths, chunk_size, local_window, backward_mode, source_block_size):
+    def forward(
+        ctx,
+        query,
+        global_key,
+        global_value,
+        projected_value,
+        route,
+        chunks,
+        valid_lengths,
+        chunk_size,
+        local_window,
+        backward_mode,
+        source_block_size,
+    ):
         output, lse, route_output, route_lse = _direct_global_forward_impl(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, chunk_size, local_window, use_wrap_triton=False,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            chunk_size,
+            local_window,
+            use_wrap_triton=False,
         )
         ctx.save_for_backward(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, output, lse, route_output, route_lse,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            route_output,
+            route_lse,
         )
-        ctx.chunk_size=int(chunk_size); ctx.local_window=int(local_window)
-        ctx.backward_mode=int(backward_mode); ctx.source_block_size=int(source_block_size)
+        ctx.chunk_size = int(chunk_size)
+        ctx.local_window = int(local_window)
+        ctx.backward_mode = int(backward_mode)
+        ctx.source_block_size = int(source_block_size)
         return output, lse, route_output, route_lse
 
     @staticmethod
     def backward(ctx, grad_output, grad_lse, grad_route_output, grad_route_lse):
         (
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, output, lse, route_output, route_lse,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            route_output,
+            route_lse,
         ) = ctx.saved_tensors
         grads = _prepare_direct_global_gradients(
-            output, lse, route_output, route_lse,
-            grad_output, grad_lse, grad_route_output, grad_route_lse,
+            output,
+            lse,
+            route_output,
+            route_lse,
+            grad_output,
+            grad_lse,
+            grad_route_output,
+            grad_route_lse,
             has_evidence=True,
         )
         result = _direct_global_backward_impl(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, output, lse, route_output, route_lse, *grads,
-            ctx.chunk_size, ctx.local_window, ctx.backward_mode,
-            ctx.source_block_size, use_wrap_triton=False,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            route_output,
+            route_lse,
+            *grads,
+            ctx.chunk_size,
+            ctx.local_window,
+            ctx.backward_mode,
+            ctx.source_block_size,
+            use_wrap_triton=False,
         )
         return (*result, None, None, None, None, None, None)
 
 
 class _LegacyDirectGlobalHISAAggregateFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, query, global_key, global_value, route, chunks, valid_lengths,
-                chunk_size, local_window, backward_mode, source_block_size):
+    def forward(
+        ctx,
+        query,
+        global_key,
+        global_value,
+        route,
+        chunks,
+        valid_lengths,
+        chunk_size,
+        local_window,
+        backward_mode,
+        source_block_size,
+    ):
         output, lse, _, _ = _direct_global_forward_impl(
-            query, global_key, global_value, None, route, chunks, valid_lengths,
-            chunk_size, local_window, use_wrap_triton=False,
+            query,
+            global_key,
+            global_value,
+            None,
+            route,
+            chunks,
+            valid_lengths,
+            chunk_size,
+            local_window,
+            use_wrap_triton=False,
         )
         ctx.save_for_backward(
             query, global_key, global_value, route, chunks, valid_lengths, output, lse
         )
-        ctx.chunk_size=int(chunk_size); ctx.local_window=int(local_window)
-        ctx.backward_mode=int(backward_mode); ctx.source_block_size=int(source_block_size)
+        ctx.chunk_size = int(chunk_size)
+        ctx.local_window = int(local_window)
+        ctx.backward_mode = int(backward_mode)
+        ctx.source_block_size = int(source_block_size)
         return output, lse
 
     @staticmethod
     def backward(ctx, grad_output, grad_lse):
-        query, global_key, global_value, route, chunks, valid_lengths, output, lse = ctx.saved_tensors
+        query, global_key, global_value, route, chunks, valid_lengths, output, lse = (
+            ctx.saved_tensors
+        )
         dummy_output = torch.empty(1, device=query.device, dtype=query.dtype)
         dummy_lse = torch.empty(1, device=query.device, dtype=torch.float32)
         grads = _prepare_direct_global_gradients(
-            output, lse, dummy_output, dummy_lse,
-            grad_output, grad_lse, None, None, has_evidence=False,
+            output,
+            lse,
+            dummy_output,
+            dummy_lse,
+            grad_output,
+            grad_lse,
+            None,
+            None,
+            has_evidence=False,
         )
         result = _direct_global_backward_impl(
-            query, global_key, global_value, None, route, chunks, valid_lengths,
-            output, lse, dummy_output, dummy_lse, *grads,
-            ctx.chunk_size, ctx.local_window, ctx.backward_mode,
-            ctx.source_block_size, use_wrap_triton=False,
+            query,
+            global_key,
+            global_value,
+            None,
+            route,
+            chunks,
+            valid_lengths,
+            output,
+            lse,
+            dummy_output,
+            dummy_lse,
+            *grads,
+            ctx.chunk_size,
+            ctx.local_window,
+            ctx.backward_mode,
+            ctx.source_block_size,
+            use_wrap_triton=False,
         )
-        return result[0], result[1], result[2], result[4], None, None, None, None, None, None
+        return (
+            result[0],
+            result[1],
+            result[2],
+            result[4],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def _direct_global_hisa_triton_apply(
@@ -5038,40 +6505,85 @@ def _direct_global_hisa_triton_apply(
     if not query.is_cuda or not _TRITON_AVAILABLE:
         metadata = HISAMetadata(
             top_chunk_idx=chunks,
-            tile_starts=torch.arange(query.shape[2], device=query.device, dtype=torch.int32),
-            valid_lengths=valid_lengths, chunk_size=int(chunk_size), selector_tile_size=1,
+            tile_starts=torch.arange(
+                query.shape[2], device=query.device, dtype=torch.int32
+            ),
+            valid_lengths=valid_lengths,
+            chunk_size=int(chunk_size),
+            selector_tile_size=1,
         )
         if projected_value is None:
             return _eager_global_lane(
-                query, global_key, global_value, route, metadata,
+                query,
+                global_key,
+                global_value,
+                route,
+                metadata,
                 local_window=int(local_window),
             )
         return _direct_global_hisa_reference(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, int(chunk_size), int(local_window),
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            int(chunk_size),
+            int(local_window),
         )
     backward_mode = _backward_impl_code(backward_impl)
     if projected_value is None:
         if _TRITON_LIBRARY_API_AVAILABLE:
             return _direct_global_hisa_aggregate_op(
-                query, global_key, global_value, route, chunks, valid_lengths,
-                int(chunk_size), int(local_window), backward_mode,
+                query,
+                global_key,
+                global_value,
+                route,
+                chunks,
+                valid_lengths,
+                int(chunk_size),
+                int(local_window),
+                backward_mode,
                 int(source_block_size),
             )
         return _LegacyDirectGlobalHISAAggregateFn.apply(
-            query, global_key, global_value, route, chunks, valid_lengths,
-            int(chunk_size), int(local_window), backward_mode,
+            query,
+            global_key,
+            global_value,
+            route,
+            chunks,
+            valid_lengths,
+            int(chunk_size),
+            int(local_window),
+            backward_mode,
             int(source_block_size),
         )
     if _TRITON_LIBRARY_API_AVAILABLE:
         return _direct_global_hisa_evidence_op(
-            query, global_key, global_value, projected_value, route, chunks,
-            valid_lengths, int(chunk_size), int(local_window), backward_mode,
+            query,
+            global_key,
+            global_value,
+            projected_value,
+            route,
+            chunks,
+            valid_lengths,
+            int(chunk_size),
+            int(local_window),
+            backward_mode,
             int(source_block_size),
         )
     return _LegacyDirectGlobalHISAEvidenceFn.apply(
-        query, global_key, global_value, projected_value, route, chunks,
-        valid_lengths, int(chunk_size), int(local_window), backward_mode,
+        query,
+        global_key,
+        global_value,
+        projected_value,
+        route,
+        chunks,
+        valid_lengths,
+        int(chunk_size),
+        int(local_window),
+        backward_mode,
         int(source_block_size),
     )
 
@@ -5096,30 +6608,47 @@ def benchmark_direct_global_backward_variants(
         raise RuntimeError("HISA backward benchmarking requires CUDA")
     timings: dict[str, float] = {}
     for name in ("source_block_stable", "source_block_counting", "atomic"):
+
         def run() -> None:
-            q=query.detach().requires_grad_(True)
-            k=global_key.detach().requires_grad_(True)
-            v=global_value.detach().requires_grad_(True)
-            r=route.detach().requires_grad_(True)
-            p=None if projected_value is None else projected_value.detach().requires_grad_(True)
-            result=_direct_global_hisa_triton_apply(
-                q,k,v,r,chunks,valid_lengths,chunk_size,local_window,
-                projected_value=p,backward_impl=name,
+            q = query.detach().requires_grad_(True)
+            k = global_key.detach().requires_grad_(True)
+            v = global_value.detach().requires_grad_(True)
+            r = route.detach().requires_grad_(True)
+            p = (
+                None
+                if projected_value is None
+                else projected_value.detach().requires_grad_(True)
+            )
+            result = _direct_global_hisa_triton_apply(
+                q,
+                k,
+                v,
+                r,
+                chunks,
+                valid_lengths,
+                chunk_size,
+                local_window,
+                projected_value=p,
+                backward_impl=name,
                 source_block_size=source_block_size,
             )
-            outputs=result if isinstance(result, tuple) else (result,)
-            loss=sum(t.float().nan_to_num().square().mean() for t in outputs)
+            outputs = result if isinstance(result, tuple) else (result,)
+            loss = sum(t.float().nan_to_num().square().mean() for t in outputs)
             loss.backward()
+
         for _ in range(int(warmup)):
             run()
         torch.cuda.synchronize()
-        start_event=torch.cuda.Event(enable_timing=True)
-        end_event=torch.cuda.Event(enable_timing=True)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
         for _ in range(int(repeats)):
             run()
-        end_event.record(); torch.cuda.synchronize()
-        timings[name]=float(start_event.elapsed_time(end_event))/max(1,int(repeats))
+        end_event.record()
+        torch.cuda.synchronize()
+        timings[name] = float(start_event.elapsed_time(end_event)) / max(
+            1, int(repeats)
+        )
     return timings
 
 
@@ -5213,23 +6742,35 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise ValueError("top_k_chunks must be positive")
         resolved_chunk_size = 64 if chunk_size is None else int(chunk_size)
         resolved_local_window = 64 if local_window is None else int(local_window)
-        resolved_selector_tile = 16 if selector_tile_size is None else int(selector_tile_size)
+        resolved_selector_tile = (
+            16 if selector_tile_size is None else int(selector_tile_size)
+        )
         if min(resolved_chunk_size, resolved_local_window, resolved_selector_tile) < 1:
-            raise ValueError("chunk_size, local_window, and selector_tile_size must be positive")
-        resolved_top_m = resolved_chunk_size if hisa_top_m_tokens is None else int(hisa_top_m_tokens)
+            raise ValueError(
+                "chunk_size, local_window, and selector_tile_size must be positive"
+            )
+        resolved_top_m = (
+            resolved_chunk_size if hisa_top_m_tokens is None else int(hisa_top_m_tokens)
+        )
         if resolved_top_m != resolved_chunk_size:
-            raise ValueError("complete-page HISA requires hisa_top_m_tokens == chunk_size")
+            raise ValueError(
+                "complete-page HISA requires hisa_top_m_tokens == chunk_size"
+            )
         if num_chunks is not None and int(num_chunks) < 1:
             raise ValueError("num_chunks must be positive when supplied")
         if num_chunks is not None and max_seq_len is not None:
             expected = math.ceil(int(max_seq_len) / resolved_chunk_size)
             if int(num_chunks) != expected:
-                raise ValueError("num_chunks compatibility hint disagrees with max_seq_len/chunk_size")
+                raise ValueError(
+                    "num_chunks compatibility hint disagrees with max_seq_len/chunk_size"
+                )
         if not math.isfinite(temperature) or float(temperature) <= 0:
             raise ValueError("temperature must be finite and positive")
         if not math.isfinite(route_prior_scale) or float(route_prior_scale) <= 0:
             raise ValueError("route_prior_scale must be finite and positive")
-        if not math.isfinite(route_prior_max_scale) or float(route_prior_max_scale) <= float(route_prior_scale):
+        if not math.isfinite(route_prior_max_scale) or float(
+            route_prior_max_scale
+        ) <= float(route_prior_scale):
             raise ValueError("route_prior_max_scale must exceed route_prior_scale")
         for name, value in {
             "global_lane_bias_limit": global_lane_bias_limit,
@@ -5241,28 +6782,47 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         }.items():
             if not math.isfinite(value) or float(value) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        if not 0.0 <= float(coherence_score_initial_weight) <= float(coherence_score_max_weight):
+        if (
+            not 0.0
+            <= float(coherence_score_initial_weight)
+            <= float(coherence_score_max_weight)
+        ):
             raise ValueError("coherence_score_initial_weight must be in [0,max_weight]")
-        if not 0.0 <= float(parent_coherence_score_initial_weight) <= float(
-            parent_coherence_score_max_weight
+        if (
+            not 0.0
+            <= float(parent_coherence_score_initial_weight)
+            <= float(parent_coherence_score_max_weight)
         ):
             raise ValueError(
                 "parent_coherence_score_initial_weight must be in [0,max_weight]"
             )
-        if not math.isfinite(float(coherence_log_floor)) or float(coherence_log_floor) >= 0.0:
+        if (
+            not math.isfinite(float(coherence_log_floor))
+            or float(coherence_log_floor) >= 0.0
+        ):
             raise ValueError("coherence_log_floor must be finite and negative")
         if representative_mode not in {
-            "mean_max_blend", "mean_max_blend_ablation", "multi_address", "multi_landmark"
+            "mean_max_blend",
+            "mean_max_blend_ablation",
+            "multi_address",
+            "multi_landmark",
         }:
             raise ValueError("unsupported representative_mode")
         if not 0.0 <= float(representative_blend_alpha) <= 1.0:
             raise ValueError("representative_blend_alpha must be in [0,1]")
         if representative_score_reduction not in {"max", "logsumexp"}:
             raise ValueError("representative_score_reduction must be max or logsumexp")
-        if not math.isfinite(representative_lse_temperature) or float(representative_lse_temperature) <= 0:
-            raise ValueError("representative_lse_temperature must be finite and positive")
+        if (
+            not math.isfinite(representative_lse_temperature)
+            or float(representative_lse_temperature) <= 0
+        ):
+            raise ValueError(
+                "representative_lse_temperature must be finite and positive"
+            )
         if int(routing_candidate_multiplier) < 1 or int(routing_stream_block_size) < 1:
-            raise ValueError("routing candidate multiplier and stream block size must be positive")
+            raise ValueError(
+                "routing candidate multiplier and stream block size must be positive"
+            )
         if int(hierarchy_group_size) < 1:
             raise ValueError("hierarchy_group_size must be positive")
         if parent_top_k is not None and int(parent_top_k) < 1:
@@ -5290,23 +6850,31 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             if value is not None and not isinstance(value, bool):
                 raise TypeError(f"{name} must be bool or None")
         if not boundary_bridge:
-            raise ValueError("boundary_bridge must remain enabled for complete causal coverage")
+            raise ValueError(
+                "boundary_bridge must remain enabled for complete causal coverage"
+            )
         if exploration_final_probability is None:
             exploration_final_probability = exploration_probability
-        if not 0.0 <= float(exploration_probability) <= 1.0 or not 0.0 <= float(exploration_final_probability) <= 1.0:
+        if (
+            not 0.0 <= float(exploration_probability) <= 1.0
+            or not 0.0 <= float(exploration_final_probability) <= 1.0
+        ):
             raise ValueError("exploration probabilities must be in [0,1]")
         if int(exploration_anneal_steps) < 0:
             raise ValueError("exploration_anneal_steps must be non-negative")
         if exploration_policy not in {
-            "candidate_tail", "tail_softmax", "uniform_unseen_ablation"
+            "candidate_tail",
+            "tail_softmax",
+            "uniform_unseen_ablation",
         }:
             raise ValueError("unsupported exploration_policy")
-        if not math.isfinite(exploration_temperature) or float(exploration_temperature) <= 0:
+        if (
+            not math.isfinite(exploration_temperature)
+            or float(exploration_temperature) <= 0
+        ):
             raise ValueError("exploration_temperature must be finite and positive")
         if not 0.0 <= float(exploration_uniform_global_fraction) <= 1.0:
-            raise ValueError(
-                "exploration_uniform_global_fraction must be in [0,1]"
-            )
+            raise ValueError("exploration_uniform_global_fraction must be in [0,1]")
         for name, value in {
             "route_aux_weight": route_aux_weight,
             "route_aux_coverage_weight": route_aux_coverage_weight,
@@ -5327,9 +6895,15 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 "route_aux_samples must be positive when route or global-mass "
                 "teacher auxiliary weights are enabled"
             )
-        if not math.isfinite(route_aux_temperature) or float(route_aux_temperature) <= 0:
+        if (
+            not math.isfinite(route_aux_temperature)
+            or float(route_aux_temperature) <= 0
+        ):
             raise ValueError("route_aux_temperature must be finite and positive")
-        if not math.isfinite(route_aux_oracle_temperature) or float(route_aux_oracle_temperature) <= 0:
+        if (
+            not math.isfinite(route_aux_oracle_temperature)
+            or float(route_aux_oracle_temperature) <= 0
+        ):
             raise ValueError("route_aux_oracle_temperature must be finite and positive")
         if route_aux_teacher not in {"dense_attention", "cosine_ablation"}:
             raise ValueError("unsupported route_aux_teacher")
@@ -5352,11 +6926,17 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise ValueError("local_block_size must be a power of two >=16")
         if int(local_mask_cache_size) < 1:
             raise ValueError("local_mask_cache_size must be positive")
-        if int(source_block_size) < 1 or int(source_block_size) > 32 or not _is_power_of_two(int(source_block_size)):
+        if (
+            int(source_block_size) < 1
+            or int(source_block_size) > 32
+            or not _is_power_of_two(int(source_block_size))
+        ):
             raise ValueError("source_block_size must be a power of two in [1,32]")
 
         self.D, self.H, self.num_heads, self.hd = D, H, H, hd
-        self.num_chunks_compatibility_hint = None if num_chunks is None else int(num_chunks)
+        self.num_chunks_compatibility_hint = (
+            None if num_chunks is None else int(num_chunks)
+        )
         self.chunk_size = resolved_chunk_size
         self.top_k_chunks = int(top_k_chunks)
         self.hisa_top_m_tokens = resolved_top_m
@@ -5372,8 +6952,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.chunk_selection_scope = (chunk_selection_scope or "token").lower()
         if self.token_selection_mode != "auto" or self.chunk_selection_scope != "token":
             raise ValueError("legacy selection controls only accept auto/token")
-        self.token_routing_pack_size = 4 if token_routing_pack_size is None else int(token_routing_pack_size)
-        if self.token_routing_pack_size < 1 or self.token_routing_pack_size > 16 or not _is_power_of_two(self.token_routing_pack_size):
+        self.token_routing_pack_size = (
+            4 if token_routing_pack_size is None else int(token_routing_pack_size)
+        )
+        if (
+            self.token_routing_pack_size < 1
+            or self.token_routing_pack_size > 16
+            or not _is_power_of_two(self.token_routing_pack_size)
+        ):
             raise ValueError("token_routing_pack_size must be a power of two in [1,16]")
 
         self.representative_mode = representative_mode
@@ -5395,7 +6981,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         default_parent_top_k = max(
             1, math.ceil(self.routing_candidate_count / self.hierarchy_group_size) + 1
         )
-        self.parent_top_k = default_parent_top_k if parent_top_k is None else int(parent_top_k)
+        self.parent_top_k = (
+            default_parent_top_k if parent_top_k is None else int(parent_top_k)
+        )
         self.exact_page_rerank = bool(exact_page_rerank)
         self.representative_prior_after_exact_rerank = bool(
             representative_prior_after_exact_rerank
@@ -5422,9 +7010,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.route_aux_teacher_from_base_global_key = (
             resolved_route_policy.route_aux_teacher_key == "base_global_k"
         )
-        self.rerank_selected_priors_with_post_packet_representatives = (
-            resolved_route_policy.rerank_selected_priors_with_post_packet_representatives
-        )
+        self.rerank_selected_priors_with_post_packet_representatives = resolved_route_policy.rerank_selected_priors_with_post_packet_representatives
 
         self.exploration_probability = float(exploration_probability)
         self.exploration_policy = exploration_policy
@@ -5441,9 +7027,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.route_aux_teacher = route_aux_teacher
         self.route_aux_coverage_weight = float(route_aux_coverage_weight)
         self.parent_route_aux_weight = float(parent_route_aux_weight)
-        self.lane_teacher_count_normalization = bool(
-            lane_teacher_count_normalization
-        )
+        self.lane_teacher_count_normalization = bool(lane_teacher_count_normalization)
         self.global_mass_aux_weight = float(global_mass_aux_weight)
         self.binding_null_aux_weight = float(binding_null_aux_weight)
         self.require_auxiliary_return = bool(require_auxiliary_return)
@@ -5469,24 +7053,34 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         self.binding_rank = int(binding_rank)
         self.count_correction_scale_limit = float(count_correction_scale_limit)
         self.register_buffer(
-            "binding_state_version", torch.tensor(4, dtype=torch.int32),
+            "binding_state_version",
+            torch.tensor(4, dtype=torch.int32),
             persistent=bool(self.binding_rank),
         )
         self.npci_theta_max = float(npci_theta_max)
-        self.route_source = "base_global_k" if self.route_from_base_global_key else "rotated_global_k"
+        self.route_source = (
+            "base_global_k" if self.route_from_base_global_key else "rotated_global_k"
+        )
         self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
         self.local_backend = local_backend
         self.boundary_bridge = boundary_bridge
         self.local_block_size = int(local_block_size)
         self.local_mask_cache_size = int(local_mask_cache_size)
-        self._local_block_mask_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
-        self._local_count_cache: OrderedDict[tuple[object, ...], torch.Tensor] = OrderedDict()
+        self._local_block_mask_cache: OrderedDict[tuple[object, ...], object] = (
+            OrderedDict()
+        )
+        self._local_count_cache: OrderedDict[tuple[object, ...], torch.Tensor] = (
+            OrderedDict()
+        )
 
         self.triton_block_q = 16 if triton_block_q is None else int(triton_block_q)
         self.triton_query_pack_specialization = triton_query_pack_specialization
         if self.triton_block_q < 1 or not _is_power_of_two(self.triton_block_q):
             raise ValueError("compatibility BLOCK_Q must be a positive power of two")
-        if self.triton_query_pack_specialization not in {None, TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION}:
+        if self.triton_query_pack_specialization not in {
+            None,
+            TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
+        }:
             raise ValueError("unsupported compatibility query-pack specialization")
         self.backward_impl = (backward_impl or "source_block_stable").lower()
         self.backward_impl_code = _backward_impl_code(self.backward_impl)
@@ -5502,7 +7096,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if not isinstance(collect_routing_diagnostics, bool):
             raise TypeError("collect_routing_diagnostics must be bool")
         self.collect_routing_diagnostics = collect_routing_diagnostics
-        self.diagnostic_max_queries = 8 if diagnostic_max_queries is None else int(diagnostic_max_queries)
+        self.diagnostic_max_queries = (
+            8 if diagnostic_max_queries is None else int(diagnostic_max_queries)
+        )
         if self.diagnostic_max_queries < 1:
             raise ValueError("diagnostic_max_queries must be positive")
 
@@ -5536,14 +7132,21 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
 
         initial_route_fraction = float(route_prior_scale) / float(route_prior_max_scale)
         self.route_prior_raw = nn.Parameter(
-            torch.full((H,), math.log(initial_route_fraction / (1.0 - initial_route_fraction)))
+            torch.full(
+                (H,), math.log(initial_route_fraction / (1.0 - initial_route_fraction))
+            )
         )
         mix_shift = _representative_mix_shift(H, self.representative_blend_alpha)
-        self.representative_mix_raw = nn.Parameter(torch.linspace(-2.0, 2.0, H) + mix_shift)
+        self.representative_mix_raw = nn.Parameter(
+            torch.linspace(-2.0, 2.0, H) + mix_shift
+        )
         if self.representative_mode != "mean_max_blend":
             self.representative_mix_raw.requires_grad_(False)
         coherence_fraction = min(
-            max(float(coherence_score_initial_weight) / self.coherence_score_max_weight, 1e-4),
+            max(
+                float(coherence_score_initial_weight) / self.coherence_score_max_weight,
+                1e-4,
+            ),
             1.0 - 1e-4,
         )
         self.representative_coherence_raw = nn.Parameter(
@@ -5569,7 +7172,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             self.binding_head_rank = max(1, math.ceil(self.binding_rank / H))
             self.binding_feature_dim = H * self.binding_head_rank
             self.bind_query = nn.Linear(D, self.binding_feature_dim, bias=False)
-            self.bind_evidence_weight = nn.Parameter(torch.empty(H, hd, self.binding_head_rank))
+            self.bind_evidence_weight = nn.Parameter(
+                torch.empty(H, hd, self.binding_head_rank)
+            )
             self.bind_route_identity = nn.Linear(4, self.binding_head_rank, bias=True)
             self.bind_route_score = nn.Linear(self.binding_head_rank, 1, bias=False)
             self.bind_null = nn.Parameter(torch.empty(H, self.binding_head_rank))
@@ -5645,8 +7250,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         "expected 4 because captured-mass supervision changes semantics"
                     )
         super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs,
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
 
     def load_legacy_hisa_backbone_(
@@ -5767,9 +7377,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         """Versioned active semantics only; compatibility diagnostics are excluded."""
         config: dict[str, object] = {
             "format": "hisa-v19-optimized-quality-v4",
-            "model_dim": self.D, "heads": self.H, "head_dim": self.hd,
-            "chunk_size": self.chunk_size, "top_k_chunks": self.top_k_chunks,
-            "local_window": self.local_window, "boundary_bridge": self.boundary_bridge,
+            "model_dim": self.D,
+            "heads": self.H,
+            "head_dim": self.hd,
+            "chunk_size": self.chunk_size,
+            "top_k_chunks": self.top_k_chunks,
+            "local_window": self.local_window,
+            "boundary_bridge": self.boundary_bridge,
             "route_source_policy": self.route_source_policy,
             "route_source_contract": self.route_source_contract,
             "routing_key_source": self.route_source,
@@ -5799,7 +7413,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "global_key_calibration": self.global_key_calibration,
             "router_adapter_rank": self.router_adapter_rank,
             "route_aux_detach_core_qk": self.route_aux_detach_core_qk,
-            "binding_rank": self.binding_rank, "binding_state_version": 4,
+            "binding_rank": self.binding_rank,
+            "binding_state_version": 4,
             "npci_theta_max": self.npci_theta_max,
             "rerank_selected_priors_with_post_packet_representatives": (
                 self.rerank_selected_priors_with_post_packet_representatives
@@ -5821,9 +7436,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 self.exploration_uniform_global_fraction
             ),
         }
-        if self.representative_mode in {
-            "mean_max_blend", "mean_max_blend_ablation"
-        }:
+        if self.representative_mode in {"mean_max_blend", "mean_max_blend_ablation"}:
             config["representative_blend_alpha_initial_mean"] = (
                 self.representative_blend_alpha
             )
@@ -5839,34 +7452,36 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
 
     def semantic_config(self) -> dict[str, object]:
         config = dict(self._quality_candidate_config())
-        config.update({
-            "implementation": "hisa-v19-streaming-hierarchical-captured-mass-binding-v4",
-            "selected_token_policy": "enumerate_complete_selected_chunks",
-            "semantic_selection_scope": "per_token",
-            "hard_selector": "detached_streaming_parent_child_top_m_exact_page_lse_top_k",
-            "selector_autograd": "selected_K_plus_sampled_aux_rows_only",
-            "representative_coherence": (
-                "bounded_mean-landmark child and parent penalties"
-            ),
-            "global_attention_key_source": "post_packet_rotated_global_k",
-            "route_source_contract": self.route_source_contract,
-            "route_auxiliary_target": (
-                "policy conditional chunk mass plus executed selected captured mass"
-            ),
-            "route_auxiliary_transport": "explicit_forward_return_required",
-            "binding_source": "per_head_per_route_normalized_low_rank_evidence",
-            "binding_aggregation": (
-                "captured-mass-grounded route/null softmax with separate payload"
-            ),
-            "binding_mass": "exact_merged_attention_log_mass",
-            "binding_route_identity_features": "absolute_similarity,relative_centered_prior,relative_age,relative_position",
-            "binding_abstention_features": "absolute_max,absolute_mean,route_entropy",
-            "lane_merge": "exact_lse",
-            "selected_attention_arithmetic": "direct_complete_page_scan",
-            "incremental_cache": "exact_completed_page_reference_api_O(N)_KV",
-            "quality_candidate_fingerprint_sha256": self._quality_candidate_fingerprint(),
-            "max_seq_len": self.max_seq_len,
-        })
+        config.update(
+            {
+                "implementation": "hisa-v19-streaming-hierarchical-captured-mass-binding-v4",
+                "selected_token_policy": "enumerate_complete_selected_chunks",
+                "semantic_selection_scope": "per_token",
+                "hard_selector": "detached_streaming_parent_child_top_m_exact_page_lse_top_k",
+                "selector_autograd": "selected_K_plus_sampled_aux_rows_only",
+                "representative_coherence": (
+                    "bounded_mean-landmark child and parent penalties"
+                ),
+                "global_attention_key_source": "post_packet_rotated_global_k",
+                "route_source_contract": self.route_source_contract,
+                "route_auxiliary_target": (
+                    "policy conditional chunk mass plus executed selected captured mass"
+                ),
+                "route_auxiliary_transport": "explicit_forward_return_required",
+                "binding_source": "per_head_per_route_normalized_low_rank_evidence",
+                "binding_aggregation": (
+                    "captured-mass-grounded route/null softmax with separate payload"
+                ),
+                "binding_mass": "exact_merged_attention_log_mass",
+                "binding_route_identity_features": "absolute_similarity,relative_centered_prior,relative_age,relative_position",
+                "binding_abstention_features": "absolute_max,absolute_mean,route_entropy",
+                "lane_merge": "exact_lse",
+                "selected_attention_arithmetic": "direct_complete_page_scan",
+                "incremental_cache": "exact_completed_page_reference_api_O(N)_KV",
+                "quality_candidate_fingerprint_sha256": self._quality_candidate_fingerprint(),
+                "max_seq_len": self.max_seq_len,
+            }
+        )
         return config
 
     def execution_config(self) -> dict[str, object]:
@@ -5885,7 +7500,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             "local_mask_cache_size": self.local_mask_cache_size,
             "backward_impl": self.resolved_backward_impl,
             "source_block_size": self.source_block_size,
-            "direct_kernel_schedule": "autotuned_candidate" if _DIRECT_GLOBAL_AUTOTUNE_ENABLED else "static_default",
+            "direct_kernel_schedule": "autotuned_candidate"
+            if _DIRECT_GLOBAL_AUTOTUNE_ENABLED
+            else "static_default",
             "aggregate_only_triton_specialization": True,
             "selected_address_score_backend": (
                 "registered_triton_autograd"
@@ -5893,7 +7510,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 else "legacy_triton_autograd"
             ),
             "factorized_page_route_softmax": True,
-            "reverse_edge_options": ("stable_sort", "bounded_id_counting", "atomic_query_owned"),
+            "reverse_edge_options": (
+                "stable_sort",
+                "bounded_id_counting",
+                "atomic_query_owned",
+            ),
             "collect_routing_diagnostics": self.collect_routing_diagnostics,
             "diagnostic_max_queries": self.diagnostic_max_queries,
             "selector_workspace": "O(B*H*N*M)+stream_block; no differentiable B*H*N*C surface",
@@ -5911,13 +7532,17 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             },
         }
 
-
     def _ensure_local_block_mask(self, device: torch.device, seq_len: int):
         if not _FLEX_ATTENTION_AVAILABLE:
             raise RuntimeError("FlexAttention is unavailable in this PyTorch build")
         key = (
-            device.type, device.index, int(seq_len), self.local_window,
-            self.chunk_size, self.boundary_bridge, self.local_block_size,
+            device.type,
+            device.index,
+            int(seq_len),
+            self.local_window,
+            self.chunk_size,
+            self.boundary_bridge,
+            self.local_block_size,
         )
         cached = self._local_block_mask_cache.get(key)
         if cached is not None:
@@ -5932,9 +7557,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             )
 
         mask = create_block_mask(
-            local_mask, B=None, H=None,
-            Q_LEN=max(1, int(seq_len) - 1), KV_LEN=int(seq_len),
-            device=device, BLOCK_SIZE=self.local_block_size,
+            local_mask,
+            B=None,
+            H=None,
+            Q_LEN=max(1, int(seq_len) - 1),
+            KV_LEN=int(seq_len),
+            device=device,
+            BLOCK_SIZE=self.local_block_size,
         )
         self._local_block_mask_cache[key] = mask
         self._local_block_mask_cache.move_to_end(key)
@@ -5943,7 +7572,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         return mask
 
     def _local_count_geometry(self, device: torch.device, seq_len: int) -> torch.Tensor:
-        key = (device.type, device.index, int(seq_len), self.local_window, self.chunk_size)
+        key = (
+            device.type,
+            device.index,
+            int(seq_len),
+            self.local_window,
+            self.chunk_size,
+        )
         if not torch.compiler.is_compiling():
             cached = self._local_count_cache.get(key)
             if cached is not None:
@@ -5996,9 +7631,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 block_mask,
                 self.local_block_size,
             )
-            output = torch.cat(
-                (torch.zeros_like(query[:, :, :1]), output_tail), dim=2
-            )
+            output = torch.cat((torch.zeros_like(query[:, :, :1]), output_tail), dim=2)
             lse = torch.cat(
                 (
                     torch.full_like(lse_tail[:, :, :1], float("-inf")),
@@ -6011,12 +7644,13 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             output = torch.where(
                 valid[:, None, :, None], output, torch.zeros_like(output)
             )
-            lse = torch.where(
-                valid[:, None], lse, torch.full_like(lse, float("-inf"))
-            )
+            lse = torch.where(valid[:, None], lse, torch.full_like(lse, float("-inf")))
             return output, lse
         return _eager_local_lane(
-            query, local_key, local_value, valid_lengths,
+            query,
+            local_key,
+            local_value,
+            valid_lengths,
             local_window=self.local_window,
             chunk_size=self.chunk_size,
             selector_tile_size=self.selector_tile_size,
@@ -6061,10 +7695,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if not self.binding_rank:
             return
         if (
-            self.bind_query is None or self.bind_route_identity is None
-            or self.bind_route_score is None or self.bind_abstention is None
-            or self.bind_output is None or self.bind_evidence_weight is None
-            or self.bind_null is None or self.bind_null_prior is None
+            self.bind_query is None
+            or self.bind_route_identity is None
+            or self.bind_route_score is None
+            or self.bind_abstention is None
+            or self.bind_output is None
+            or self.bind_evidence_weight is None
+            or self.bind_null is None
+            or self.bind_null_prior is None
             or self.binding_gain_raw is None
         ):
             raise RuntimeError("binding reset modules are incomplete")
@@ -6099,10 +7737,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mass-grounded slot binding with separate scoring and payload paths."""
         if (
-            self.bind_query is None or self.bind_route_identity is None
-            or self.bind_route_score is None or self.bind_null is None
-            or self.bind_null_prior is None or self.bind_abstention is None
-            or self.bind_output is None or self.binding_gain_raw is None
+            self.bind_query is None
+            or self.bind_route_identity is None
+            or self.bind_route_score is None
+            or self.bind_null is None
+            or self.bind_null_prior is None
+            or self.bind_abstention is None
+            or self.bind_output is None
+            or self.binding_gain_raw is None
         ):
             raise RuntimeError("binding correction modules are incomplete")
         batch_size, seq_len, _ = x.shape
@@ -6119,31 +7761,29 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             raise ValueError("absolute route summary must have shape [B,H,N,3]")
 
         query_features = torch.tanh(
-            self.bind_query(x).reshape(
-                batch_size, seq_len, self.H, self.binding_head_rank
-            ).permute(0, 2, 1, 3)
+            self.bind_query(x)
+            .reshape(batch_size, seq_len, self.H, self.binding_head_rank)
+            .permute(0, 2, 1, 3)
         )
         evidence = route_evidence_features.to(query_features.dtype)
         identity = self.bind_route_identity(
             route_identity_features.to(query_features.dtype)
         )
-        score_content = F.layer_norm(
-            evidence + identity, (self.binding_head_rank,)
-        )
+        score_content = F.layer_norm(evidence + identity, (self.binding_head_rank,))
         score_interaction = (
-            score_content
-            + query_features[..., None, :] * score_content
-            + identity
+            score_content + query_features[..., None, :] * score_content + identity
         )
-        learned_route_adjustment = self.bind_route_score(
-            score_interaction
-        ).squeeze(-1).float()
+        learned_route_adjustment = (
+            self.bind_route_score(score_interaction).squeeze(-1).float()
+        )
         valid_route = torch.isfinite(route_log_mass)
         route_logits = route_log_mass.float() + learned_route_adjustment
         route_logits = route_logits.masked_fill(~valid_route, float("-inf"))
 
         finite_log_mass = torch.where(
-            valid_route, route_log_mass.float(), torch.full_like(route_log_mass.float(), float("-inf"))
+            valid_route,
+            route_log_mass.float(),
+            torch.full_like(route_log_mass.float(), float("-inf")),
         )
         route_mass_sum = torch.exp(finite_log_mass).sum(-1).clamp(0.0, 1.0)
         base_null_log_mass = torch.log((1.0 - route_mass_sum).clamp_min(1e-30))
@@ -6153,9 +7793,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         learned_null_adjustment = (
             self.bind_route_score(null_interaction).squeeze(-1).float()
             + self.bind_null_prior.reshape(1, self.H, 1).float()
-            + self.bind_abstention(
-                absolute_route_summary.to(query_features.dtype)
-            ).squeeze(-1).float()
+            + self.bind_abstention(absolute_route_summary.to(query_features.dtype))
+            .squeeze(-1)
+            .float()
         )
         null_logits = base_null_log_mass + learned_null_adjustment
         all_logits = torch.cat((route_logits, null_logits[..., None]), dim=-1)
@@ -6165,9 +7805,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         null_log_odds = null_logits - torch.logsumexp(route_logits, dim=-1)
 
         payload = evidence * (1.0 + 0.1 * query_features[..., None, :]) + identity
-        per_head = (
-            route_weights[..., None].to(payload.dtype) * payload
-        ).sum(dim=3)
+        per_head = (route_weights[..., None].to(payload.dtype) * payload).sum(dim=3)
         combined = per_head.permute(0, 2, 1, 3).reshape(
             batch_size, seq_len, self.binding_feature_dim
         )
@@ -6216,20 +7854,27 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 f"input sequence length {seq_len} exceeds configured HISA bound {self.max_seq_len}"
             )
         lengths = _as_valid_lengths(
-            valid_lengths if valid_lengths is not None
+            valid_lengths
+            if valid_lengths is not None
             else getattr(self, "_causal_control_valid_lengths", None),
-            batch_size=batch_size, seq_len=seq_len, device=x.device,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=x.device,
         )
         use_triton = _resolve_attention_execution(
-            backend=self.backend, is_cuda=x.is_cuda,
+            backend=self.backend,
+            is_cuda=x.is_cuda,
             triton_available=_TRITON_AVAILABLE,
             flex_available=_FLEX_ATTENTION_AVAILABLE,
         )
         if use_triton:
-            _validate_triton_geometry(head_dim=self.hd, tokens_per_chunk=self.chunk_size)
+            _validate_triton_geometry(
+                head_dim=self.hd, tokens_per_chunk=self.chunk_size
+            )
 
         teacher_aux_active = bool(
-            self.training and self.route_aux_samples > 0
+            self.training
+            and self.route_aux_samples > 0
             and (
                 self.route_aux_weight > 0.0
                 or self.global_mass_aux_weight > 0.0
@@ -6282,45 +7927,71 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         local_value = _to_heads(value_flat, batch_size, seq_len, self.H, self.hd)
         global_key, global_value = local_key, local_value
         if self.global_adapter_rank:
-            if any(module is None for module in (
-                self.global_k_down, self.global_k_up,
-                self.global_v_down, self.global_v_up,
-            )):
+            if any(
+                module is None
+                for module in (
+                    self.global_k_down,
+                    self.global_k_up,
+                    self.global_v_down,
+                    self.global_v_up,
+                )
+            ):
                 raise RuntimeError("global adapter modules are incomplete")
             assert self.global_k_down is not None and self.global_k_up is not None
             assert self.global_v_down is not None and self.global_v_up is not None
             global_key = global_key + _to_heads(
                 self.global_k_up(self.global_k_down(x)),
-                batch_size, seq_len, self.H, self.hd,
+                batch_size,
+                seq_len,
+                self.H,
+                self.hd,
             )
             global_value = global_value + _to_heads(
                 self.global_v_up(self.global_v_down(x)),
-                batch_size, seq_len, self.H, self.hd,
+                batch_size,
+                seq_len,
+                self.H,
+                self.hd,
             )
         base_global_key = global_key
         rotation_diagnostics: dict[str, torch.Tensor] = {}
         if kv_inject is not None:
             key_delta, value_delta = kv_inject
-            if key_delta.shape != global_key.shape or value_delta.shape != global_value.shape:
+            if (
+                key_delta.shape != global_key.shape
+                or value_delta.shape != global_value.shape
+            ):
                 raise ValueError("kv_inject must contain [B,H,N,HD] tensors")
             theta_k = self.npci_theta_max * torch.tanh(self.npci_theta_k)
             theta_v = self.npci_theta_max * torch.tanh(self.npci_theta_v)
             if emit_diagnostics:
-                rotation_diagnostics.update(_rotation_diagnostics(
-                    global_key, key_delta, theta_k,
-                    valid_lengths=lengths, label="k",
-                ))
-                rotation_diagnostics.update(_rotation_diagnostics(
-                    global_value, value_delta, theta_v,
-                    valid_lengths=lengths, label="v",
-                ))
+                rotation_diagnostics.update(
+                    _rotation_diagnostics(
+                        global_key,
+                        key_delta,
+                        theta_k,
+                        valid_lengths=lengths,
+                        label="k",
+                    )
+                )
+                rotation_diagnostics.update(
+                    _rotation_diagnostics(
+                        global_value,
+                        value_delta,
+                        theta_v,
+                        valid_lengths=lengths,
+                        label="v",
+                    )
+                )
             global_key = _magnitude_aware_rotate(global_key, key_delta, theta_k)
             global_value = _magnitude_aware_rotate(global_value, value_delta, theta_v)
         if self.global_key_calibration == "rms_match_local":
             global_key = _rms_match_global_key(global_key, local_key, lengths)
 
         route_teacher_key = (
-            base_global_key if self.route_aux_teacher_from_base_global_key else global_key
+            base_global_key
+            if self.route_aux_teacher_from_base_global_key
+            else global_key
         )
         routing_key_core = (
             base_global_key if self.route_from_base_global_key else global_key
@@ -6334,20 +8005,31 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         router_q_delta: torch.Tensor | None = None
         router_k_delta: torch.Tensor | None = None
         if self.router_adapter_rank:
-            if any(module is None for module in (
-                self.router_q_down, self.router_q_up,
-                self.router_k_down, self.router_k_up,
-            )):
+            if any(
+                module is None
+                for module in (
+                    self.router_q_down,
+                    self.router_q_up,
+                    self.router_k_down,
+                    self.router_k_up,
+                )
+            ):
                 raise RuntimeError("router adapter modules are incomplete")
             assert self.router_q_down is not None and self.router_q_up is not None
             assert self.router_k_down is not None and self.router_k_up is not None
             router_q_delta = _to_heads(
                 self.router_q_up(self.router_q_down(x)),
-                batch_size, seq_len, self.H, self.hd,
+                batch_size,
+                seq_len,
+                self.H,
+                self.hd,
             )
             router_k_delta = _to_heads(
                 self.router_k_up(self.router_k_down(x)),
-                batch_size, seq_len, self.H, self.hd,
+                batch_size,
+                seq_len,
+                self.H,
+                self.hd,
             )
             routing_query = routing_query + router_q_delta
             routing_key = routing_key + router_k_delta
@@ -6417,8 +8099,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 coherence_log_floor=self.coherence_log_floor,
             )
             concatenated = torch.cat(
-                (deterministic_candidates.top_chunk_idx,
-                 attention_candidates.top_chunk_idx), dim=-1
+                (
+                    deterministic_candidates.top_chunk_idx,
+                    attention_candidates.top_chunk_idx,
+                ),
+                dim=-1,
             ).to(torch.int64)
             deduplicated, unique = _deduplicate_fixed_candidates(
                 concatenated, entry_count=routing_addresses.values.shape[2]
@@ -6435,9 +8120,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             )
 
         hard_rerank_key = (
-            base_global_key
-            if self.hard_rerank_from_base_global_key
-            else global_key
+            base_global_key if self.hard_rerank_from_base_global_key else global_key
         )
         deterministic_metadata, exact_candidate_lse = _rerank_candidate_metadata(
             query,
@@ -6467,8 +8150,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if not compiling:
             self._last_token_selection_path = (
                 "hierarchical_parent_child_top_m_exact_page_lse_top_k"
-                if self.hierarchical_routing else
-                "streaming_flat_top_m_exact_page_lse_top_k"
+                if self.hierarchical_routing
+                else "streaming_flat_top_m_exact_page_lse_top_k"
             )
 
         prior_addresses = routing_addresses
@@ -6495,16 +8178,21 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         )
         valid_route = torch.isfinite(selected_similarity)
         valid_count = valid_route.sum(-1, keepdim=True).clamp_min(1)
-        selected_mean = torch.where(
-            valid_route, selected_similarity, torch.zeros_like(selected_similarity)
-        ).sum(-1, keepdim=True) / valid_count
+        selected_mean = (
+            torch.where(
+                valid_route, selected_similarity, torch.zeros_like(selected_similarity)
+            ).sum(-1, keepdim=True)
+            / valid_count
+        )
         centered_similarity = torch.where(
-            valid_route, selected_similarity - selected_mean,
+            valid_route,
+            selected_similarity - selected_mean,
             torch.zeros_like(selected_similarity),
         )
         if self.exact_page_rerank and not self.representative_prior_after_exact_rerank:
             route = torch.where(
-                valid_route, torch.zeros_like(centered_similarity),
+                valid_route,
+                torch.zeros_like(centered_similarity),
                 torch.full_like(centered_similarity, float("-inf")),
             )
         else:
@@ -6538,9 +8226,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             ),
             torch.zeros_like(global_count),
         )
-        count_correction = (
-            raw_count_correction
-            * self.count_correction_scale.reshape(1, self.H, 1)
+        count_correction = raw_count_correction * self.count_correction_scale.reshape(
+            1, self.H, 1
         )
         route_common_correction = (
             count_correction
@@ -6608,24 +8295,36 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if not has_possible_global:
             global_output = torch.zeros_like(query)
             global_lse = torch.full(
-                (batch_size, self.H, seq_len), float("-inf"),
-                device=x.device, dtype=torch.float32,
+                (batch_size, self.H, seq_len),
+                float("-inf"),
+                device=x.device,
+                dtype=torch.float32,
             )
         elif use_triton:
             if evidence_value is None:
                 global_output, global_lse = _direct_global_hisa_triton_apply(
-                    query, global_key, global_value, route,
-                    metadata.top_chunk_idx, lengths,
-                    self.chunk_size, self.local_window,
+                    query,
+                    global_key,
+                    global_value,
+                    route,
+                    metadata.top_chunk_idx,
+                    lengths,
+                    self.chunk_size,
+                    self.local_window,
                     backward_impl=self.resolved_backward_impl,
                     source_block_size=self.source_block_size,
                 )
             else:
                 global_output, global_lse, route_output, route_lse = (
                     _direct_global_hisa_triton_apply(
-                        query, global_key, global_value, route,
-                        metadata.top_chunk_idx, lengths,
-                        self.chunk_size, self.local_window,
+                        query,
+                        global_key,
+                        global_value,
+                        route,
+                        metadata.top_chunk_idx,
+                        lengths,
+                        self.chunk_size,
+                        self.local_window,
                         projected_value=evidence_value,
                         backward_impl=self.resolved_backward_impl,
                         source_block_size=self.source_block_size,
@@ -6635,13 +8334,24 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         else:
             if evidence_value is None:
                 global_output, global_lse = _eager_global_lane(
-                    query, global_key, global_value, route, metadata,
+                    query,
+                    global_key,
+                    global_value,
+                    route,
+                    metadata,
                     local_window=self.local_window,
                 )
             else:
-                global_output, global_lse, route_evidence = _eager_global_lane_with_route_evidence(
-                    query, global_key, global_value, route, metadata,
-                    local_window=self.local_window, evidence_value=evidence_value,
+                global_output, global_lse, route_evidence = (
+                    _eager_global_lane_with_route_evidence(
+                        query,
+                        global_key,
+                        global_value,
+                        route,
+                        metadata,
+                        local_window=self.local_window,
+                        evidence_value=evidence_value,
+                    )
                 )
 
         attended, combined_lse, head_global_mass = _merge_attention_lanes_with_mass(
@@ -6650,9 +8360,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if router_auxiliary is not None and self.global_mass_aux_weight > 0.0:
             sampled_ids = router_auxiliary.sampled_tile_ids
             if sampled_ids.numel() > 0:
-                predicted_global_logits = (
-                    global_lse.float() - local_lse.float()
-                )[:, :, sampled_ids]
+                predicted_global_logits = (global_lse.float() - local_lse.float())[
+                    :, :, sampled_ids
+                ]
                 predicted_global_logits = torch.nan_to_num(
                     predicted_global_logits, nan=0.0, posinf=20.0, neginf=-20.0
                 ).clamp(-20.0, 20.0)
@@ -6677,8 +8387,11 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             if route_evidence is None:
                 # Prefixes with no complete global page have an exact null binder.
                 null_probability = torch.ones(
-                    batch_size, self.H, seq_len,
-                    device=x.device, dtype=torch.float32,
+                    batch_size,
+                    self.H,
+                    seq_len,
+                    device=x.device,
+                    dtype=torch.float32,
                 )
                 null_log_odds = torch.full_like(null_probability, 20.0)
             else:
@@ -6688,12 +8401,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     route_evidence.lse.float() - combined_lse.float()[..., None],
                     torch.full_like(route_evidence.lse.float(), float("-inf")),
                 )
-                binding_correction, null_probability, null_log_odds = self._binding_correction(
-                    x,
-                    route_evidence.output,
-                    route_log_mass,
-                    route_identity_features,
-                    absolute_route_summary,
+                binding_correction, null_probability, null_log_odds = (
+                    self._binding_correction(
+                        x,
+                        route_evidence.output,
+                        route_log_mass,
+                        route_identity_features,
+                        absolute_route_summary,
+                    )
                 )
             if (
                 self.training
@@ -6705,11 +8420,12 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 sampled_ids = router_auxiliary.sampled_tile_ids
                 predicted_null_logits = torch.nan_to_num(
                     null_log_odds[:, :, sampled_ids].float(),
-                    nan=0.0, posinf=20.0, neginf=-20.0,
+                    nan=0.0,
+                    posinf=20.0,
+                    neginf=-20.0,
                 ).clamp(-20.0, 20.0)
                 target_null = (
-                    1.0
-                    - router_auxiliary.teacher_selected_global_mass.detach().float()
+                    1.0 - router_auxiliary.teacher_selected_global_mass.detach().float()
                 ).clamp(0.0, 1.0)
                 null_loss = F.binary_cross_entropy_with_logits(
                     predicted_null_logits, target_null, reduction="mean"
@@ -6732,16 +8448,17 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 metadata=metadata,
                 auxiliary_loss=auxiliary,
                 sampled_anchor_logits=(
-                    None if router_auxiliary is None
+                    None
+                    if router_auxiliary is None
                     else router_auxiliary.sampled_anchor_logits
                 ),
                 sampled_tile_ids=(
-                    None if router_auxiliary is None
+                    None
+                    if router_auxiliary is None
                     else router_auxiliary.sampled_tile_ids
                 ),
                 sampled_teacher_mass=(
-                    None if router_auxiliary is None
-                    else router_auxiliary.teacher_mass
+                    None if router_auxiliary is None else router_auxiliary.teacher_mass
                 ),
             )
 
@@ -6755,7 +8472,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 )
                 valid_count_diag = valid_rows.sum().clamp_min(1)
                 global_mass_diag = torch.where(
-                    valid_rows, head_global_mass.float(),
+                    valid_rows,
+                    head_global_mass.float(),
                     torch.zeros_like(head_global_mass.float()),
                 )
                 finite_route = torch.isfinite(route)
@@ -6768,7 +8486,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     "global_attention_mass": global_mass_diag.sum() / valid_count_diag,
                     "local_attention_mass": torch.where(
                         valid_rows, 1.0 - global_mass_diag, 0.0
-                    ).sum() / valid_count_diag,
+                    ).sum()
+                    / valid_count_diag,
                     "selected_route_rms": torch.sqrt(
                         torch.where(finite_route, route.float().square(), 0.0).sum()
                         / route_count
@@ -6794,7 +8513,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         if self.binding_gain_raw is None
                         else torch.sigmoid(self.binding_gain_raw.float())
                     ),
-                    "binder_correction_rms": binding_correction.float().square().mean().sqrt(),
+                    "binder_correction_rms": binding_correction.float()
+                    .square()
+                    .mean()
+                    .sqrt(),
                     "binder_to_attention_rms_ratio": (
                         binding_correction.float().square().mean().sqrt()
                         / projected.float().square().mean().sqrt().clamp_min(1e-12)
@@ -6806,14 +8528,17 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     ),
                     "global_lane_logit_bias_mean": self.bounded_global_lane_logit_bias.mean(),
                     "route_confidence_offset_mean": torch.where(
-                        (semantic_chunks >= 0).any(-1), route_confidence_offset,
+                        (semantic_chunks >= 0).any(-1),
+                        route_confidence_offset,
                         torch.zeros_like(route_confidence_offset),
-                    ).sum() / (semantic_chunks >= 0).any(-1).sum().clamp_min(1),
+                    ).sum()
+                    / (semantic_chunks >= 0).any(-1).sum().clamp_min(1),
                     "exploration_probability_effective": torch.as_tensor(
                         exploration_probability, device=x.device, dtype=torch.float32
                     ),
                     "routing_candidate_count": torch.tensor(
-                        float(deterministic_candidates.top_chunk_idx.shape[-1]), device=x.device
+                        float(deterministic_candidates.top_chunk_idx.shape[-1]),
+                        device=x.device,
                     ),
                     "hierarchical_routing_enabled": torch.tensor(
                         float(self.hierarchical_routing), device=x.device
@@ -6822,43 +8547,60 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         float(self.exact_page_rerank), device=x.device
                     ),
                     "router_auxiliary_loss": (
-                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        auxiliary.new_zeros(())
+                        if router_auxiliary is None
                         else router_auxiliary.loss
                     ),
                     "router_child_cross_entropy": (
-                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        auxiliary.new_zeros(())
+                        if router_auxiliary is None
                         else router_auxiliary.cross_entropy
                     ),
                     "router_parent_cross_entropy": (
-                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        auxiliary.new_zeros(())
+                        if router_auxiliary is None
                         else router_auxiliary.parent_cross_entropy
                     ),
                     "teacher_full_global_mass_mean": (
-                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        auxiliary.new_zeros(())
+                        if router_auxiliary is None
                         else router_auxiliary.teacher_full_global_mass.mean()
                     ),
                     "teacher_selected_global_mass_mean": (
-                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        auxiliary.new_zeros(())
+                        if router_auxiliary is None
                         else router_auxiliary.teacher_selected_global_mass.mean()
                     ),
                     "teacher_capture_fraction_mean": (
-                        auxiliary.new_zeros(()) if router_auxiliary is None
+                        auxiliary.new_zeros(())
+                        if router_auxiliary is None
                         else router_auxiliary.teacher_capture_fraction.mean()
                     ),
                     "global_mass_auxiliary_loss": global_mass_loss,
                     "binding_null_auxiliary_loss": null_loss,
                 }
-                if router_auxiliary is not None and router_auxiliary.sampled_tile_ids.numel():
+                if (
+                    router_auxiliary is not None
+                    and router_auxiliary.sampled_tile_ids.numel()
+                ):
                     sampled_ids = router_auxiliary.sampled_tile_ids
                     teacher = router_auxiliary.teacher_mass
-                    candidates = deterministic_candidates.top_chunk_idx[:, :, sampled_ids]
+                    candidates = deterministic_candidates.top_chunk_idx[
+                        :, :, sampled_ids
+                    ]
                     final_selected = metadata.top_chunk_idx[:, :, sampled_ids]
-                    candidate_mass = torch.gather(
-                        teacher, -1, candidates.clamp_min(0).long()
-                    ).masked_fill(candidates < 0, 0.0).sum(-1).clamp_max(1.0)
-                    final_mass = torch.gather(
-                        teacher, -1, final_selected.clamp_min(0).long()
-                    ).masked_fill(final_selected < 0, 0.0).sum(-1).clamp_max(1.0)
+                    candidate_mass = (
+                        torch.gather(teacher, -1, candidates.clamp_min(0).long())
+                        .masked_fill(candidates < 0, 0.0)
+                        .sum(-1)
+                        .clamp_max(1.0)
+                    )
+                    final_mass = (
+                        torch.gather(teacher, -1, final_selected.clamp_min(0).long())
+                        .masked_fill(final_selected < 0, 0.0)
+                        .sum(-1)
+                        .clamp_max(1.0)
+                    )
                     teacher_top = teacher.argmax(-1)
                     candidate_parent = torch.div(
                         candidates.clamp_min(0).long(),
@@ -6882,7 +8624,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 if exact_candidate_lse is not None:
                     finite_exact = torch.isfinite(exact_candidate_lse)
                     diagnostics["exact_candidate_page_lse_mean"] = torch.where(
-                        finite_exact, exact_candidate_lse,
+                        finite_exact,
+                        exact_candidate_lse,
                         torch.zeros_like(exact_candidate_lse),
                     ).sum() / finite_exact.sum().clamp_min(1)
                     # Report deterministic top-K separately from all scored
@@ -6892,22 +8635,33 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                         dim=-1,
                     ).values
                     finite_selected = torch.isfinite(selected_exact)
-                    diagnostics["exact_deterministic_selected_page_lse_mean"] = torch.where(
-                        finite_selected, selected_exact, torch.zeros_like(selected_exact)
-                    ).sum() / finite_selected.sum().clamp_min(1)
+                    diagnostics["exact_deterministic_selected_page_lse_mean"] = (
+                        torch.where(
+                            finite_selected,
+                            selected_exact,
+                            torch.zeros_like(selected_exact),
+                        ).sum()
+                        / finite_selected.sum().clamp_min(1)
+                    )
                 if analysis_selection_logits is not None:
                     first_competitive = (
-                        (self.top_k_chunks + 1) * self.chunk_size + self.local_window
-                    )
+                        self.top_k_chunks + 1
+                    ) * self.chunk_size + self.local_window
                     ids = torch.arange(
-                        min(seq_len, first_competitive), seq_len,
-                        device=x.device, dtype=torch.int64,
+                        min(seq_len, first_competitive),
+                        seq_len,
+                        device=x.device,
+                        dtype=torch.int64,
                     )[: self.diagnostic_max_queries]
                     self._routing_entropy = (
                         _eligible_route_entropy(
-                            analysis_selection_logits, metadata,
-                            self.local_window, tile_ids=ids,
-                        ) if ids.numel() else torch.zeros((), device=x.device)
+                            analysis_selection_logits,
+                            metadata,
+                            self.local_window,
+                            tile_ids=ids,
+                        )
+                        if ids.numel()
+                        else torch.zeros((), device=x.device)
                     )
                     diagnostics["routing_entropy"] = self._routing_entropy
                 if forced_route_chunk_ids is not None:
@@ -6929,7 +8683,6 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             return output, auxiliary
         return output
 
-
     def init_incremental_state(
         self,
         batch_size: int,
@@ -6944,22 +8697,35 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         resolved_device = parameter.device if device is None else torch.device(device)
         resolved_dtype = parameter.dtype if dtype is None else dtype
         empty_tokens = torch.empty(
-            int(batch_size), self.H, 0, self.hd,
-            device=resolved_device, dtype=resolved_dtype,
+            int(batch_size),
+            self.H,
+            0,
+            self.hd,
+            device=resolved_device,
+            dtype=resolved_dtype,
         )
         empty_pages = torch.empty(
-            int(batch_size), self.H, 0, self.chunk_size, self.hd,
-            device=resolved_device, dtype=resolved_dtype,
+            int(batch_size),
+            self.H,
+            0,
+            self.chunk_size,
+            self.hd,
+            device=resolved_device,
+            dtype=resolved_dtype,
         )
         hierarchy_size = self.hierarchy_group_size if self.hierarchical_routing else 1
         routing_addresses = _empty_incremental_address_cache(
-            int(batch_size), self.H, self.hd,
+            int(batch_size),
+            self.H,
+            self.hd,
             mode=self.representative_mode,
             hierarchy_group_size=hierarchy_size,
             device=resolved_device,
         )
         attention_addresses = _empty_incremental_address_cache(
-            int(batch_size), self.H, self.hd,
+            int(batch_size),
+            self.H,
+            self.hd,
             mode=self.representative_mode,
             hierarchy_group_size=hierarchy_size,
             device=resolved_device,
@@ -6997,13 +8763,17 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         child_count = addresses.values.shape[2]
         if eligible_count <= 0 or child_count == 0:
             return torch.full(
-                (batch_size, heads, 1, self.top_k_chunks), -1,
-                device=query_normalized.device, dtype=torch.int32,
+                (batch_size, heads, 1, self.top_k_chunks),
+                -1,
+                device=query_normalized.device,
+                dtype=torch.int32,
             )
 
         def coarse_candidates(source: HISAChunkAddresses) -> torch.Tensor:
             if source.values.shape[2] != child_count:
-                raise ValueError("incremental address sources must have equal child counts")
+                raise ValueError(
+                    "incremental address sources must have equal child counts"
+                )
             coarse = _dense_routing_score_surface(
                 query_normalized,
                 source,
@@ -7015,9 +8785,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             chunk_ids = torch.arange(
                 child_count, device=query_normalized.device, dtype=torch.int64
             ).reshape(1, 1, 1, child_count)
-            coarse = coarse.masked_fill(
-                chunk_ids >= int(eligible_count), float("-inf")
-            )
+            coarse = coarse.masked_fill(chunk_ids >= int(eligible_count), float("-inf"))
 
             if (
                 self.hierarchical_routing
@@ -7055,23 +8823,31 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                     ).reshape(batch_size, heads, 1, -1)
                 else:
                     parent_children = torch.empty(
-                        batch_size, heads, 1, 0,
-                        device=query_normalized.device, dtype=torch.int64,
+                        batch_size,
+                        heads,
+                        1,
+                        0,
+                        device=query_normalized.device,
+                        dtype=torch.int64,
                     )
                 tail_start = eligible_parents * group
-                tail = torch.arange(
-                    tail_start, int(eligible_count),
-                    device=query_normalized.device, dtype=torch.int64,
-                ).reshape(1, 1, 1, -1).expand(batch_size, heads, 1, -1)
+                tail = (
+                    torch.arange(
+                        tail_start,
+                        int(eligible_count),
+                        device=query_normalized.device,
+                        dtype=torch.int64,
+                    )
+                    .reshape(1, 1, 1, -1)
+                    .expand(batch_size, heads, 1, -1)
+                )
                 candidates = torch.cat((parent_children, tail), dim=-1)
                 deduplicated, unique = _deduplicate_fixed_candidates(
                     candidates, entry_count=child_count
                 )
                 safe = deduplicated.clamp(max=child_count - 1)
                 candidate_scores = torch.gather(coarse, -1, safe)
-                candidate_scores = candidate_scores.masked_fill(
-                    ~unique, float("-inf")
-                )
+                candidate_scores = candidate_scores.masked_fill(~unique, float("-inf"))
                 candidate_k = min(
                     self.routing_candidate_count, candidate_scores.shape[-1]
                 )
@@ -7093,13 +8869,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             union, unique = _deduplicate_fixed_candidates(
                 torch.cat((primary, secondary), dim=-1), entry_count=child_count
             )
-            coarse_candidates = torch.where(
-                unique, union, torch.full_like(union, -1)
-            )
+            coarse_candidates = torch.where(unique, union, torch.full_like(union, -1))
         else:
             coarse_candidates = primary
 
-        if not self.exact_page_rerank or coarse_candidates.shape[-1] <= self.top_k_chunks:
+        if (
+            not self.exact_page_rerank
+            or coarse_candidates.shape[-1] <= self.top_k_chunks
+        ):
             selected = coarse_candidates[..., : self.top_k_chunks]
             if selected.shape[-1] < self.top_k_chunks:
                 selected = F.pad(
@@ -7158,7 +8935,9 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         if self.max_seq_len is not None and position >= self.max_seq_len:
             raise ValueError("incremental position exceeds configured max_seq_len")
 
-        query_flat, key_flat, value_flat, gate = self.qkvg_proj(x_t).split(self.D, dim=-1)
+        query_flat, key_flat, value_flat, gate = self.qkvg_proj(x_t).split(
+            self.D, dim=-1
+        )
         query = _to_heads(query_flat, batch_size, 1, self.H, self.hd)
         local_key_t = _to_heads(key_flat, batch_size, 1, self.H, self.hd)
         local_value_t = _to_heads(value_flat, batch_size, 1, self.H, self.hd)
@@ -7168,21 +8947,34 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             assert self.global_v_down is not None and self.global_v_up is not None
             global_key_t = global_key_t + _to_heads(
                 self.global_k_up(self.global_k_down(x_t)),
-                batch_size, 1, self.H, self.hd,
+                batch_size,
+                1,
+                self.H,
+                self.hd,
             )
             global_value_t = global_value_t + _to_heads(
                 self.global_v_up(self.global_v_down(x_t)),
-                batch_size, 1, self.H, self.hd,
+                batch_size,
+                1,
+                self.H,
+                self.hd,
             )
         base_global_key_t = global_key_t
         if kv_inject is not None:
             key_delta, value_delta = kv_inject
-            if key_delta.shape != global_key_t.shape or value_delta.shape != global_value_t.shape:
-                raise ValueError("incremental kv_inject must contain [B,H,1,HD] tensors")
+            if (
+                key_delta.shape != global_key_t.shape
+                or value_delta.shape != global_value_t.shape
+            ):
+                raise ValueError(
+                    "incremental kv_inject must contain [B,H,1,HD] tensors"
+                )
             theta_k = self.npci_theta_max * torch.tanh(self.npci_theta_k)
             theta_v = self.npci_theta_max * torch.tanh(self.npci_theta_v)
             global_key_t = _magnitude_aware_rotate(global_key_t, key_delta, theta_k)
-            global_value_t = _magnitude_aware_rotate(global_value_t, value_delta, theta_v)
+            global_value_t = _magnitude_aware_rotate(
+                global_value_t, value_delta, theta_v
+            )
         if self.global_key_calibration == "rms_match_local":
             one = torch.ones(batch_size, device=x_t.device, dtype=torch.int32)
             global_key_t = _rms_match_global_key(global_key_t, local_key_t, one)
@@ -7197,18 +8989,26 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             assert self.router_k_down is not None and self.router_k_up is not None
             routing_query_t = routing_query_t + _to_heads(
                 self.router_q_up(self.router_q_down(x_t)),
-                batch_size, 1, self.H, self.hd,
+                batch_size,
+                1,
+                self.H,
+                self.hd,
             )
             routing_key_t = routing_key_t + _to_heads(
                 self.router_k_up(self.router_k_down(x_t)),
-                batch_size, 1, self.H, self.hd,
+                batch_size,
+                1,
+                self.H,
+                self.hd,
             )
 
         if state.local_key.shape[2] == 0:
             local_output = torch.zeros_like(query)
             local_lse = torch.full(
-                (batch_size, self.H, 1), float("-inf"),
-                device=x_t.device, dtype=torch.float32,
+                (batch_size, self.H, 1),
+                float("-inf"),
+                device=x_t.device,
+                dtype=torch.float32,
             )
         else:
             local_mask = _strict_local_or_boundary_key_mask(
@@ -7227,7 +9027,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 torch.isfinite(scores), probability, torch.zeros_like(probability)
             )
             local_output = torch.einsum(
-                "bhql,bhld->bhqd", probability.to(state.local_value.dtype),
+                "bhql,bhld->bhqd",
+                probability.to(state.local_value.dtype),
                 state.local_value,
             )
 
@@ -7286,21 +9087,27 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
             )
             valid_route = torch.isfinite(similarity)
             count = valid_route.sum(-1, keepdim=True).clamp_min(1)
-            mean = torch.where(
-                valid_route, similarity, torch.zeros_like(similarity)
-            ).sum(-1, keepdim=True) / count
+            mean = (
+                torch.where(valid_route, similarity, torch.zeros_like(similarity)).sum(
+                    -1, keepdim=True
+                )
+                / count
+            )
             centered = torch.where(
                 valid_route, similarity - mean, torch.zeros_like(similarity)
             )
-            if self.exact_page_rerank and not self.representative_prior_after_exact_rerank:
+            if (
+                self.exact_page_rerank
+                and not self.representative_prior_after_exact_rerank
+            ):
                 route = torch.where(
-                    valid_route, torch.zeros_like(centered),
+                    valid_route,
+                    torch.zeros_like(centered),
                     torch.full_like(centered, float("-inf")),
                 )
             else:
                 route = (
-                    centered
-                    * self.effective_route_prior_scale.reshape(1, self.H, 1, 1)
+                    centered * self.effective_route_prior_scale.reshape(1, self.H, 1, 1)
                 ).masked_fill(~valid_route, float("-inf"))
             semantic_similarity = torch.where(
                 valid_route, similarity, torch.zeros_like(similarity)
@@ -7317,16 +9124,17 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 absolute_route_summary, selected_chunks
             )[..., None].to(route.dtype)
             local_count = self._local_count_geometry(x_t.device, position + 1)[-1]
-            global_count = torch.isfinite(route).sum(-1).float() * float(self.chunk_size)
+            global_count = torch.isfinite(route).sum(-1).float() * float(
+                self.chunk_size
+            )
             raw_count = torch.where(
                 (global_count > 0.0) & (local_count > 0.0),
                 torch.log(local_count.clamp_min(1.0) / global_count.clamp_min(1.0)),
                 torch.zeros_like(global_count),
             )
-            common = (
-                raw_count * self.count_correction_scale.reshape(1, self.H, 1)
-                + self.bounded_global_lane_logit_bias.reshape(1, self.H, 1)
-            )
+            common = raw_count * self.count_correction_scale.reshape(
+                1, self.H, 1
+            ) + self.bounded_global_lane_logit_bias.reshape(1, self.H, 1)
             route = route + common[..., None].to(route.dtype)
 
             safe = selected_chunks.clamp_min(0).to(torch.int64)
@@ -7355,12 +9163,14 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 token_scores.reshape(batch_size, self.H, 1, -1), dim=-1
             ).reshape_as(token_scores)
             global_probability = torch.where(
-                torch.isfinite(token_scores), global_probability,
+                torch.isfinite(token_scores),
+                global_probability,
                 torch.zeros_like(global_probability),
             )
             global_output = torch.einsum(
                 "bhqkm,bhqkmd->bhqd",
-                global_probability.to(selected_v.dtype), selected_v,
+                global_probability.to(selected_v.dtype),
+                selected_v,
             )
             if self.binding_rank:
                 assert self.bind_evidence_weight is not None
@@ -7377,7 +9187,8 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
                 )
                 route_output = torch.einsum(
                     "bhqkm,bhqkmr->bhqkr",
-                    route_probability.to(projected_tokens.dtype), projected_tokens,
+                    route_probability.to(projected_tokens.dtype),
+                    projected_tokens,
                 )
                 route_evidence = HISARouteEvidence(
                     output=route_output, lse=route_lse.float()
@@ -7390,7 +9201,10 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         projected = self.W_o(merged)
         binding_correction = torch.zeros_like(projected)
         if self.binding_rank and route_evidence is not None:
-            assert route_identity_features is not None and absolute_route_summary is not None
+            assert (
+                route_identity_features is not None
+                and absolute_route_summary is not None
+            )
             route_log_mass = torch.where(
                 torch.isfinite(route_evidence.lse)
                 & torch.isfinite(combined_lse.float()[..., None]),
@@ -7408,10 +9222,12 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
 
         local_key_history = torch.cat((state.local_key, local_key_t), dim=2)
         local_value_history = torch.cat((state.local_value, local_value_t), dim=2)
-        local_positions = torch.cat((
-            state.local_positions,
-            torch.tensor([position], device=x_t.device, dtype=torch.int64),
-        ))
+        local_positions = torch.cat(
+            (
+                state.local_positions,
+                torch.tensor([position], device=x_t.device, dtype=torch.int64),
+            )
+        )
         max_history = self.local_window + self.chunk_size - 1
         if local_key_history.shape[2] > max_history:
             local_key_history = local_key_history[:, :, -max_history:]
@@ -7421,9 +9237,7 @@ class HierarchicalSparseAttentionV19HISACausal(nn.Module):
         pending_base_global_key = torch.cat(
             (state.pending_base_global_key, base_global_key_t), dim=2
         )
-        pending_global_key = torch.cat(
-            (state.pending_global_key, global_key_t), dim=2
-        )
+        pending_global_key = torch.cat((state.pending_global_key, global_key_t), dim=2)
         pending_global_value = torch.cat(
             (state.pending_global_value, global_value_t), dim=2
         )

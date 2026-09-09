@@ -124,6 +124,7 @@ from dsqg_attention_v23 import (  # noqa: E402
     DSQGAttentionV23,
     dsqg_triton_available,
 )
+
 if REPO_KERNEL_LAYOUT:
     from kernels.hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
         HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
@@ -170,15 +171,21 @@ LEGACY_HISA_CHECKPOINT_KINDS = frozenset(
 ROUTE_AUX_RECIPE_SEED = 20_260_809
 EXPECTED_PARAMETERS = 100_290_445
 EXPECTED_TRAINABLE_PARAMETERS = 100_290_405
-EXPECTED_STATE_FINGERPRINT = "099c313d786bc6879926c842f479cf45c84954cf3612bac4a4b656578518960a"
-EXPECTED_SEEDED_RNG_FINGERPRINT = "ba02b103e767eb3ccc7420da1e82900f816843d5ac49aa42e82f87b7d7405f63"
+EXPECTED_STATE_FINGERPRINT = (
+    "099c313d786bc6879926c842f479cf45c84954cf3612bac4a4b656578518960a"
+)
+EXPECTED_SEEDED_RNG_FINGERPRINT = (
+    "ba02b103e767eb3ccc7420da1e82900f816843d5ac49aa42e82f87b7d7405f63"
+)
 EXPECTED_SOURCE_AST_SHA256: dict[str, str] = {
     "train/train_dwarf.py": "ead99fe174e00e8a7b70a8f8184bf3f4797a22a2085263d55b076f90a155f688",
     "kernels/causal_ema_scan.py": "d531c6f8a1ba23fb8fdcbb7bc36337c8922a245863f0140a880717d257a1d0ed",
     "kernels/dsqg_attention_v23.py": "df2e8b0476881c40ac0d8127ac1f07c1f35aab3e51fd0501e33b87857bda68fe",
     "kernels/hierarchical_sparse_attn_v19_hisa.py": "dea70b1566e4986cf5e51a6f141c6fe04fb6f9a5e9bf94ea1a7cdf12384d4499",
 }
-EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256 = "581c5148d4845732c9e687937afef0236dc69896009f48e510de55027af37924"
+EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256 = (
+    "581c5148d4845732c9e687937afef0236dc69896009f48e510de55027af37924"
+)
 
 CANONICAL_TOKENIZER_SHA256 = (
     "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
@@ -256,9 +263,7 @@ class DwarfConfig:
     hisa_global_route_confidence_limit: float = 2.0
     hisa_count_correction_scale_limit: float = 2.0
     hisa_npci_theta_max: float = 0.25
-    hisa_base_k_route_source_policy: str = (
-        HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE
-    )
+    hisa_base_k_route_source_policy: str = HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE
     hisa_route_aux_weight: float = 0.02
     hisa_route_aux_samples: int = 8
     hisa_route_aux_temperature: float = 0.5
@@ -325,25 +330,27 @@ class DwarfConfig:
             raise ValueError("DWARF requires at least four blocks")
         if (
             not self.global_mixer_layers
-            or tuple(sorted(set(self.global_mixer_layers)))
-            != self.global_mixer_layers
+            or tuple(sorted(set(self.global_mixer_layers))) != self.global_mixer_layers
             or self.global_mixer_layers[0] < 0
             or self.global_mixer_layers[-1] >= self.num_layers
         ):
             raise ValueError(
                 "global_mixer_layers must be sorted unique in-range block indices"
             )
-        if (
-            tuple(sorted(set(self.ema_packet_layers))) != self.ema_packet_layers
-            or not set(self.ema_packet_layers).issubset(self.global_mixer_layers)
+        if tuple(
+            sorted(set(self.ema_packet_layers))
+        ) != self.ema_packet_layers or not set(self.ema_packet_layers).issubset(
+            self.global_mixer_layers
         ):
             raise ValueError("EMA packet layers must be sorted unique HISA layers")
-        if (
-            tuple(sorted(set(self.base_k_routing_layers)))
-            != self.base_k_routing_layers
-            or not set(self.base_k_routing_layers).issubset(self.ema_packet_layers)
+        if tuple(
+            sorted(set(self.base_k_routing_layers))
+        ) != self.base_k_routing_layers or not set(self.base_k_routing_layers).issubset(
+            self.ema_packet_layers
         ):
-            raise ValueError("base-K routing layers must be sorted packet-enabled HISA layers")
+            raise ValueError(
+                "base-K routing layers must be sorted packet-enabled HISA layers"
+            )
         if len(self.ema_packet_initial_coupling_fractions) != len(
             self.ema_packet_layers
         ) or any(
@@ -362,16 +369,23 @@ class DwarfConfig:
             raise ValueError("DSQG backend must be auto, eager, or triton")
         if not isinstance(self.dsqg_support_band_execution, bool):
             raise TypeError("DSQG support-band execution flag must be bool")
-        if min(
-            self.hisa_chunk_size,
-            self.hisa_local_window,
-            self.hisa_selector_tile,
-            self.top_k_chunks,
-            self.hisa_route_aux_competitive_slots,
-        ) < 1:
-            raise ValueError("HISA chunk, local, selector, and route widths must be positive")
+        if (
+            min(
+                self.hisa_chunk_size,
+                self.hisa_local_window,
+                self.hisa_selector_tile,
+                self.top_k_chunks,
+                self.hisa_route_aux_competitive_slots,
+            )
+            < 1
+        ):
+            raise ValueError(
+                "HISA chunk, local, selector, and route widths must be positive"
+            )
         if self.hisa_route_aux_competitive_slots < self.top_k_chunks:
-            raise ValueError("HISA route-aux competitive slots must be >= executed top-K")
+            raise ValueError(
+                "HISA route-aux competitive slots must be >= executed top-K"
+            )
         if self.hisa_top_m_tokens != self.hisa_chunk_size:
             raise ValueError(
                 "canonical HISA enumerates complete chunks; top-M must equal chunk size"
@@ -531,9 +545,8 @@ class DwarfConfig:
             raise ValueError("HISA global key calibration is invalid")
         if self.hisa_local_backend != "flex":
             raise ValueError("canonical HISA local backend must be flex")
-        if (
-            self.hisa_local_block_size < 16
-            or self.hisa_local_block_size & (self.hisa_local_block_size - 1)
+        if self.hisa_local_block_size < 16 or self.hisa_local_block_size & (
+            self.hisa_local_block_size - 1
         ):
             raise ValueError("HISA local block size must be a power of two >=16")
         if self.hisa_local_mask_cache_size < 1:
@@ -592,8 +605,7 @@ def build_offset_groups(config: DwarfConfig) -> tuple[tuple[int, ...], ...]:
     shared_local = tuple(offset for offset in offsets if offset <= 8)
     distributed = tuple(offset for offset in offsets if offset > 8)
     groups = tuple(
-        tuple(sorted((*shared_local, *distributed[index::3])))
-        for index in range(3)
+        tuple(sorted((*shared_local, *distributed[index::3]))) for index in range(3)
     )
     if any(not group for group in groups):
         raise ValueError("offset pruning left an empty DSQG group")
@@ -607,12 +619,15 @@ def route_aux_tile_ids_for_update(
 ) -> torch.Tensor:
     """Derive deterministic rows where more than K chunks compete for K slots."""
     config = config or DwarfConfig()
-    if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 1:
+    if (
+        isinstance(global_step, bool)
+        or not isinstance(global_step, int)
+        or global_step < 1
+    ):
         raise ValueError("global optimizer step must be a positive integer")
     first_competitive = (
-        (config.hisa_route_aux_competitive_slots + 1) * config.hisa_chunk_size
-        + config.hisa_local_window
-    )
+        config.hisa_route_aux_competitive_slots + 1
+    ) * config.hisa_chunk_size + config.hisa_local_window
     candidate_count = config.model_length - first_competitive
     sample_count = min(config.hisa_route_aux_samples, candidate_count)
     if sample_count != config.hisa_route_aux_samples:
@@ -621,9 +636,7 @@ def route_aux_tile_ids_for_update(
     seed = int.from_bytes(hashlib.sha256(material).digest()[:8], "little") % (2**63)
     generator = torch.Generator(device="cpu").manual_seed(seed)
     ids = torch.randperm(candidate_count, generator=generator)[:sample_count]
-    return (ids + first_competitive).to(
-        device=torch.device(device), dtype=torch.int64
-    )
+    return (ids + first_competitive).to(device=torch.device(device), dtype=torch.int64)
 
 
 def _consume_retired_movt_rng(
@@ -710,6 +723,7 @@ def _canonical_ast_dump_v1(node: ast.AST) -> str:
     independent of Python 3.13's ast.dump(show_empty=False) default and later
     pretty-printer changes. New syntax still changes the serialized tree.
     """
+
     def render(value: Any) -> str:
         if isinstance(value, ast.AST):
             fields = []
@@ -741,8 +755,7 @@ def _semantic_ast_sha256(path: Path) -> str:
 
 def source_semantic_manifest() -> dict[str, str]:
     return {
-        name: _semantic_ast_sha256(path)
-        for name, path in source_locations().items()
+        name: _semantic_ast_sha256(path) for name, path in source_locations().items()
     }
 
 
@@ -860,17 +873,23 @@ def _qualified_liger_ops() -> tuple[Any, Any, dict[str, Any]]:
         raise RuntimeError(
             "installed Liger fused CE module differs from the qualified 0.8.0 source"
         )
-    return ops, original, {
-        "version": version,
-        "function_source_sha256": function_hash,
-        "ops_file_sha256": file_hash,
-    }
+    return (
+        ops,
+        original,
+        {
+            "version": version,
+            "function_source_sha256": function_hash,
+            "ops_file_sha256": file_hash,
+        },
+    )
 
 
 def _install_qualified_liger_chunk_planner(chunk_size: int) -> dict[str, Any]:
     """Install the qualified host-side 2048-token planner without editing Liger."""
     if chunk_size != 2048:
-        raise ValueError("only the qualified 2048-token Liger chunk planner is supported")
+        raise ValueError(
+            "only the qualified 2048-token Liger chunk planner is supported"
+        )
     ops, original, receipt = _qualified_liger_ops()
     source = textwrap.dedent(inspect.getsource(original))
     tree = ast.parse(source)
@@ -894,9 +913,13 @@ def _install_qualified_liger_chunk_planner(chunk_size: int) -> dict[str, Any]:
     expected_chunk = ast.parse(_LIGER_CHUNK_EXPR, mode="eval").body
     expected_count = ast.parse(_LIGER_COUNT_EXPR, mode="eval").body
     if _liger_ast_key(chunks[0].value) != _liger_ast_key(expected_chunk):
-        raise RuntimeError("Liger chunk-size expression differs from the qualified contract")
+        raise RuntimeError(
+            "Liger chunk-size expression differs from the qualified contract"
+        )
     if _liger_ast_key(counts[0].value) != _liger_ast_key(expected_count):
-        raise RuntimeError("Liger chunk-count expression differs from the qualified contract")
+        raise RuntimeError(
+            "Liger chunk-count expression differs from the qualified contract"
+        )
     if (
         chunks[0] not in function.body
         or counts[0] not in function.body
@@ -927,7 +950,8 @@ def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
         "pytorch": str(torch.__version__),
         "cuda_runtime": torch.version.cuda,
         "cudnn": (
-            None if not torch.backends.cudnn.is_available()
+            None
+            if not torch.backends.cudnn.is_available()
             else torch.backends.cudnn.version()
         ),
         "triton": _package_version("triton"),
@@ -945,7 +969,8 @@ def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
     }
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
         resolved = torch.device(
-            "cuda", torch.cuda.current_device() if device.index is None else device.index
+            "cuda",
+            torch.cuda.current_device() if device.index is None else device.index,
         )
         properties = torch.cuda.get_device_properties(resolved)
         environment["gpu"] = {
@@ -976,7 +1001,8 @@ def validate_optimized_hisa_contract(
         "triton_library_operator",
     )
     missing = [
-        name for name in required_capabilities
+        name
+        for name in required_capabilities
         if observed_capabilities.get(name) is not True
     ]
     if missing:
@@ -1025,7 +1051,9 @@ def validate_training_runtime(
     """Fail before data hashing or model allocation when production backends are absent."""
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("DWARF training requires CUDA")
-    resolved_index = torch.cuda.current_device() if device.index is None else device.index
+    resolved_index = (
+        torch.cuda.current_device() if device.index is None else device.index
+    )
     if not 0 <= resolved_index < torch.cuda.device_count():
         raise ValueError(f"CUDA device index {resolved_index} is not visible")
     torch.cuda.set_device(resolved_index)
@@ -1148,9 +1176,7 @@ def _require_close(
         raise AssertionError(f"{message}; maximum absolute difference={maximum}")
 
 
-def _require_raises(
-    error_type: type[BaseException], callable_, message: str
-) -> None:
+def _require_raises(error_type: type[BaseException], callable_, message: str) -> None:
     try:
         callable_()
     except error_type:
@@ -1162,9 +1188,7 @@ def _require_raises(
     raise AssertionError(f"{message}; no exception was raised")
 
 
-def _independent_lagged_ema(
-    x: torch.Tensor, factors: torch.Tensor
-) -> torch.Tensor:
+def _independent_lagged_ema(x: torch.Tensor, factors: torch.Tensor) -> torch.Tensor:
     accumulator_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
     state = torch.zeros(
         x.shape[0], 3, x.shape[2], device=x.device, dtype=accumulator_dtype
@@ -1218,9 +1242,12 @@ def assert_public_kernel_contracts() -> None:
                 message=f"causal EMA {name} gradient changed",
             )
 
-        ema_source = ast.parse(source_locations()["kernels/causal_ema_scan.py"].read_text())
+        ema_source = ast.parse(
+            source_locations()["kernels/causal_ema_scan.py"].read_text()
+        )
         ema_backward_nodes = [
-            node for node in ast.walk(ema_source)
+            node
+            for node in ast.walk(ema_source)
             if isinstance(node, ast.FunctionDef) and node.name == "_ema3_bwd_serial"
         ]
         _require(len(ema_backward_nodes) == 1, "causal EMA backward kernel is absent")
@@ -1238,13 +1265,18 @@ def assert_public_kernel_contracts() -> None:
         # bounded live telemetry.
         # Keep the shared-gradient replay fix covered on the public surface;
         # numerical repeatability is additionally qualified on CUDA.
-        dsqg_source = ast.parse(source_locations()["kernels/dsqg_attention_v23.py"].read_text())
+        dsqg_source = ast.parse(
+            source_locations()["kernels/dsqg_attention_v23.py"].read_text()
+        )
         dsqg_backward_names = {
-            "_bwd_dq_v23", "_bwd_dq_v23_banded",
-            "_bwd_dkdv_v23", "_bwd_dkdv_v23_banded",
+            "_bwd_dq_v23",
+            "_bwd_dq_v23_banded",
+            "_bwd_dkdv_v23",
+            "_bwd_dkdv_v23_banded",
         }
         dsqg_backward_nodes = {
-            node.name: node for node in ast.walk(dsqg_source)
+            node.name: node
+            for node in ast.walk(dsqg_source)
             if isinstance(node, ast.FunctionDef) and node.name in dsqg_backward_names
         }
         _require(
@@ -1262,14 +1294,18 @@ def assert_public_kernel_contracts() -> None:
                 f"DSQG unordered shared-gradient accumulation returned: {name}",
             )
         hisa_source = ast.parse(
-            source_locations()["kernels/hierarchical_sparse_attn_v19_hisa.py"].read_text()
+            source_locations()[
+                "kernels/hierarchical_sparse_attn_v19_hisa.py"
+            ].read_text()
         )
         selected_source_found = False
         for node in ast.walk(hisa_source):
             if isinstance(node, ast.FunctionDef) and node.name.startswith(
                 "_selected_address_score_backward_"
             ):
-                selected_source_found |= node.name == "_selected_address_score_backward_source_kernel"
+                selected_source_found |= (
+                    node.name == "_selected_address_score_backward_source_kernel"
+                )
                 _require(
                     not any(
                         isinstance(call, ast.Call)
@@ -1279,7 +1315,9 @@ def assert_public_kernel_contracts() -> None:
                     ),
                     "HISA unordered selected-address gradient accumulation returned",
                 )
-        _require(selected_source_found, "HISA selected-address source backward is absent")
+        _require(
+            selected_source_found, "HISA selected-address source backward is absent"
+        )
         dsqg_kwargs = {
             "embedding_dim": 64,
             "num_heads": 4,
@@ -1495,9 +1533,9 @@ def assert_public_kernel_contracts() -> None:
         causal_input = torch.randn(1, 64, 64, requires_grad=True)
         causal_changed = causal_input.detach().clone()
         causal_split = 51
-        causal_changed[:, causal_split:] = torch.randn_like(
-            causal_changed[:, causal_split:]
-        ) * 11.0
+        causal_changed[:, causal_split:] = (
+            torch.randn_like(causal_changed[:, causal_split:]) * 11.0
+        )
         causal_a = hisa(causal_input)[:, :causal_split]
         causal_b = hisa(causal_changed)[:, :causal_split]
         _require_close(
@@ -1564,7 +1602,9 @@ def assert_public_kernel_contracts() -> None:
                     "representative_mode": "mean_max_blend",
                     "representative_blend_alpha": 0.2,
                 }
-            ).representative_mix.detach().mean()
+            )
+            .representative_mix.detach()
+            .mean()
         )
         mean_high = float(
             HierarchicalSparseAttentionV19HISACausal(
@@ -1573,7 +1613,9 @@ def assert_public_kernel_contracts() -> None:
                     "representative_mode": "mean_max_blend",
                     "representative_blend_alpha": 0.8,
                 }
-            ).representative_mix.detach().mean()
+            )
+            .representative_mix.detach()
+            .mean()
         )
         _require(
             mean_low < 0.25 and mean_high > 0.75,
@@ -1621,11 +1663,15 @@ class InterferencePacket(nn.Module):
         super().__init__()
         self.heads = config.num_heads
         self.head_dim = config.embedding_dim // config.num_heads
-        raw = [inverse_bounded_ema_factor(1.0 / value) for value in config.ema_timescales]
+        raw = [
+            inverse_bounded_ema_factor(1.0 / value) for value in config.ema_timescales
+        ]
         self.ema_raw = nn.Parameter(torch.tensor(raw, dtype=torch.float32))
         self.mix_logits = nn.Parameter(torch.zeros(self.heads, len(raw)))
         self.gate_proj = nn.Linear(config.embedding_dim, config.embedding_dim)
-        self.kv_proj = nn.Linear(config.embedding_dim, 2 * config.embedding_dim, bias=False)
+        self.kv_proj = nn.Linear(
+            config.embedding_dim, 2 * config.embedding_dim, bias=False
+        )
         with torch.no_grad():
             self.gate_proj.bias.fill_(-2.0)
         self._diagnostics: dict[str, torch.Tensor] = {}
@@ -1654,11 +1700,15 @@ class InterferencePacket(nn.Module):
         )
         mixture = torch.softmax(self.mix_logits.float(), dim=-1)
         pooled = (
-            stacked
-            * mixture.transpose(0, 1)
-            .reshape(1, 1, len(self.ema_factors), self.heads, 1)
-            .to(stacked.dtype)
-        ).sum(2).reshape(batch, seq_len, -1)
+            (
+                stacked
+                * mixture.transpose(0, 1)
+                .reshape(1, 1, len(self.ema_factors), self.heads, 1)
+                .to(stacked.dtype)
+            )
+            .sum(2)
+            .reshape(batch, seq_len, -1)
+        )
         pooled_float = pooled.float()
         mean_square = pooled_float.square().mean(-1, keepdim=True)
         rms = (mean_square + 1e-6).sqrt()
@@ -1667,9 +1717,9 @@ class InterferencePacket(nn.Module):
         gate = torch.sigmoid(self.gate_proj(normalized).float())
         packet = (direction * confidence * gate).to(normalized.dtype)
         key_delta, value_delta = self.kv_proj(packet).chunk(2, dim=-1)
-        key_delta = key_delta.reshape(batch, seq_len, self.heads, self.head_dim).permute(
-            0, 2, 1, 3
-        )
+        key_delta = key_delta.reshape(
+            batch, seq_len, self.heads, self.head_dim
+        ).permute(0, 2, 1, 3)
         value_delta = value_delta.reshape(
             batch, seq_len, self.heads, self.head_dim
         ).permute(0, 2, 1, 3)
@@ -1681,9 +1731,9 @@ class InterferencePacket(nn.Module):
                     "ema_pooled_rms_p50": torch.quantile(rms_flat, 0.50),
                     "ema_pooled_rms_p90": torch.quantile(rms_flat, 0.90),
                     "ema_pooled_rms_p99": torch.quantile(rms_flat, 0.99),
-                    "ema_confidence_saturation_fraction": (
-                        confidence_flat > 0.9
-                    ).float().mean(),
+                    "ema_confidence_saturation_fraction": (confidence_flat > 0.9)
+                    .float()
+                    .mean(),
                     "ema_packet_rms": packet.float().square().mean().sqrt(),
                     "ema_key_delta_rms": key_delta.float().square().mean().sqrt(),
                     "ema_value_delta_rms": value_delta.float().square().mean().sqrt(),
@@ -1732,9 +1782,7 @@ class DSQGBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, *, collect_diagnostics: bool = False
     ) -> torch.Tensor:
-        x = x + self.attn(
-            self.norm1(x), collect_diagnostics=collect_diagnostics
-        )
+        x = x + self.attn(self.norm1(x), collect_diagnostics=collect_diagnostics)
         return x + self.ffn(self.norm2(x))
 
 
@@ -1764,16 +1812,10 @@ class GlobalMixerBlock(nn.Module):
             temperature=config.hisa_temperature,
             representative_mode=config.hisa_representative_mode,
             representative_blend_alpha=config.hisa_representative_blend_alpha,
-            representative_score_reduction=(
-                config.hisa_representative_score_reduction
-            ),
-            representative_lse_temperature=(
-                config.hisa_representative_lse_temperature
-            ),
+            representative_score_reduction=(config.hisa_representative_score_reduction),
+            representative_lse_temperature=(config.hisa_representative_lse_temperature),
             coherence_score_max_weight=config.hisa_coherence_score_max_weight,
-            coherence_score_initial_weight=(
-                config.hisa_coherence_score_initial_weight
-            ),
+            coherence_score_initial_weight=(config.hisa_coherence_score_initial_weight),
             parent_coherence_score_max_weight=(
                 config.hisa_parent_coherence_score_max_weight
             ),
@@ -1793,9 +1835,7 @@ class GlobalMixerBlock(nn.Module):
             route_prior_scale=config.hisa_route_prior_scale,
             route_prior_max_scale=config.hisa_route_prior_max_scale,
             global_lane_bias_limit=config.hisa_global_lane_bias_limit,
-            global_route_confidence_limit=(
-                config.hisa_global_route_confidence_limit
-            ),
+            global_route_confidence_limit=(config.hisa_global_route_confidence_limit),
             route_aux_weight=config.hisa_route_aux_weight,
             route_aux_samples=config.hisa_route_aux_samples,
             route_aux_temperature=config.hisa_route_aux_temperature,
@@ -1815,18 +1855,14 @@ class GlobalMixerBlock(nn.Module):
             exploration_uniform_global_fraction=(
                 config.hisa_exploration_uniform_global_fraction
             ),
-            exploration_final_probability=(
-                config.hisa_exploration_final_probability
-            ),
+            exploration_final_probability=(config.hisa_exploration_final_probability),
             exploration_anneal_steps=config.hisa_exploration_anneal_steps,
             global_adapter_rank=config.hisa_global_adapter_rank,
             global_key_calibration=config.hisa_global_key_calibration,
             router_adapter_rank=config.hisa_router_adapter_rank,
             route_aux_detach_core_qk=config.hisa_route_aux_detach_core_qk,
             binding_rank=config.hisa_binding_rank,
-            count_correction_scale_limit=(
-                config.hisa_count_correction_scale_limit
-            ),
+            count_correction_scale_limit=(config.hisa_count_correction_scale_limit),
             npci_theta_max=config.hisa_npci_theta_max,
             max_seq_len=config.model_length,
             backend=config.hisa_backend,
@@ -1879,9 +1915,7 @@ class GlobalMixerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         normalized = self.norm1(x)
         kv_inject = (
-            self.packet(
-                normalized, collect_diagnostics=collect_diagnostics
-            )
+            self.packet(normalized, collect_diagnostics=collect_diagnostics)
             if self.packet is not None
             else None
         )
@@ -1973,7 +2007,9 @@ class DwarfForCausalLM(nn.Module):
                         std=module.scale_embed_init_std,
                     )
                     with torch.no_grad():
-                        module.scale_embed.sub_(module.scale_embed.mean(0, keepdim=True))
+                        module.scale_embed.sub_(
+                            module.scale_embed.mean(0, keepdim=True)
+                        )
                 elif isinstance(module, HierarchicalSparseAttentionV19HISACausal):
                     module.initialize_global_adapter_up_()
                     module.initialize_router_adapter_up_()
@@ -2276,17 +2312,30 @@ def make_parameter_groups(
             if module.representative_mix_raw.requires_grad:
                 special["route"].append(module.representative_mix_raw)
             if module.router_adapter_rank:
-                if any(item is None for item in (
-                    module.router_q_down, module.router_q_up,
-                    module.router_k_down, module.router_k_up,
-                )):
+                if any(
+                    item is None
+                    for item in (
+                        module.router_q_down,
+                        module.router_q_up,
+                        module.router_k_down,
+                        module.router_k_up,
+                    )
+                ):
                     raise RuntimeError("HISA router adapters are incomplete")
-                assert module.router_q_down is not None and module.router_q_up is not None
-                assert module.router_k_down is not None and module.router_k_up is not None
-                special["router_adapter"].extend((
-                    module.router_q_down.weight, module.router_q_up.weight,
-                    module.router_k_down.weight, module.router_k_up.weight,
-                ))
+                assert (
+                    module.router_q_down is not None and module.router_q_up is not None
+                )
+                assert (
+                    module.router_k_down is not None and module.router_k_up is not None
+                )
+                special["router_adapter"].extend(
+                    (
+                        module.router_q_down.weight,
+                        module.router_q_up.weight,
+                        module.router_k_down.weight,
+                        module.router_k_up.weight,
+                    )
+                )
             if module.binding_gain_raw is not None:
                 special["route"].append(module.binding_gain_raw)
             if module.binding_rank:
@@ -2392,7 +2441,9 @@ def make_parameter_groups(
         for item in (*muon_groups, *adam_groups)
         for parameter in item["params"]
     ]
-    expected = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    expected = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
     if len(assigned) != len(expected) or {id(p) for p in assigned} != {
         id(p) for p in expected
     }:
@@ -2421,7 +2472,9 @@ def optimizer_manifest(
                         "dtype": str(parameter.dtype),
                     }
                 )
-            groups.append({"name": str(group.get("name", "")), "parameters": parameters})
+            groups.append(
+                {"name": str(group.get("name", "")), "parameters": parameters}
+            )
         entries.append({"name": optimizer_name, "groups": groups})
     return {"format": "dwarf-optimizer-manifest-v1", "optimizers": entries}
 
@@ -2469,16 +2522,20 @@ class MultiOptimizer:
     def _partition_norm(
         parameters: list[nn.Parameter],
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        gradients = [parameter.grad for parameter in parameters if parameter.grad is not None]
+        gradients = [
+            parameter.grad for parameter in parameters if parameter.grad is not None
+        ]
         if not gradients:
             device = parameters[0].device if parameters else torch.device("cpu")
             return torch.zeros((), device=device), []
         if len({gradient.device for gradient in gradients}) != 1:
             raise ValueError("gradient clipping partition spans multiple devices")
         component_norms = torch._foreach_norm(gradients, 2.0)
-        total = torch.stack(
-            [component.float().square() for component in component_norms]
-        ).sum().sqrt()
+        total = (
+            torch.stack([component.float().square() for component in component_norms])
+            .sum()
+            .sqrt()
+        )
         return total, gradients
 
     def clip(self, recipe: TrainRecipe) -> dict[str, Any]:
@@ -2497,14 +2554,18 @@ class MultiOptimizer:
             coefficients[name] = torch.clamp(
                 limits[name] / (norms[name] + 1e-6), max=1.0
             )
-        finite_muon, finite_adamw, clipped_muon, clipped_adamw = torch.stack(
-            (
-                torch.isfinite(norms["muon"]),
-                torch.isfinite(norms["adamw"]),
-                coefficients["muon"] < 1.0,
-                coefficients["adamw"] < 1.0,
+        finite_muon, finite_adamw, clipped_muon, clipped_adamw = (
+            torch.stack(
+                (
+                    torch.isfinite(norms["muon"]),
+                    torch.isfinite(norms["adamw"]),
+                    coefficients["muon"] < 1.0,
+                    coefficients["adamw"] < 1.0,
+                )
             )
-        ).to(device="cpu", dtype=torch.bool).tolist()
+            .to(device="cpu", dtype=torch.bool)
+            .tolist()
+        )
         if not finite_muon:
             raise FloatingPointError("muon gradient norm is non-finite")
         if not finite_adamw:
@@ -2586,15 +2647,19 @@ class MultiOptimizer:
                 raise ValueError("checkpoint optimizer payload is invalid")
             saved_state = item["state"]
             current_state = optimizer.state_dict()
-            if set(saved_state) != {"state", "param_groups"} or not isinstance(
-                saved_state["state"], dict
-            ) or not isinstance(saved_state["param_groups"], list):
+            if (
+                set(saved_state) != {"state", "param_groups"}
+                or not isinstance(saved_state["state"], dict)
+                or not isinstance(saved_state["param_groups"], list)
+            ):
                 raise ValueError("checkpoint optimizer state is invalid")
             current_groups = current_state["param_groups"]
             saved_groups = saved_state["param_groups"]
             live_groups = optimizer.param_groups
             if len(saved_groups) != len(current_groups):
-                raise ValueError("checkpoint optimizer parameter-group count does not match")
+                raise ValueError(
+                    "checkpoint optimizer parameter-group count does not match"
+                )
             parameter_ids: list[int] = []
             slot_parameters: dict[int, nn.Parameter] = {}
             for saved_group, current_group, live_group in zip(
@@ -2603,7 +2668,9 @@ class MultiOptimizer:
                 if not isinstance(saved_group, dict) or set(saved_group) != set(
                     current_group
                 ):
-                    raise ValueError("checkpoint optimizer group metadata does not match")
+                    raise ValueError(
+                        "checkpoint optimizer group metadata does not match"
+                    )
                 saved_parameters = saved_group.get("params")
                 current_parameters = current_group["params"]
                 if (
@@ -2658,11 +2725,15 @@ class MultiOptimizer:
             parameter_id_set = set(parameter_ids)
             saved_state_ids = set(saved_state["state"])
             if saved_state_ids - parameter_id_set:
-                raise ValueError("checkpoint optimizer state has unexpected parameter entries")
+                raise ValueError(
+                    "checkpoint optimizer state has unexpected parameter entries"
+                )
             if (saved_state_ids or require_complete_state) and (
                 parameter_id_set - saved_state_ids
             ):
-                raise ValueError("checkpoint optimizer state has missing parameter entries")
+                raise ValueError(
+                    "checkpoint optimizer state has missing parameter entries"
+                )
             for parameter_id, parameter_state in saved_state["state"].items():
                 if not isinstance(parameter_state, dict) or not parameter_state:
                     raise ValueError("checkpoint optimizer parameter state is invalid")
@@ -2681,9 +2752,11 @@ class MultiOptimizer:
                                 "checkpoint optimizer state tensor dtype does not match "
                                 f"parameter slot {parameter_id}: {state_name}"
                             )
-                    elif isinstance(state_value, bool) or not isinstance(
-                        state_value, (int, float)
-                    ) or not math.isfinite(float(state_value)):
+                    elif (
+                        isinstance(state_value, bool)
+                        or not isinstance(state_value, (int, float))
+                        or not math.isfinite(float(state_value))
+                    ):
                         raise ValueError(
                             "checkpoint optimizer scalar state is invalid for "
                             f"parameter slot {parameter_id}: {state_name}"
@@ -2751,9 +2824,12 @@ class ValidatedDatasetSource:
         self.path = Path(path).resolve()
         expected = None if expected_sha256 is None else expected_sha256.strip().lower()
         if expected is not None and (
-            len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected)
+            len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
         ):
-            raise ValueError("dataset SHA-256 must be 64 lowercase hexadecimal characters")
+            raise ValueError(
+                "dataset SHA-256 must be 64 lowercase hexadecimal characters"
+            )
         if trust_expected_sha256 and expected is None:
             raise ValueError("--trust-dataset-sha256 requires --dataset-sha256")
         self.descriptor = os.open(
@@ -2816,7 +2892,9 @@ class ValidatedDatasetSource:
                     payload = payload[key]
                     break
         if not torch.is_tensor(payload):
-            raise TypeError("dataset must be a tensor or a dict containing packed tokens")
+            raise TypeError(
+                "dataset must be a tensor or a dict containing packed tokens"
+            )
         if payload.ndim != 2 or payload.shape[1] != seq_len:
             raise ValueError(
                 f"dataset must have shape [rows,{seq_len}], got {tuple(payload.shape)}"
@@ -2988,7 +3066,9 @@ def validate_prefix_extension_transition(
     proof = contract.get("prefix_proof")
     if not all(isinstance(value, dict) for value in (parent, child, proof)):
         raise ValueError("prefix extension contract sections are invalid")
-    assert isinstance(parent, dict) and isinstance(child, dict) and isinstance(proof, dict)
+    assert (
+        isinstance(parent, dict) and isinstance(child, dict) and isinstance(proof, dict)
+    )
 
     if parent.get("checkpoint_sha256") != parent_checkpoint_sha256:
         raise ValueError("parent checkpoint SHA-256 does not match transition contract")
@@ -3087,9 +3167,7 @@ def preflight_training_rows(
         raise ValueError("dataset preflight requires a two-dimensional CPU tensor")
     if not 0 < selected_rows <= len(dataset) or vocab_size < 1 or chunk_rows < 1:
         raise ValueError("dataset preflight bounds are invalid")
-    if document_boundary_policy not in {
-        "single_document_rows", "allow_packed_unsafe"
-    }:
+    if document_boundary_policy not in {"single_document_rows", "allow_packed_unsafe"}:
         raise ValueError("unsupported document-boundary policy")
     minimum = vocab_size
     maximum = -1
@@ -3191,16 +3269,12 @@ def compiled_training_callables(
     diagnostics_enabled: bool,
 ) -> TrainingCallables:
     exploration = torch.compile(
-        _TrainingForwardCallable(
-            model, diagnostics=False, exploration_disabled=False
-        ),
+        _TrainingForwardCallable(model, diagnostics=False, exploration_disabled=False),
         options={"deterministic": True},
         dynamic=False,
     )
     no_exploration = torch.compile(
-        _TrainingForwardCallable(
-            model, diagnostics=False, exploration_disabled=True
-        ),
+        _TrainingForwardCallable(model, diagnostics=False, exploration_disabled=True),
         options={"deterministic": True},
         dynamic=False,
     )
@@ -3237,12 +3311,10 @@ class BatchStager:
         self.device = device
         shape = (batch_size, dataset.shape[1])
         self.host_buffers = [
-            torch.empty(shape, dtype=dataset.dtype, pin_memory=True)
-            for _ in range(2)
+            torch.empty(shape, dtype=dataset.dtype, pin_memory=True) for _ in range(2)
         ]
         self.device_buffers = [
-            torch.empty(shape, dtype=torch.long, device=device)
-            for _ in range(2)
+            torch.empty(shape, dtype=torch.long, device=device) for _ in range(2)
         ]
         self.transfer_stream = torch.cuda.Stream(device=device)
         self.copy_done = [torch.cuda.Event() for _ in range(2)]
@@ -3264,9 +3336,7 @@ class BatchStager:
         with torch.cuda.stream(self.transfer_stream):
             if self.compute_recorded[slot]:
                 self.transfer_stream.wait_event(self.compute_done[slot])
-            self.device_buffers[slot].copy_(
-                self.host_buffers[slot], non_blocking=True
-            )
+            self.device_buffers[slot].copy_(self.host_buffers[slot], non_blocking=True)
             self.copy_done[slot].record(self.transfer_stream)
             self.copy_recorded[slot] = True
 
@@ -3277,9 +3347,13 @@ class BatchStager:
 
     def batches(self, update_indices: torch.Tensor) -> Iterator[torch.Tensor]:
         if update_indices.device.type != "cpu" or update_indices.ndim != 1:
-            raise ValueError("batch staging indices must be a one-dimensional CPU tensor")
+            raise ValueError(
+                "batch staging indices must be a one-dimensional CPU tensor"
+            )
         if len(update_indices) % self.batch_size:
-            raise ValueError("update row count must be divisible by the microbatch size")
+            raise ValueError(
+                "update row count must be divisible by the microbatch size"
+            )
         if not len(update_indices):
             return
         first = int(update_indices[0])
@@ -3304,9 +3378,7 @@ class BatchStager:
             # The previous H2D read of this host slot has completed, so refill it
             # while the consumer computes on the corresponding device buffer.
             next_fill = (
-                self.executor.submit(
-                    self._fill_contiguous, starts[next_index], slot
-                )
+                self.executor.submit(self._fill_contiguous, starts[next_index], slot)
                 if next_index < len(starts)
                 else None
             )
@@ -3363,7 +3435,9 @@ def _cuda_device(value: torch.device | str | int) -> torch.device:
     device = torch.device(value)
     if device.type != "cuda":
         raise ValueError("checkpoint stream keys must be CUDA devices")
-    return torch.device("cuda", torch.cuda.current_device() if device.index is None else device.index)
+    return torch.device(
+        "cuda", torch.cuda.current_device() if device.index is None else device.index
+    )
 
 
 def _async_stage_payload(
@@ -3373,10 +3447,13 @@ def _async_stage_payload(
 ) -> PendingSnapshot:
     tensors = list(_walk_tensors(payload))
     cuda_devices = {
-        _cuda_device(tensor.device) for tensor in tensors if tensor.device.type == "cuda"
+        _cuda_device(tensor.device)
+        for tensor in tensors
+        if tensor.device.type == "cuda"
     }
     streams = {
-        _cuda_device(device): stream for device, stream in (producer_streams or {}).items()
+        _cuda_device(device): stream
+        for device, stream in (producer_streams or {}).items()
     }
     if cuda_devices != set(streams):
         raise ValueError("an explicit producer stream is required for each CUDA device")
@@ -3415,7 +3492,10 @@ def _async_stage_payload(
                 else:
                     device = _cuda_device(detached.device)
                     staged_storage = torch.empty(
-                        storage.nbytes(), dtype=torch.uint8, device="cpu", pin_memory=True
+                        storage.nbytes(),
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=True,
                     )
                     with torch.cuda.stream(staging_streams[device]):
                         staged_storage.copy_(source, non_blocking=True)
@@ -3471,7 +3551,9 @@ def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
 
 class AsyncCheckpointWriter:
     def __init__(self) -> None:
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dwarf-save")
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dwarf-save"
+        )
         self.future: Future[None] | None = None
         self.lock = threading.Lock()
 
@@ -3487,9 +3569,8 @@ class AsyncCheckpointWriter:
         payload: dict[str, Any],
         path: Path,
         *,
-        producer_streams: dict[
-            torch.device | str | int, torch.cuda.Stream
-        ] | None = None,
+        producer_streams: dict[torch.device | str | int, torch.cuda.Stream]
+        | None = None,
     ) -> None:
         with self.lock:
             if self.future is not None:
@@ -3595,7 +3676,9 @@ def _stable_reconstruction_architecture(value: dict[str, Any]) -> dict[str, Any]
         "config": copy.deepcopy(value.get("config")),
         "parameters": value.get("parameters"),
         "trainable_parameters": value.get("trainable_parameters"),
-        "topology": {key: copy.deepcopy(topology.get(key)) for key in required_topology},
+        "topology": {
+            key: copy.deepcopy(topology.get(key)) for key in required_topology
+        },
     }
 
 
@@ -3733,7 +3816,11 @@ def restore_checkpoint(
     if checkpoint.get("recipe") != asdict(RECIPE):
         raise ValueError("checkpoint recipe does not match")
     step = checkpoint.get("step")
-    if isinstance(step, bool) or not isinstance(step, int) or not 0 < step <= RECIPE.steps:
+    if (
+        isinstance(step, bool)
+        or not isinstance(step, int)
+        or not 0 < step <= RECIPE.steps
+    ):
         raise ValueError("checkpoint step is invalid")
     validate_dataset_identity(
         checkpoint.get("dataset"),
@@ -3876,7 +3963,9 @@ def configure_compiled_backward_autocast() -> dict[str, str | bool]:
         from torch._functorch import config as functorch_config
         from torch._inductor import config as inductor_config
     except ImportError as error:
-        raise RuntimeError("compiled training numerical policy is unavailable") from error
+        raise RuntimeError(
+            "compiled training numerical policy is unavailable"
+        ) from error
     previous = getattr(functorch_config, "backward_pass_autocast", None)
     if not isinstance(previous, str):
         raise RuntimeError("compiled backward autocast policy is unavailable")
@@ -3893,7 +3982,9 @@ def configure_compiled_backward_autocast() -> dict[str, str | bool]:
     if inductor_config.deterministic is not True:
         raise RuntimeError("deterministic compiled reductions could not be set")
     return {
-        "previous": previous, "observed": observed, "required": True,
+        "previous": previous,
+        "observed": observed,
+        "required": True,
         "inductor_deterministic": True,
     }
 
@@ -4030,8 +4121,13 @@ def assert_hisa_auxiliary_gradient_contract(
             parent_value = magnitude(
                 "parent_coherence_raw", gradients[layout["parent_coherence_raw"]]
             )
-            _require(route_value > 0.0, "HISA route auxiliary has zero route-prior gradient")
-            _require(child_value > 0.0, "HISA route auxiliary has zero child-coherence gradient")
+            _require(
+                route_value > 0.0, "HISA route auxiliary has zero route-prior gradient"
+            )
+            _require(
+                child_value > 0.0,
+                "HISA route auxiliary has zero child-coherence gradient",
+            )
             totals["route_prior"] += route_value
             totals["child_coherence"] += child_value
             totals["parent_coherence"] += parent_value
@@ -4042,9 +4138,9 @@ def assert_hisa_auxiliary_gradient_contract(
                 gradients[layout["representative_mix_raw"]],
             )
             _require(value > 0.0, "active representative mixture has zero gradient")
-            totals["representative_mix"] = float(
-                totals.get("representative_mix", 0.0)
-            ) + value
+            totals["representative_mix"] = (
+                float(totals.get("representative_mix", 0.0)) + value
+            )
 
         adapter_value = 0.0
         for name in ("router_q_down", "router_q_up", "router_k_down", "router_k_up"):
@@ -4191,7 +4287,9 @@ def warm_compiled_training_step(
             )
             loss_off = language_off + auxiliary_off
         loss_off.backward()
-        _assert_finite(loss_off.detach(), "no-exploration compile warm-up loss is non-finite")
+        _assert_finite(
+            loss_off.detach(), "no-exploration compile warm-up loss is non-finite"
+        )
         torch.cuda.synchronize(device)
         model.zero_grad(set_to_none=True)
         contract["compiled_graphs"] = 2
@@ -4434,7 +4532,9 @@ def _assert_mixed_fused_reference_ce_gradients(
         requires_grad=True,
     )
     weight_a = model.lm_head.weight.detach().clone().requires_grad_(True)
-    labels = torch.tensor([1, 7, 31, 63, 127, 255, 511], device=device, dtype=torch.long)
+    labels = torch.tensor(
+        [1, 7, 31, 63, 127, 255, 511], device=device, dtype=torch.long
+    )
     with amp_context():
         fused = loss_fn(weight_a, hidden_a, labels)
     fused.backward()
@@ -4446,8 +4546,12 @@ def _assert_mixed_fused_reference_ce_gradients(
         F.linear(hidden_b.float(), weight_b.float()), labels, reduction="mean"
     )
     reference.backward()
-    hidden_delta = float((fused_hidden_grad - hidden_b.grad.detach().float()).abs().max())
-    weight_delta = float((fused_weight_grad - weight_b.grad.detach().float()).abs().max())
+    hidden_delta = float(
+        (fused_hidden_grad - hidden_b.grad.detach().float()).abs().max()
+    )
+    weight_delta = float(
+        (fused_weight_grad - weight_b.grad.detach().float()).abs().max()
+    )
     if not torch.allclose(
         fused.detach().float(), reference.detach().float(), atol=2e-3, rtol=2e-3
     ):
@@ -4483,7 +4587,10 @@ def _assert_mixed_empty_auxiliary_is_zero(
     state = _capture_rng_state(device)
     try:
         input_ids = torch.full(
-            (1, config.model_length), config.pad_token_id, device=device, dtype=torch.long
+            (1, config.model_length),
+            config.pad_token_id,
+            device=device,
+            dtype=torch.long,
         )
         valid_lengths = torch.zeros(1, device=device, dtype=torch.int32)
         route_aux_tile_ids = route_aux_tile_ids_for_update(1, device, config)
@@ -4564,7 +4671,10 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
     if not tokenizer_path.is_absolute():
         tokenizer_path = (dataset.manifest_path.parent / tokenizer_path).resolve()
     manifest_tokenizer_hash = str(dataset.manifest["tokenizer_sha256"])
-    if not tokenizer_path.is_file() or mixed_file_sha256(tokenizer_path) != manifest_tokenizer_hash:
+    if (
+        not tokenizer_path.is_file()
+        or mixed_file_sha256(tokenizer_path) != manifest_tokenizer_hash
+    ):
         raise ValueError("manifest tokenizer path/SHA-256 does not match")
     tokenizer = tokenizer_identity(tokenizer_path, config.vocab_size)
     if tokenizer["sha256"] != manifest_tokenizer_hash:
@@ -4654,7 +4764,9 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
             config.hisa_exploration_final_probability == 0.0
             and step >= config.hisa_exploration_anneal_steps
         )
-        compiled = callables.exploration if exploration_active else callables.no_exploration
+        compiled = (
+            callables.exploration if exploration_active else callables.no_exploration
+        )
         route_aux_tile_ids = route_aux_tile_ids_for_update(step, device, config)
         exploration_step = torch.tensor(step, device=device, dtype=torch.int64)
         started = time.perf_counter()
@@ -4665,14 +4777,18 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
                 microbatch_index=microbatch_index,
                 pad_token_id=config.pad_token_id,
             )
-            input_ids = batch.input_ids.to(device=device, non_blocking=True).contiguous()
+            input_ids = batch.input_ids.to(
+                device=device, non_blocking=True
+            ).contiguous()
             labels = batch.labels.to(device=device, non_blocking=True).contiguous()
             valid_lengths = batch.valid_lengths.to(
                 device=device, dtype=torch.int32, non_blocking=True
             ).contiguous()
             active_targets = masked_target_count(labels)
             if active_targets != int(valid_lengths.sum(dtype=torch.int64)):
-                raise RuntimeError("label mask and valid_lengths active-target accounting diverged")
+                raise RuntimeError(
+                    "label mask and valid_lengths active-target accounting diverged"
+                )
             with amp_context():
                 hidden, auxiliary = compiled(
                     input_ids, valid_lengths, route_aux_tile_ids, exploration_step
@@ -4691,7 +4807,9 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
                 and bool(torch.isfinite(auxiliary))
                 and bool(torch.isfinite(loss))
             ):
-                raise FloatingPointError("non-finite mixed-length language/auxiliary/total loss")
+                raise FloatingPointError(
+                    "non-finite mixed-length language/auxiliary/total loss"
+                )
             loss.backward()
             scale = active_targets / update.active_targets if active_targets else 0.0
             language_accumulator += language.detach().float() * scale
@@ -4717,7 +4835,9 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
             "target_budget": plan.target_budget,
             "budget_excess_targets": plan.excess_targets,
             "active_target_positions_per_second": update.active_targets / elapsed,
-            "stored_model_positions": physical_batch_size * grad_accum_steps * config.model_length,
+            "stored_model_positions": physical_batch_size
+            * grad_accum_steps
+            * config.model_length,
             "elapsed_seconds": elapsed,
             "exploration_graph_active": exploration_active,
             "lr_factor": lr_factor,
@@ -4735,7 +4855,9 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
         if should_save:
             dataset.assert_unchanged()
             if mixed_length_source_identity() != source_identity:
-                raise RuntimeError("trainer, mixed runtime, or kernel source changed during training")
+                raise RuntimeError(
+                    "trainer, mixed runtime, or kernel source changed during training"
+                )
             atomic_mixed_torch_save(
                 mixed_checkpoint_payload(
                     step=step,
@@ -4753,7 +4875,9 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
             )
     dataset.assert_unchanged()
     result = {
-        "status": "PASS_BOUNDED" if stop_step < len(plan.updates) else "PASS_COMPLETE_BUDGET",
+        "status": "PASS_BOUNDED"
+        if stop_step < len(plan.updates)
+        else "PASS_COMPLETE_BUDGET",
         "entrypoint": str(Path(__file__).resolve()),
         "architecture": architecture,
         "environment": environment,
@@ -4789,9 +4913,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
         raise ValueError("invalid save/log interval")
 
     config = DwarfConfig()
-    validate_canonical_kernel_sources(
-        allow_mismatch=args.allow_source_mismatch
-    )
+    validate_canonical_kernel_sources(allow_mismatch=args.allow_source_mismatch)
     loss_class, environment = validate_training_runtime(requested_device, config)
     device = _resolved_cuda_device(requested_device)
     compile_policy = configure_compiled_backward_autocast()
@@ -4946,7 +5068,8 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                 and step >= config.hisa_exploration_anneal_steps
             )
             compiled = (
-                callables.exploration if exploration_active
+                callables.exploration
+                if exploration_active
                 else callables.no_exploration
             )
             last_input_ids: torch.Tensor | None = None
@@ -4990,9 +5113,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                 raise error
             _assert_finite(loss_accumulator, "non-finite training loss")
             for name in ("muon", "adamw"):
-                _assert_finite(
-                    norms[name]["norm"], f"non-finite {name} gradient norm"
-                )
+                _assert_finite(norms[name]["norm"], f"non-finite {name} gradient norm")
             optimizer.step()
 
             logged = step % args.log_every == 0 or step in {1, stop_step}
@@ -5014,7 +5135,8 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                 diagnostic_peak_reserved = 0
                 if diagnostics_enabled:
                     diagnostic = (
-                        callables.diagnostic_exploration if exploration_active
+                        callables.diagnostic_exploration
+                        if exploration_active
                         else callables.diagnostic_no_exploration
                     )
                     if diagnostic is None:
@@ -5048,15 +5170,13 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                     },
                     "grad_norm_muon": float(norms["muon"]["norm"]),
                     "grad_norm_adamw": float(norms["adamw"]["norm"]),
-                    "grad_clip_muon_coefficient": float(
-                        norms["muon"]["coefficient"]
-                    ),
-                    "grad_clip_adamw_coefficient": float(
-                        norms["adamw"]["coefficient"]
-                    ),
+                    "grad_clip_muon_coefficient": float(norms["muon"]["coefficient"]),
+                    "grad_clip_adamw_coefficient": float(norms["adamw"]["coefficient"]),
                     "grad_clip_muon_clipped": norms["muon"]["clipped"],
                     "grad_clip_adamw_clipped": norms["adamw"]["clipped"],
-                    "shifted_targets": step * RECIPE.effective_batch * config.model_length,
+                    "shifted_targets": step
+                    * RECIPE.effective_batch
+                    * config.model_length,
                     "interval_training_seconds": interval_seconds,
                     "shifted_targets_per_second": targets / interval_seconds,
                     "wall_effective_shifted_targets_per_second": (
@@ -5078,7 +5198,9 @@ def train_fixed_length(args: argparse.Namespace) -> None:
             if should_save:
                 source.assert_unchanged()
                 if source_manifest() != architecture["sources"]:
-                    raise RuntimeError("trainer or kernel source changed during training")
+                    raise RuntimeError(
+                        "trainer or kernel source changed during training"
+                    )
                 writer.submit(
                     checkpoint_payload(
                         step=step,
@@ -5244,8 +5366,7 @@ def self_test() -> None:
             "canonical HISA auxiliary weight changed",
         )
         _require(
-            attention.global_mass_aux_weight
-            == model.config.hisa_global_mass_aux_weight
+            attention.global_mass_aux_weight == model.config.hisa_global_mass_aux_weight
             and attention.binding_null_aux_weight
             == model.config.hisa_binding_null_aux_weight
             and attention.require_auxiliary_return,
@@ -5332,9 +5453,7 @@ def self_test() -> None:
         sum(isinstance(block, DSQGBlock) for block in model.blocks) == 21,
         "L24 DSQG layer count changed",
     )
-    dsqg_layers = [
-        block.attn for block in model.blocks if isinstance(block, DSQGBlock)
-    ]
+    dsqg_layers = [block.attn for block in model.blocks if isinstance(block, DSQGBlock)]
     _require(
         all(module.backend == model.config.dsqg_backend for module in dsqg_layers),
         "canonical DSQG backend is not explicit",
@@ -5359,8 +5478,7 @@ def self_test() -> None:
     )
     groups = make_parameter_groups(model, RECIPE)
     _require(
-        [item["name"] for item in groups["muon"]]
-        == ["muon_linear_weights"],
+        [item["name"] for item in groups["muon"]] == ["muon_linear_weights"],
         "Muon optimizer partition changed",
     )
     _require(
@@ -5404,9 +5522,7 @@ def self_test() -> None:
             "route_aux_teacher_key": "base_global_k",
             "global_attention_key": "post_packet_rotated_global_k",
             "global_attention_value": "post_packet_rotated_global_v",
-            "student_router_stream": (
-                "detached_core_plus_low_rank_router_adapter"
-            ),
+            "student_router_stream": ("detached_core_plus_low_rank_router_adapter"),
             "router_adapter_rank": 32,
         },
         "L17 base-owned route-source contract changed",
@@ -5488,7 +5604,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-length-checkpoint-every", type=int, default=0)
     parser.add_argument("--mixed-length-seed", type=int, default=42)
     parser.add_argument("--allow-mixed-length-smoke-geometry", action="store_true")
-    parser.add_argument("--mixed-length-skip-fused-ce-parity-check", action="store_true")
+    parser.add_argument(
+        "--mixed-length-skip-fused-ce-parity-check", action="store_true"
+    )
     parser.add_argument("--mixed-length-skip-empty-aux-check", action="store_true")
     parser.add_argument("--output-dir")
     parser.add_argument(
@@ -5590,7 +5708,9 @@ def parse_args() -> argparse.Namespace:
             "mismatch overrides are not supported"
         )
     if args.mixed_length_manifest and args.resume_prefix_extension:
-        parser.error("mixed-length route does not support fixed-row prefix-extension resumes")
+        parser.error(
+            "mixed-length route does not support fixed-row prefix-extension resumes"
+        )
     return args
 
 

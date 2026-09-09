@@ -1,6 +1,5 @@
 """Dynamic Sparse Query-Gather attention with bounded causal routing."""
 
-
 from __future__ import annotations
 
 import bisect
@@ -12,6 +11,7 @@ import torch.nn.functional as F
 try:
     import triton
     import triton.language as tl
+
     _TRITON_AVAILABLE = True
 except Exception:
     _TRITON_AVAILABLE = False
@@ -76,18 +76,108 @@ _DSQG_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": 64}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_N": 64}, num_warps=8, num_stages=3),
 ]
-_DSQG_MIN_AUTOTUNE_BLOCK_N = min(config.kwargs["BLOCK_N"] for config in _DSQG_AUTOTUNE_CONFIGS)
+_DSQG_MIN_AUTOTUNE_BLOCK_N = min(
+    config.kwargs["BLOCK_N"] for config in _DSQG_AUTOTUNE_CONFIGS
+)
 
 
 ALL_OFFSETS = [
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 15,
-    16, 19, 21, 23, 28, 48, 64, 96, 121, 161, 192, 212,
-    245, 273, 295, 342, 375, 384, 413, 441, 473, 512, 549, 579,
-    593, 631, 653, 694, 716, 768, 826, 846, 900, 936, 970, 1000,
-    1024, 1074, 1108, 1144, 1166, 1190, 1218, 1244, 1288, 1322, 1385, 1423,
-    1451, 1497, 1522, 1550, 1581, 1603, 1617, 1634, 1651, 1661, 1710, 1743,
-    1780, 1810, 1820, 1852, 1860, 1876, 1886, 1897, 1903, 1916, 1926, 1929,
-    1941, 1965, 1983, 2006, 2011, 2029, 2037, 2044, 2068, 2097, 2113, 2199,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    13,
+    15,
+    16,
+    19,
+    21,
+    23,
+    28,
+    48,
+    64,
+    96,
+    121,
+    161,
+    192,
+    212,
+    245,
+    273,
+    295,
+    342,
+    375,
+    384,
+    413,
+    441,
+    473,
+    512,
+    549,
+    579,
+    593,
+    631,
+    653,
+    694,
+    716,
+    768,
+    826,
+    846,
+    900,
+    936,
+    970,
+    1000,
+    1024,
+    1074,
+    1108,
+    1144,
+    1166,
+    1190,
+    1218,
+    1244,
+    1288,
+    1322,
+    1385,
+    1423,
+    1451,
+    1497,
+    1522,
+    1550,
+    1581,
+    1603,
+    1617,
+    1634,
+    1651,
+    1661,
+    1710,
+    1743,
+    1780,
+    1810,
+    1820,
+    1852,
+    1860,
+    1876,
+    1886,
+    1897,
+    1903,
+    1916,
+    1926,
+    1929,
+    1941,
+    1965,
+    1983,
+    2006,
+    2011,
+    2029,
+    2037,
+    2044,
+    2068,
+    2097,
+    2113,
+    2199,
 ]
 
 
@@ -134,7 +224,12 @@ def _canonicalize_offsets(
 @triton.autotune(
     configs=_DSQG_AUTOTUNE_CONFIGS,
     key=[
-        "BATCH", "H", "N", "HD", "J_VAL", "KV_HEAD_GROUP_SIZE",
+        "BATCH",
+        "H",
+        "N",
+        "HD",
+        "J_VAL",
+        "KV_HEAD_GROUP_SIZE",
         "QUERY_START",
     ],
     reset_to_zero=["OUT"],
@@ -143,19 +238,50 @@ def _canonicalize_offsets(
 )
 @triton.jit
 def _fwd_v23_online(
-    Q, K, V, POS_BIAS, SCALE_EMBED, NULL_KEY, NULL_BIAS, OUT, LSE, OFFSETS,
+    Q,
+    K,
+    V,
+    POS_BIAS,
+    SCALE_EMBED,
+    NULL_KEY,
+    NULL_BIAS,
+    OUT,
+    LSE,
+    OFFSETS,
     LOG_VALID_COUNT,
-    stride_qb, stride_qh, stride_qn, stride_qd,
-    stride_kb, stride_kh, stride_kn, stride_kd,
-    stride_vb, stride_vh, stride_vn, stride_vd,
-    stride_ob, stride_oh, stride_on, stride_od,
-    stride_lb, stride_lh, stride_ln,
-    stride_pbi, stride_pbh,
-    stride_sei, stride_sed,
-    stride_nkh, stride_nkd,
-    BATCH: tl.constexpr, H: tl.constexpr, N, HD: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
-    J_VAL: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_od,
+    stride_lb,
+    stride_lh,
+    stride_ln,
+    stride_pbi,
+    stride_pbh,
+    stride_sei,
+    stride_sed,
+    stride_nkh,
+    stride_nkd,
+    BATCH: tl.constexpr,
+    H: tl.constexpr,
+    N,
+    HD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    J_VAL: tl.constexpr,
+    KV_HEAD_GROUP_SIZE: tl.constexpr,
     QUERY_START: tl.constexpr,
 ):
     """One online-softmax traversal over every configured causal offset."""
@@ -175,12 +301,14 @@ def _fwd_v23_online(
     vbase = V + batch * stride_vb + kv_head * stride_vh
     query = tl.load(
         qbase + positions[:, None] * stride_qn + dims[None, :] * stride_qd,
-        mask=qmask[:, None] & dmask[None, :], other=0.0,
+        mask=qmask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
 
     null_key = tl.load(
         NULL_KEY + head * stride_nkh + dims * stride_nkd,
-        mask=dmask, other=0.0,
+        mask=dmask,
+        other=0.0,
     ).to(tl.float32)
     null_score = tl.sum(query * null_key[None, :], axis=1) * scale
     # Calibrate the null score against the number of valid offsets. The
@@ -188,7 +316,7 @@ def _fwd_v23_online(
     # every offset a second time in each forward kernel.
     null_score += tl.load(LOG_VALID_COUNT + positions, mask=qmask, other=0.0)
     null_score += tl.load(NULL_BIAS + head)
-    running_max = tl.where(qmask, null_score, float('-inf'))
+    running_max = tl.where(qmask, null_score, float("-inf"))
     running_sum = tl.where(qmask, 1.0, 0.0)
     accumulator = tl.zeros([BLOCK_N, BLOCK_HD], tl.float32)
 
@@ -198,28 +326,27 @@ def _fwd_v23_online(
         valid = qmask & (source >= 0) & (source < N)
         key = tl.load(
             kbase + source[:, None] * stride_kn + dims[None, :] * stride_kd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         virtual_key = tl.load(
             SCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
-            mask=dmask, other=0.0,
+            mask=dmask,
+            other=0.0,
         ).to(tl.float32)
         score = tl.sum(query * (key + virtual_key[None, :]), axis=1) * scale
         score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
-        score = tl.where(valid, score, float('-inf'))
+        score = tl.where(valid, score, float("-inf"))
 
         merged_max = tl.maximum(running_max, score)
-        has_old = running_max > float('-inf')
+        has_old = running_max > float("-inf")
         safe_max = tl.where(has_old | valid, merged_max, 0.0)
-        old_scale = tl.where(
-            has_old, tl.exp2((running_max - safe_max) * _LOG2E), 0.0
-        )
-        new_weight = tl.where(
-            valid, tl.exp2((score - safe_max) * _LOG2E), 0.0
-        )
+        old_scale = tl.where(has_old, tl.exp2((running_max - safe_max) * _LOG2E), 0.0)
+        new_weight = tl.where(valid, tl.exp2((score - safe_max) * _LOG2E), 0.0)
         value = tl.load(
             vbase + source[:, None] * stride_vn + dims[None, :] * stride_vd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         accumulator = accumulator * old_scale[:, None] + new_weight[:, None] * value
         running_sum = running_sum * old_scale + new_weight
@@ -230,23 +357,33 @@ def _fwd_v23_online(
     lse = tl.where(
         running_sum > 0.0,
         running_max + tl.log2(running_sum) * (1.0 / _LOG2E),
-        float('-inf'),
+        float("-inf"),
     )
     tl.store(
-        OUT + batch * stride_ob + head * stride_oh
-        + positions[:, None] * stride_on + dims[None, :] * stride_od,
-        output, mask=qmask[:, None] & dmask[None, :],
+        OUT
+        + batch * stride_ob
+        + head * stride_oh
+        + positions[:, None] * stride_on
+        + dims[None, :] * stride_od,
+        output,
+        mask=qmask[:, None] & dmask[None, :],
     )
     tl.store(
         LSE + batch * stride_lb + head * stride_lh + positions * stride_ln,
-        lse, mask=qmask,
+        lse,
+        mask=qmask,
     )
 
 
 @triton.autotune(
     configs=_DSQG_AUTOTUNE_CONFIGS,
     key=[
-        "BATCH", "H", "N", "HD", "J_VAL", "KV_HEAD_GROUP_SIZE",
+        "BATCH",
+        "H",
+        "N",
+        "HD",
+        "J_VAL",
+        "KV_HEAD_GROUP_SIZE",
         "QUERY_START",
     ],
     reset_to_zero=["DQ", "DELTA", "DNULL_KEY", "DNULL_BIAS"],
@@ -254,21 +391,61 @@ def _fwd_v23_online(
 )
 @triton.jit
 def _bwd_dq_v23(
-    Q, K, V, POS_BIAS, SCALE_EMBED, NULL_KEY, NULL_BIAS, DO, LSE, DELTA,
-    DQ, DNULL_KEY, DNULL_BIAS, OFFSETS, LOG_VALID_COUNT,
-    stride_qb, stride_qh, stride_qn, stride_qd,
-    stride_kb, stride_kh, stride_kn, stride_kd,
-    stride_vb, stride_vh, stride_vn, stride_vd,
-    stride_dob, stride_doh, stride_don, stride_dod,
-    stride_lb, stride_lh, stride_ln,
-    stride_db, stride_dh, stride_dn,
-    stride_dqb, stride_dqh, stride_dqn, stride_dqd,
-    stride_pbi, stride_pbh,
-    stride_sei, stride_sed,
-    stride_nkh, stride_nkd,
-    BATCH: tl.constexpr, H: tl.constexpr, N, HD: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
-    J_VAL: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
+    Q,
+    K,
+    V,
+    POS_BIAS,
+    SCALE_EMBED,
+    NULL_KEY,
+    NULL_BIAS,
+    DO,
+    LSE,
+    DELTA,
+    DQ,
+    DNULL_KEY,
+    DNULL_BIAS,
+    OFFSETS,
+    LOG_VALID_COUNT,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_dob,
+    stride_doh,
+    stride_don,
+    stride_dod,
+    stride_lb,
+    stride_lh,
+    stride_ln,
+    stride_db,
+    stride_dh,
+    stride_dn,
+    stride_dqb,
+    stride_dqh,
+    stride_dqn,
+    stride_dqd,
+    stride_pbi,
+    stride_pbh,
+    stride_sei,
+    stride_sed,
+    stride_nkh,
+    stride_nkd,
+    BATCH: tl.constexpr,
+    H: tl.constexpr,
+    N,
+    HD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    J_VAL: tl.constexpr,
+    KV_HEAD_GROUP_SIZE: tl.constexpr,
     QUERY_START: tl.constexpr,
     GRAD_BLOCKS: tl.constexpr,
 ):
@@ -285,29 +462,39 @@ def _bwd_dq_v23(
     scale = 1.0 / tl.sqrt(HD * 1.0)
 
     query = tl.load(
-        Q + batch * stride_qb + head * stride_qh
-        + positions[:, None] * stride_qn + dims[None, :] * stride_qd,
-        mask=qmask[:, None] & dmask[None, :], other=0.0,
+        Q
+        + batch * stride_qb
+        + head * stride_qh
+        + positions[:, None] * stride_qn
+        + dims[None, :] * stride_qd,
+        mask=qmask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     dout = tl.load(
-        DO + batch * stride_dob + head * stride_doh
-        + positions[:, None] * stride_don + dims[None, :] * stride_dod,
-        mask=qmask[:, None] & dmask[None, :], other=0.0,
+        DO
+        + batch * stride_dob
+        + head * stride_doh
+        + positions[:, None] * stride_don
+        + dims[None, :] * stride_dod,
+        mask=qmask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     lse = tl.load(
         LSE + batch * stride_lb + head * stride_lh + positions * stride_ln,
-        mask=qmask, other=float('-inf'),
+        mask=qmask,
+        other=float("-inf"),
     ).to(tl.float32)
 
     null_key = tl.load(
         NULL_KEY + head * stride_nkh + dims * stride_nkd,
-        mask=dmask, other=0.0,
+        mask=dmask,
+        other=0.0,
     ).to(tl.float32)
     null_score = tl.sum(query * null_key[None, :], axis=1) * scale
     null_score += tl.load(LOG_VALID_COUNT + positions, mask=qmask, other=0.0)
     null_score += tl.load(NULL_BIAS + head)
     null_probability = tl.where(
-        qmask & (lse > float('-inf')),
+        qmask & (lse > float("-inf")),
         tl.exp2((null_score - lse) * _LOG2E),
         0.0,
     )
@@ -320,24 +507,33 @@ def _bwd_dq_v23(
         source = positions - offset
         valid = qmask & (source >= 0) & (source < N)
         key = tl.load(
-            K + batch * stride_kb + kv_head * stride_kh
-            + source[:, None] * stride_kn + dims[None, :] * stride_kd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            K
+            + batch * stride_kb
+            + kv_head * stride_kh
+            + source[:, None] * stride_kn
+            + dims[None, :] * stride_kd,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         value = tl.load(
-            V + batch * stride_vb + kv_head * stride_vh
-            + source[:, None] * stride_vn + dims[None, :] * stride_vd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            V
+            + batch * stride_vb
+            + kv_head * stride_vh
+            + source[:, None] * stride_vn
+            + dims[None, :] * stride_vd,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         virtual_key = tl.load(
             SCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
-            mask=dmask, other=0.0,
+            mask=dmask,
+            other=0.0,
         ).to(tl.float32)
         score = tl.sum(query * (key + virtual_key[None, :]), axis=1) * scale
         score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
-        score = tl.where(valid, score, float('-inf'))
+        score = tl.where(valid, score, float("-inf"))
         probability = tl.where(
-            valid & (lse > float('-inf')),
+            valid & (lse > float("-inf")),
             tl.exp2((score - lse) * _LOG2E),
             0.0,
         )
@@ -353,7 +549,8 @@ def _bwd_dq_v23(
     partial = (batch * H + head) * GRAD_BLOCKS + block
     tl.store(
         DNULL_KEY + partial * HD + dims,
-        dnull_key, mask=dmask,
+        dnull_key,
+        mask=dmask,
     )
     tl.store(
         DNULL_BIAS + partial,
@@ -361,43 +558,96 @@ def _bwd_dq_v23(
     )
     tl.store(
         DELTA + batch * stride_db + head * stride_dh + positions * stride_dn,
-        delta_row, mask=qmask,
+        delta_row,
+        mask=qmask,
     )
     # DQ has the BF16 Triton-input dtype. This is the single final rounding at
     # the custom-autograd boundary; all accumulation above remains FP32.
     tl.store(
-        DQ + batch * stride_dqb + head * stride_dqh
-        + positions[:, None] * stride_dqn + dims[None, :] * stride_dqd,
-        dq.to(tl.bfloat16), mask=qmask[:, None] & dmask[None, :],
+        DQ
+        + batch * stride_dqb
+        + head * stride_dqh
+        + positions[:, None] * stride_dqn
+        + dims[None, :] * stride_dqd,
+        dq.to(tl.bfloat16),
+        mask=qmask[:, None] & dmask[None, :],
     )
+
 
 @triton.autotune(
     configs=_DSQG_AUTOTUNE_CONFIGS,
     key=[
-        "BATCH", "H", "N", "HD", "J_VAL", "KV_HEAD_GROUP_SIZE",
-        "QUERY_START", "SOURCE_END",
+        "BATCH",
+        "H",
+        "N",
+        "HD",
+        "J_VAL",
+        "KV_HEAD_GROUP_SIZE",
+        "QUERY_START",
+        "SOURCE_END",
     ],
     reset_to_zero=["DK", "DV", "DPOS_BIAS", "DSCALE_EMBED"],
     cache_results=True,
 )
 @triton.jit
 def _bwd_dkdv_v23(
-    Q, K, V, POS_BIAS, SCALE_EMBED, DO, LSE, DELTA,
-    DK, DV, DPOS_BIAS, DSCALE_EMBED, OFFSETS,
-    stride_qb, stride_qh, stride_qn, stride_qd,
-    stride_kb, stride_kh, stride_kn, stride_kd,
-    stride_vb, stride_vh, stride_vn, stride_vd,
-    stride_dob, stride_doh, stride_don, stride_dod,
-    stride_lb, stride_lh, stride_ln,
-    stride_db, stride_dh, stride_dn,
-    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
-    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
-    stride_pbi, stride_pbh,
-    stride_sei, stride_sed,
-    BATCH: tl.constexpr, H: tl.constexpr, N, HD: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
-    J_VAL: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
-    QUERY_START: tl.constexpr, SOURCE_END: tl.constexpr,
+    Q,
+    K,
+    V,
+    POS_BIAS,
+    SCALE_EMBED,
+    DO,
+    LSE,
+    DELTA,
+    DK,
+    DV,
+    DPOS_BIAS,
+    DSCALE_EMBED,
+    OFFSETS,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_dob,
+    stride_doh,
+    stride_don,
+    stride_dod,
+    stride_lb,
+    stride_lh,
+    stride_ln,
+    stride_db,
+    stride_dh,
+    stride_dn,
+    stride_dkb,
+    stride_dkh,
+    stride_dkn,
+    stride_dkd,
+    stride_dvb,
+    stride_dvh,
+    stride_dvn,
+    stride_dvd,
+    stride_pbi,
+    stride_pbh,
+    stride_sei,
+    stride_sed,
+    BATCH: tl.constexpr,
+    H: tl.constexpr,
+    N,
+    HD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    J_VAL: tl.constexpr,
+    KV_HEAD_GROUP_SIZE: tl.constexpr,
+    QUERY_START: tl.constexpr,
+    SOURCE_END: tl.constexpr,
     GRAD_BLOCKS: tl.constexpr,
 ):
     bhkv = tl.program_id(0)
@@ -413,14 +663,22 @@ def _bwd_dkdv_v23(
     scale = 1.0 / tl.sqrt(HD * 1.0)
 
     key = tl.load(
-        K + batch * stride_kb + kv_head * stride_kh
-        + source[:, None] * stride_kn + dims[None, :] * stride_kd,
-        mask=smask[:, None] & dmask[None, :], other=0.0,
+        K
+        + batch * stride_kb
+        + kv_head * stride_kh
+        + source[:, None] * stride_kn
+        + dims[None, :] * stride_kd,
+        mask=smask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     value = tl.load(
-        V + batch * stride_vb + kv_head * stride_vh
-        + source[:, None] * stride_vn + dims[None, :] * stride_vd,
-        mask=smask[:, None] & dmask[None, :], other=0.0,
+        V
+        + batch * stride_vb
+        + kv_head * stride_vh
+        + source[:, None] * stride_vn
+        + dims[None, :] * stride_vd,
+        mask=smask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     dk = tl.zeros([BLOCK_N, BLOCK_HD], tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_HD], tl.float32)
@@ -432,34 +690,43 @@ def _bwd_dkdv_v23(
             positions = source + offset
             valid = smask & (positions >= QUERY_START) & (positions < N)
             query = tl.load(
-                Q + batch * stride_qb + head * stride_qh
-                + positions[:, None] * stride_qn + dims[None, :] * stride_qd,
-                mask=valid[:, None] & dmask[None, :], other=0.0,
+                Q
+                + batch * stride_qb
+                + head * stride_qh
+                + positions[:, None] * stride_qn
+                + dims[None, :] * stride_qd,
+                mask=valid[:, None] & dmask[None, :],
+                other=0.0,
             ).to(tl.float32)
             dout = tl.load(
-                DO + batch * stride_dob + head * stride_doh
-                + positions[:, None] * stride_don + dims[None, :] * stride_dod,
-                mask=valid[:, None] & dmask[None, :], other=0.0,
+                DO
+                + batch * stride_dob
+                + head * stride_doh
+                + positions[:, None] * stride_don
+                + dims[None, :] * stride_dod,
+                mask=valid[:, None] & dmask[None, :],
+                other=0.0,
             ).to(tl.float32)
             lse = tl.load(
                 LSE + batch * stride_lb + head * stride_lh + positions * stride_ln,
-                mask=valid, other=float('-inf'),
+                mask=valid,
+                other=float("-inf"),
             ).to(tl.float32)
             delta_row = tl.load(
                 DELTA + batch * stride_db + head * stride_dh + positions * stride_dn,
-                mask=valid, other=0.0,
+                mask=valid,
+                other=0.0,
             ).to(tl.float32)
             virtual_key = tl.load(
                 SCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
-                mask=dmask, other=0.0,
+                mask=dmask,
+                other=0.0,
             ).to(tl.float32)
             score = tl.sum(query * (key + virtual_key[None, :]), axis=1) * scale
-            score += tl.load(
-                POS_BIAS + logical_index * stride_pbi + head * stride_pbh
-            )
-            score = tl.where(valid, score, float('-inf'))
+            score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
+            score = tl.where(valid, score, float("-inf"))
             probability = tl.where(
-                valid & (lse > float('-inf')),
+                valid & (lse > float("-inf")),
                 tl.exp2((score - lse) * _LOG2E),
                 0.0,
             )
@@ -474,21 +741,31 @@ def _bwd_dkdv_v23(
             dscale = tl.sum(dscore[:, None] * query, axis=0) * scale
             tl.store(
                 DSCALE_EMBED + partial * HD + dims,
-                dscale, mask=dmask,
+                dscale,
+                mask=dmask,
             )
 
     # DK/DV have the BF16 Triton-input dtype. The grouped reductions above
     # accumulate in FP32 before these final stores.
     tl.store(
-        DK + batch * stride_dkb + kv_head * stride_dkh
-        + source[:, None] * stride_dkn + dims[None, :] * stride_dkd,
-        dk.to(tl.bfloat16), mask=smask[:, None] & dmask[None, :],
+        DK
+        + batch * stride_dkb
+        + kv_head * stride_dkh
+        + source[:, None] * stride_dkn
+        + dims[None, :] * stride_dkd,
+        dk.to(tl.bfloat16),
+        mask=smask[:, None] & dmask[None, :],
     )
     tl.store(
-        DV + batch * stride_dvb + kv_head * stride_dvh
-        + source[:, None] * stride_dvn + dims[None, :] * stride_dvd,
-        dv.to(tl.bfloat16), mask=smask[:, None] & dmask[None, :],
+        DV
+        + batch * stride_dvb
+        + kv_head * stride_dvh
+        + source[:, None] * stride_dvn
+        + dims[None, :] * stride_dvd,
+        dv.to(tl.bfloat16),
+        mask=smask[:, None] & dmask[None, :],
     )
+
 
 def _support_band_ranges(
     offsets: tuple[int, ...],
@@ -500,7 +777,9 @@ def _support_band_ranges(
     """Return exact disjoint query/source bands with bounded active offset sets."""
     if not offsets:
         return (), ()
-    cutoffs = sorted({0, *(int(v) for v in boundaries if 0 < int(v) < seq_len), seq_len})
+    cutoffs = sorted(
+        {0, *(int(v) for v in boundaries if 0 < int(v) < seq_len), seq_len}
+    )
     query_bands: list[tuple[int, int, int]] = []
     start = max(0, int(query_start))
     for end in cutoffs[1:]:
@@ -539,20 +818,52 @@ def _band_launch_geometry(active_offsets: int) -> tuple[int, int, int]:
 
 @triton.jit
 def _fwd_v23_banded(
-    Q, K, V, POS_BIAS, SCALE_EMBED, NULL_KEY, NULL_BIAS, OUT, LSE, OFFSETS,
+    Q,
+    K,
+    V,
+    POS_BIAS,
+    SCALE_EMBED,
+    NULL_KEY,
+    NULL_BIAS,
+    OUT,
+    LSE,
+    OFFSETS,
     LOG_VALID_COUNT,
-    stride_qb, stride_qh, stride_qn, stride_qd,
-    stride_kb, stride_kh, stride_kn, stride_kd,
-    stride_vb, stride_vh, stride_vn, stride_vd,
-    stride_ob, stride_oh, stride_on, stride_od,
-    stride_lb, stride_lh, stride_ln,
-    stride_pbi, stride_pbh,
-    stride_sei, stride_sed,
-    stride_nkh, stride_nkd,
-    BATCH: tl.constexpr, H: tl.constexpr, N, HD: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
-    J_ACTIVE: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
-    QUERY_START: tl.constexpr, QUERY_END: tl.constexpr,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_on,
+    stride_od,
+    stride_lb,
+    stride_lh,
+    stride_ln,
+    stride_pbi,
+    stride_pbh,
+    stride_sei,
+    stride_sed,
+    stride_nkh,
+    stride_nkd,
+    BATCH: tl.constexpr,
+    H: tl.constexpr,
+    N,
+    HD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    J_ACTIVE: tl.constexpr,
+    KV_HEAD_GROUP_SIZE: tl.constexpr,
+    QUERY_START: tl.constexpr,
+    QUERY_END: tl.constexpr,
 ):
     bh = tl.program_id(0)
     block = tl.program_id(1)
@@ -565,18 +876,23 @@ def _fwd_v23_banded(
     dmask = dims < HD
     scale = 1.0 / tl.sqrt(HD * 1.0)
     query = tl.load(
-        Q + batch * stride_qb + head * stride_qh
-        + positions[:, None] * stride_qn + dims[None, :] * stride_qd,
-        mask=qmask[:, None] & dmask[None, :], other=0.0,
+        Q
+        + batch * stride_qb
+        + head * stride_qh
+        + positions[:, None] * stride_qn
+        + dims[None, :] * stride_qd,
+        mask=qmask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     null_key = tl.load(
         NULL_KEY + head * stride_nkh + dims * stride_nkd,
-        mask=dmask, other=0.0,
+        mask=dmask,
+        other=0.0,
     ).to(tl.float32)
     null_score = tl.sum(query * null_key[None, :], axis=1) * scale
     null_score += tl.load(LOG_VALID_COUNT + positions, mask=qmask, other=0.0)
     null_score += tl.load(NULL_BIAS + head)
-    running_max = tl.where(qmask, null_score, float('-inf'))
+    running_max = tl.where(qmask, null_score, float("-inf"))
     running_sum = tl.where(qmask, 1.0, 0.0)
     accumulator = tl.zeros([BLOCK_N, BLOCK_HD], tl.float32)
     for logical_index in range(J_ACTIVE):
@@ -584,26 +900,35 @@ def _fwd_v23_banded(
         source = positions - delta
         valid = qmask & (source >= 0) & (source < N)
         key = tl.load(
-            K + batch * stride_kb + kv_head * stride_kh
-            + source[:, None] * stride_kn + dims[None, :] * stride_kd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            K
+            + batch * stride_kb
+            + kv_head * stride_kh
+            + source[:, None] * stride_kn
+            + dims[None, :] * stride_kd,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         virtual_key = tl.load(
             SCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
-            mask=dmask, other=0.0,
+            mask=dmask,
+            other=0.0,
         ).to(tl.float32)
         score = tl.sum(query * (key + virtual_key[None, :]), axis=1) * scale
         score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
-        score = tl.where(valid, score, float('-inf'))
+        score = tl.where(valid, score, float("-inf"))
         merged_max = tl.maximum(running_max, score)
-        has_old = running_max > float('-inf')
+        has_old = running_max > float("-inf")
         safe_max = tl.where(has_old | valid, merged_max, 0.0)
         old_scale = tl.where(has_old, tl.exp2((running_max - safe_max) * _LOG2E), 0.0)
         new_weight = tl.where(valid, tl.exp2((score - safe_max) * _LOG2E), 0.0)
         value = tl.load(
-            V + batch * stride_vb + kv_head * stride_vh
-            + source[:, None] * stride_vn + dims[None, :] * stride_vd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            V
+            + batch * stride_vb
+            + kv_head * stride_vh
+            + source[:, None] * stride_vn
+            + dims[None, :] * stride_vd,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         accumulator = accumulator * old_scale[:, None] + new_weight[:, None] * value
         running_sum = running_sum * old_scale + new_weight
@@ -613,37 +938,83 @@ def _fwd_v23_banded(
     lse = tl.where(
         running_sum > 0.0,
         running_max + tl.log2(running_sum) * (1.0 / _LOG2E),
-        float('-inf'),
+        float("-inf"),
     )
     tl.store(
-        OUT + batch * stride_ob + head * stride_oh
-        + positions[:, None] * stride_on + dims[None, :] * stride_od,
-        output, mask=qmask[:, None] & dmask[None, :],
+        OUT
+        + batch * stride_ob
+        + head * stride_oh
+        + positions[:, None] * stride_on
+        + dims[None, :] * stride_od,
+        output,
+        mask=qmask[:, None] & dmask[None, :],
     )
     tl.store(
         LSE + batch * stride_lb + head * stride_lh + positions * stride_ln,
-        lse, mask=qmask,
+        lse,
+        mask=qmask,
     )
 
 
 @triton.jit
 def _bwd_dq_v23_banded(
-    Q, K, V, POS_BIAS, SCALE_EMBED, NULL_KEY, NULL_BIAS, DO, LSE, DELTA,
-    DQ, DNULL_KEY, DNULL_BIAS, OFFSETS, LOG_VALID_COUNT,
-    stride_qb, stride_qh, stride_qn, stride_qd,
-    stride_kb, stride_kh, stride_kn, stride_kd,
-    stride_vb, stride_vh, stride_vn, stride_vd,
-    stride_dob, stride_doh, stride_don, stride_dod,
-    stride_lb, stride_lh, stride_ln,
-    stride_db, stride_dh, stride_dn,
-    stride_dqb, stride_dqh, stride_dqn, stride_dqd,
-    stride_pbi, stride_pbh,
-    stride_sei, stride_sed,
-    stride_nkh, stride_nkd,
-    BATCH: tl.constexpr, H: tl.constexpr, N, HD: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
-    J_ACTIVE: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
-    QUERY_START: tl.constexpr, QUERY_END: tl.constexpr,
+    Q,
+    K,
+    V,
+    POS_BIAS,
+    SCALE_EMBED,
+    NULL_KEY,
+    NULL_BIAS,
+    DO,
+    LSE,
+    DELTA,
+    DQ,
+    DNULL_KEY,
+    DNULL_BIAS,
+    OFFSETS,
+    LOG_VALID_COUNT,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_dob,
+    stride_doh,
+    stride_don,
+    stride_dod,
+    stride_lb,
+    stride_lh,
+    stride_ln,
+    stride_db,
+    stride_dh,
+    stride_dn,
+    stride_dqb,
+    stride_dqh,
+    stride_dqn,
+    stride_dqd,
+    stride_pbi,
+    stride_pbh,
+    stride_sei,
+    stride_sed,
+    stride_nkh,
+    stride_nkd,
+    BATCH: tl.constexpr,
+    H: tl.constexpr,
+    N,
+    HD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    J_ACTIVE: tl.constexpr,
+    KV_HEAD_GROUP_SIZE: tl.constexpr,
+    QUERY_START: tl.constexpr,
+    QUERY_END: tl.constexpr,
     GRAD_BLOCKS: tl.constexpr,
     GRAD_BLOCK_OFFSET: tl.constexpr,
 ):
@@ -658,29 +1029,40 @@ def _bwd_dq_v23_banded(
     dmask = dims < HD
     scale = 1.0 / tl.sqrt(HD * 1.0)
     query = tl.load(
-        Q + batch * stride_qb + head * stride_qh
-        + positions[:, None] * stride_qn + dims[None, :] * stride_qd,
-        mask=qmask[:, None] & dmask[None, :], other=0.0,
+        Q
+        + batch * stride_qb
+        + head * stride_qh
+        + positions[:, None] * stride_qn
+        + dims[None, :] * stride_qd,
+        mask=qmask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     dout = tl.load(
-        DO + batch * stride_dob + head * stride_doh
-        + positions[:, None] * stride_don + dims[None, :] * stride_dod,
-        mask=qmask[:, None] & dmask[None, :], other=0.0,
+        DO
+        + batch * stride_dob
+        + head * stride_doh
+        + positions[:, None] * stride_don
+        + dims[None, :] * stride_dod,
+        mask=qmask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     lse = tl.load(
         LSE + batch * stride_lb + head * stride_lh + positions * stride_ln,
-        mask=qmask, other=float('-inf'),
+        mask=qmask,
+        other=float("-inf"),
     ).to(tl.float32)
     null_key = tl.load(
         NULL_KEY + head * stride_nkh + dims * stride_nkd,
-        mask=dmask, other=0.0,
+        mask=dmask,
+        other=0.0,
     ).to(tl.float32)
     null_score = tl.sum(query * null_key[None, :], axis=1) * scale
     null_score += tl.load(LOG_VALID_COUNT + positions, mask=qmask, other=0.0)
     null_score += tl.load(NULL_BIAS + head)
     null_probability = tl.where(
-        qmask & (lse > float('-inf')),
-        tl.exp2((null_score - lse) * _LOG2E), 0.0,
+        qmask & (lse > float("-inf")),
+        tl.exp2((null_score - lse) * _LOG2E),
+        0.0,
     )
     probability_key = null_probability[:, None] * null_key[None, :]
     response_key = tl.zeros([BLOCK_N, BLOCK_HD], tl.float32)
@@ -690,25 +1072,35 @@ def _bwd_dq_v23_banded(
         source = positions - offset
         valid = qmask & (source >= 0) & (source < N)
         key = tl.load(
-            K + batch * stride_kb + kv_head * stride_kh
-            + source[:, None] * stride_kn + dims[None, :] * stride_kd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            K
+            + batch * stride_kb
+            + kv_head * stride_kh
+            + source[:, None] * stride_kn
+            + dims[None, :] * stride_kd,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         value = tl.load(
-            V + batch * stride_vb + kv_head * stride_vh
-            + source[:, None] * stride_vn + dims[None, :] * stride_vd,
-            mask=valid[:, None] & dmask[None, :], other=0.0,
+            V
+            + batch * stride_vb
+            + kv_head * stride_vh
+            + source[:, None] * stride_vn
+            + dims[None, :] * stride_vd,
+            mask=valid[:, None] & dmask[None, :],
+            other=0.0,
         ).to(tl.float32)
         virtual_key = tl.load(
             SCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
-            mask=dmask, other=0.0,
+            mask=dmask,
+            other=0.0,
         ).to(tl.float32)
         score = tl.sum(query * (key + virtual_key[None, :]), axis=1) * scale
         score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
-        score = tl.where(valid, score, float('-inf'))
+        score = tl.where(valid, score, float("-inf"))
         probability = tl.where(
-            valid & (lse > float('-inf')),
-            tl.exp2((score - lse) * _LOG2E), 0.0,
+            valid & (lse > float("-inf")),
+            tl.exp2((score - lse) * _LOG2E),
+            0.0,
         )
         response = tl.sum(dout * value, axis=1)
         effective_key = key + virtual_key[None, :]
@@ -729,37 +1121,85 @@ def _bwd_dq_v23_banded(
     )
     tl.store(
         DELTA + batch * stride_db + head * stride_dh + positions * stride_dn,
-        delta_row, mask=qmask,
+        delta_row,
+        mask=qmask,
     )
     tl.store(
-        DQ + batch * stride_dqb + head * stride_dqh
-        + positions[:, None] * stride_dqn + dims[None, :] * stride_dqd,
-        dq.to(tl.bfloat16), mask=qmask[:, None] & dmask[None, :],
+        DQ
+        + batch * stride_dqb
+        + head * stride_dqh
+        + positions[:, None] * stride_dqn
+        + dims[None, :] * stride_dqd,
+        dq.to(tl.bfloat16),
+        mask=qmask[:, None] & dmask[None, :],
     )
 
 
 @triton.jit
 def _bwd_dkdv_v23_banded(
-    Q, K, V, POS_BIAS, SCALE_EMBED, DO, LSE, DELTA,
-    DK, DV, DPOS_BIAS, DSCALE_EMBED, OFFSETS,
-    stride_qb, stride_qh, stride_qn, stride_qd,
-    stride_kb, stride_kh, stride_kn, stride_kd,
-    stride_vb, stride_vh, stride_vn, stride_vd,
-    stride_dob, stride_doh, stride_don, stride_dod,
-    stride_lb, stride_lh, stride_ln,
-    stride_db, stride_dh, stride_dn,
-    stride_dkb, stride_dkh, stride_dkn, stride_dkd,
-    stride_dvb, stride_dvh, stride_dvn, stride_dvd,
-    stride_pbi, stride_pbh,
-    stride_sei, stride_sed,
-    BATCH: tl.constexpr, H: tl.constexpr, N, HD: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_HD: tl.constexpr,
-    J_ACTIVE: tl.constexpr, KV_HEAD_GROUP_SIZE: tl.constexpr,
-    QUERY_START: tl.constexpr, SOURCE_START: tl.constexpr,
+    Q,
+    K,
+    V,
+    POS_BIAS,
+    SCALE_EMBED,
+    DO,
+    LSE,
+    DELTA,
+    DK,
+    DV,
+    DPOS_BIAS,
+    DSCALE_EMBED,
+    OFFSETS,
+    stride_qb,
+    stride_qh,
+    stride_qn,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_dob,
+    stride_doh,
+    stride_don,
+    stride_dod,
+    stride_lb,
+    stride_lh,
+    stride_ln,
+    stride_db,
+    stride_dh,
+    stride_dn,
+    stride_dkb,
+    stride_dkh,
+    stride_dkn,
+    stride_dkd,
+    stride_dvb,
+    stride_dvh,
+    stride_dvn,
+    stride_dvd,
+    stride_pbi,
+    stride_pbh,
+    stride_sei,
+    stride_sed,
+    BATCH: tl.constexpr,
+    H: tl.constexpr,
+    N,
+    HD: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    J_ACTIVE: tl.constexpr,
+    KV_HEAD_GROUP_SIZE: tl.constexpr,
+    QUERY_START: tl.constexpr,
+    SOURCE_START: tl.constexpr,
     SOURCE_END: tl.constexpr,
     GRAD_BLOCKS: tl.constexpr,
-    GRAD_BLOCK_OFFSET: tl.constexpr, GRAD_J: tl.constexpr,
-    COMPACT_PARTIALS: tl.constexpr = False, GRAD_ENTRIES: tl.constexpr = 0,
+    GRAD_BLOCK_OFFSET: tl.constexpr,
+    GRAD_J: tl.constexpr,
+    COMPACT_PARTIALS: tl.constexpr = False,
+    GRAD_ENTRIES: tl.constexpr = 0,
 ):
     bhkv = tl.program_id(0)
     block = tl.program_id(1)
@@ -773,14 +1213,22 @@ def _bwd_dkdv_v23_banded(
     dmask = dims < HD
     scale = 1.0 / tl.sqrt(HD * 1.0)
     key = tl.load(
-        K + batch * stride_kb + kv_head * stride_kh
-        + source[:, None] * stride_kn + dims[None, :] * stride_kd,
-        mask=smask[:, None] & dmask[None, :], other=0.0,
+        K
+        + batch * stride_kb
+        + kv_head * stride_kh
+        + source[:, None] * stride_kn
+        + dims[None, :] * stride_kd,
+        mask=smask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     value = tl.load(
-        V + batch * stride_vb + kv_head * stride_vh
-        + source[:, None] * stride_vn + dims[None, :] * stride_vd,
-        mask=smask[:, None] & dmask[None, :], other=0.0,
+        V
+        + batch * stride_vb
+        + kv_head * stride_vh
+        + source[:, None] * stride_vn
+        + dims[None, :] * stride_vd,
+        mask=smask[:, None] & dmask[None, :],
+        other=0.0,
     ).to(tl.float32)
     dk = tl.zeros([BLOCK_N, BLOCK_HD], tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_HD], tl.float32)
@@ -791,33 +1239,45 @@ def _bwd_dkdv_v23_banded(
             positions = source + offset
             valid = smask & (positions >= QUERY_START) & (positions < N)
             query = tl.load(
-                Q + batch * stride_qb + head * stride_qh
-                + positions[:, None] * stride_qn + dims[None, :] * stride_qd,
-                mask=valid[:, None] & dmask[None, :], other=0.0,
+                Q
+                + batch * stride_qb
+                + head * stride_qh
+                + positions[:, None] * stride_qn
+                + dims[None, :] * stride_qd,
+                mask=valid[:, None] & dmask[None, :],
+                other=0.0,
             ).to(tl.float32)
             dout = tl.load(
-                DO + batch * stride_dob + head * stride_doh
-                + positions[:, None] * stride_don + dims[None, :] * stride_dod,
-                mask=valid[:, None] & dmask[None, :], other=0.0,
+                DO
+                + batch * stride_dob
+                + head * stride_doh
+                + positions[:, None] * stride_don
+                + dims[None, :] * stride_dod,
+                mask=valid[:, None] & dmask[None, :],
+                other=0.0,
             ).to(tl.float32)
             lse = tl.load(
                 LSE + batch * stride_lb + head * stride_lh + positions * stride_ln,
-                mask=valid, other=float('-inf'),
+                mask=valid,
+                other=float("-inf"),
             ).to(tl.float32)
             delta_row = tl.load(
                 DELTA + batch * stride_db + head * stride_dh + positions * stride_dn,
-                mask=valid, other=0.0,
+                mask=valid,
+                other=0.0,
             ).to(tl.float32)
             virtual_key = tl.load(
                 SCALE_EMBED + logical_index * stride_sei + dims * stride_sed,
-                mask=dmask, other=0.0,
+                mask=dmask,
+                other=0.0,
             ).to(tl.float32)
             score = tl.sum(query * (key + virtual_key[None, :]), axis=1) * scale
             score += tl.load(POS_BIAS + logical_index * stride_pbi + head * stride_pbh)
-            score = tl.where(valid, score, float('-inf'))
+            score = tl.where(valid, score, float("-inf"))
             probability = tl.where(
-                valid & (lse > float('-inf')),
-                tl.exp2((score - lse) * _LOG2E), 0.0,
+                valid & (lse > float("-inf")),
+                tl.exp2((score - lse) * _LOG2E),
+                0.0,
             )
             dscore = probability * (tl.sum(dout * value, axis=1) - delta_row)
             dk += dscore[:, None] * query * scale
@@ -825,13 +1285,14 @@ def _bwd_dkdv_v23_banded(
             if COMPACT_PARTIALS:
                 partial = (
                     (batch * H + head) * GRAD_ENTRIES
-                    + GRAD_BLOCK_OFFSET + block * J_ACTIVE + logical_index
+                    + GRAD_BLOCK_OFFSET
+                    + block * J_ACTIVE
+                    + logical_index
                 )
             else:
                 partial = (
-                    ((batch * H + head) * GRAD_BLOCKS + GRAD_BLOCK_OFFSET + block)
-                    * GRAD_J + logical_index
-                )
+                    (batch * H + head) * GRAD_BLOCKS + GRAD_BLOCK_OFFSET + block
+                ) * GRAD_J + logical_index
             tl.store(
                 DPOS_BIAS + partial,
                 tl.sum(tl.where(valid, dscore, 0.0)),
@@ -842,23 +1303,38 @@ def _bwd_dkdv_v23_banded(
                 mask=dmask,
             )
     tl.store(
-        DK + batch * stride_dkb + kv_head * stride_dkh
-        + source[:, None] * stride_dkn + dims[None, :] * stride_dkd,
-        dk.to(tl.bfloat16), mask=smask[:, None] & dmask[None, :],
+        DK
+        + batch * stride_dkb
+        + kv_head * stride_dkh
+        + source[:, None] * stride_dkn
+        + dims[None, :] * stride_dkd,
+        dk.to(tl.bfloat16),
+        mask=smask[:, None] & dmask[None, :],
     )
     tl.store(
-        DV + batch * stride_dvb + kv_head * stride_dvh
-        + source[:, None] * stride_dvn + dims[None, :] * stride_dvd,
-        dv.to(tl.bfloat16), mask=smask[:, None] & dmask[None, :],
+        DV
+        + batch * stride_dvb
+        + kv_head * stride_dvh
+        + source[:, None] * stride_dvn
+        + dims[None, :] * stride_dvd,
+        dv.to(tl.bfloat16),
+        mask=smask[:, None] & dmask[None, :],
     )
 
 
 @triton.jit
 def _compact_scale_reduce_v23(
-    PARTIALS, OUT,
-    B: tl.constexpr, H: tl.constexpr, D: tl.constexpr, J: tl.constexpr,
-    ENTRIES: tl.constexpr, ACTIVES: tl.constexpr, BLOCKS: tl.constexpr,
-    STARTS: tl.constexpr, REDUCE_BLOCK: tl.constexpr,
+    PARTIALS,
+    OUT,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    J: tl.constexpr,
+    ENTRIES: tl.constexpr,
+    ACTIVES: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    STARTS: tl.constexpr,
+    REDUCE_BLOCK: tl.constexpr,
 ):
     logical_index = tl.program_id(0)
     rows, dims = tl.arange(0, REDUCE_BLOCK), tl.arange(0, D)
@@ -872,22 +1348,27 @@ def _compact_scale_reduce_v23(
                 row = base * REDUCE_BLOCK + rows
                 batch_head = row // blocks
                 block = row % blocks
-                index = (
-                    batch_head * ENTRIES + start + block * active + logical_index
-                )
+                index = batch_head * ENTRIES + start + block * active + logical_index
                 accumulator += tl.load(
                     PARTIALS + index[:, None] * D + dims[None, :],
-                    mask=row[:, None] < B * H * blocks, other=0.0,
+                    mask=row[:, None] < B * H * blocks,
+                    other=0.0,
                 )
     tl.store(OUT + logical_index * D + dims, tl.sum(accumulator, axis=0))
 
 
 @triton.jit
 def _compact_bias_reduce_v23(
-    PARTIALS, OUT,
-    B: tl.constexpr, H: tl.constexpr, J: tl.constexpr,
-    ENTRIES: tl.constexpr, ACTIVES: tl.constexpr, BLOCKS: tl.constexpr,
-    STARTS: tl.constexpr, REDUCE_BLOCK: tl.constexpr,
+    PARTIALS,
+    OUT,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    J: tl.constexpr,
+    ENTRIES: tl.constexpr,
+    ACTIVES: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    STARTS: tl.constexpr,
+    REDUCE_BLOCK: tl.constexpr,
 ):
     head, logical_index = tl.program_id(0), tl.program_id(1)
     rows = tl.arange(0, REDUCE_BLOCK)
@@ -903,7 +1384,9 @@ def _compact_bias_reduce_v23(
                 block = row % blocks
                 index = (
                     (batch * H + head) * ENTRIES
-                    + start + block * active + logical_index
+                    + start
+                    + block * active
+                    + logical_index
                 )
                 accumulator += tl.load(
                     PARTIALS + index, mask=row < B * blocks, other=0.0
@@ -915,8 +1398,14 @@ def _reduce_compact_shared_gradients_v23(
     partial_pos_bias: torch.Tensor,
     partial_scale_embed: torch.Tensor,
     *,
-    batch: int, heads: int, j_val: int, head_dim: int, entries: int,
-    actives: tuple[int, ...], blocks: tuple[int, ...], starts: tuple[int, ...],
+    batch: int,
+    heads: int,
+    j_val: int,
+    head_dim: int,
+    entries: int,
+    actives: tuple[int, ...],
+    blocks: tuple[int, ...],
+    starts: tuple[int, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dpos_bias = torch.empty(
         (j_val, heads), device=partial_pos_bias.device, dtype=torch.float32
@@ -925,15 +1414,30 @@ def _reduce_compact_shared_gradients_v23(
         (j_val, head_dim), device=partial_scale_embed.device, dtype=torch.float32
     )
     _compact_bias_reduce_v23[(heads, j_val)](
-        partial_pos_bias, dpos_bias,
-        B=batch, H=heads, J=j_val, ENTRIES=entries,
-        ACTIVES=actives, BLOCKS=blocks, STARTS=starts, REDUCE_BLOCK=256,
+        partial_pos_bias,
+        dpos_bias,
+        B=batch,
+        H=heads,
+        J=j_val,
+        ENTRIES=entries,
+        ACTIVES=actives,
+        BLOCKS=blocks,
+        STARTS=starts,
+        REDUCE_BLOCK=256,
         num_warps=4,
     )
     _compact_scale_reduce_v23[(j_val,)](
-        partial_scale_embed, dscale_embed,
-        B=batch, H=heads, D=head_dim, J=j_val, ENTRIES=entries,
-        ACTIVES=actives, BLOCKS=blocks, STARTS=starts, REDUCE_BLOCK=64,
+        partial_scale_embed,
+        dscale_embed,
+        B=batch,
+        H=heads,
+        D=head_dim,
+        J=j_val,
+        ENTRIES=entries,
+        ACTIVES=actives,
+        BLOCKS=blocks,
+        STARTS=starts,
+        REDUCE_BLOCK=64,
         num_warps=4,
     )
     return dpos_bias, dscale_embed
@@ -960,7 +1464,9 @@ class _DSQGV23Fn(torch.autograd.Function):
     ):
         batch, heads, seq_len, head_dim = q.shape
         if v.shape != k.shape:
-            raise ValueError(f"k/v shape mismatch: k={tuple(k.shape)} v={tuple(v.shape)}")
+            raise ValueError(
+                f"k/v shape mismatch: k={tuple(k.shape)} v={tuple(v.shape)}"
+            )
         if k.shape[0] != batch or k.shape[2:] != (seq_len, head_dim):
             raise ValueError(
                 "native GQA requires q/k/v to share batch, sequence, and head dimensions"
@@ -970,7 +1476,11 @@ class _DSQGV23Fn(torch.autograd.Function):
             raise ValueError(
                 f"query heads H={heads} must be divisible by KV heads H_KV={kv_heads}"
             )
-        if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+        if (
+            q.dtype != torch.bfloat16
+            or k.dtype != torch.bfloat16
+            or v.dtype != torch.bfloat16
+        ):
             raise TypeError("Triton DSQG V23 expects BF16 q/k/v tensors")
         if not q.is_cuda:
             raise RuntimeError("Triton DSQG V23 requires CUDA tensors")
@@ -1000,17 +1510,17 @@ class _DSQGV23Fn(torch.autograd.Function):
         use_bands = bool(support_band_execution and offsets_host is not None)
         offsets_tuple = (
             tuple(int(value) for value in offsets_host)
-            if offsets_host is not None else ()
+            if offsets_host is not None
+            else ()
         )
         query_bands, source_bands = (
-            _support_band_ranges(
-                offsets_tuple, seq_len, query_start, source_end
-            )
-            if use_bands else ((), ())
+            _support_band_ranges(offsets_tuple, seq_len, query_start, source_end)
+            if use_bands
+            else ((), ())
         )
         output = torch.zeros_like(q)
         lse = torch.full(
-            (batch, heads, seq_len), float('-inf'), device=q.device, dtype=torch.float32
+            (batch, heads, seq_len), float("-inf"), device=q.device, dtype=torch.float32
         )
         if use_bands:
             for band_start, band_end, active in query_bands:
@@ -1020,16 +1530,37 @@ class _DSQGV23Fn(torch.autograd.Function):
                     triton.cdiv(band_end - band_start, block_n),
                 )
                 _fwd_v23_banded[grid](
-                    q, k, v, pos_bias, scale_embed, null_key, null_bias,
-                    output, lse, offsets_dev, log_valid_count,
-                    *q.stride(), *k.stride(), *v.stride(),
-                    *output.stride(), *lse.stride(),
-                    *pos_bias.stride(), *scale_embed.stride(), *null_key.stride(),
-                    BATCH=batch, H=heads, N=seq_len, HD=head_dim,
-                    BLOCK_N=block_n, BLOCK_HD=block_hd, J_ACTIVE=active,
+                    q,
+                    k,
+                    v,
+                    pos_bias,
+                    scale_embed,
+                    null_key,
+                    null_bias,
+                    output,
+                    lse,
+                    offsets_dev,
+                    log_valid_count,
+                    *q.stride(),
+                    *k.stride(),
+                    *v.stride(),
+                    *output.stride(),
+                    *lse.stride(),
+                    *pos_bias.stride(),
+                    *scale_embed.stride(),
+                    *null_key.stride(),
+                    BATCH=batch,
+                    H=heads,
+                    N=seq_len,
+                    HD=head_dim,
+                    BLOCK_N=block_n,
+                    BLOCK_HD=block_hd,
+                    J_ACTIVE=active,
                     KV_HEAD_GROUP_SIZE=kv_head_group_size,
-                    QUERY_START=band_start, QUERY_END=band_end,
-                    num_warps=warps, num_stages=stages,
+                    QUERY_START=band_start,
+                    QUERY_END=band_end,
+                    num_warps=warps,
+                    num_stages=stages,
                 )
         elif query_start < seq_len:
             grid = lambda meta: (
@@ -1037,20 +1568,46 @@ class _DSQGV23Fn(torch.autograd.Function):
                 triton.cdiv(seq_len - query_start, meta["BLOCK_N"]),
             )
             _fwd_v23_online[grid](
-                q, k, v, pos_bias, scale_embed, null_key, null_bias,
-                output, lse, offsets_dev, log_valid_count,
-                *q.stride(), *k.stride(), *v.stride(),
-                *output.stride(), *lse.stride(),
-                *pos_bias.stride(), *scale_embed.stride(), *null_key.stride(),
-                BATCH=batch, H=heads, N=seq_len, HD=head_dim,
-                BLOCK_HD=block_hd, J_VAL=j_val,
+                q,
+                k,
+                v,
+                pos_bias,
+                scale_embed,
+                null_key,
+                null_bias,
+                output,
+                lse,
+                offsets_dev,
+                log_valid_count,
+                *q.stride(),
+                *k.stride(),
+                *v.stride(),
+                *output.stride(),
+                *lse.stride(),
+                *pos_bias.stride(),
+                *scale_embed.stride(),
+                *null_key.stride(),
+                BATCH=batch,
+                H=heads,
+                N=seq_len,
+                HD=head_dim,
+                BLOCK_HD=block_hd,
+                J_VAL=j_val,
                 KV_HEAD_GROUP_SIZE=kv_head_group_size,
                 QUERY_START=query_start,
             )
 
         ctx.save_for_backward(
-            q, k, v, pos_bias, scale_embed, null_key, null_bias, lse,
-            offsets_dev, log_valid_count,
+            q,
+            k,
+            v,
+            pos_bias,
+            scale_embed,
+            null_key,
+            null_bias,
+            lse,
+            offsets_dev,
+            log_valid_count,
         )
         ctx.block_hd = block_hd
         ctx.j_val = int(j_val)
@@ -1066,8 +1623,16 @@ class _DSQGV23Fn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         (
-            q, k, v, pos_bias, scale_embed, null_key, null_bias, lse,
-            offsets_dev, log_valid_count,
+            q,
+            k,
+            v,
+            pos_bias,
+            scale_embed,
+            null_key,
+            null_bias,
+            lse,
+            offsets_dev,
+            log_valid_count,
         ) = ctx.saved_tensors
         batch, heads, seq_len, head_dim = q.shape
         dout = dout.contiguous()
@@ -1089,7 +1654,9 @@ class _DSQGV23Fn(torch.autograd.Function):
                     for start, stop, active in ctx.query_bands
                 )
                 partial_null_key = torch.zeros(
-                    (batch, heads, query_blocks, head_dim), device=q.device, dtype=torch.float32
+                    (batch, heads, query_blocks, head_dim),
+                    device=q.device,
+                    dtype=torch.float32,
                 )
                 partial_null_bias = torch.zeros(
                     (batch, heads, query_blocks), device=q.device, dtype=torch.float32
@@ -1102,18 +1669,45 @@ class _DSQGV23Fn(torch.autograd.Function):
                         triton.cdiv(band_end - band_start, block_n),
                     )
                     _bwd_dq_v23_banded[grid](
-                        q, k, v, pos_bias, scale_embed, null_key, null_bias,
-                        dout, lse, delta, dq, partial_null_key, partial_null_bias, offsets_dev,
+                        q,
+                        k,
+                        v,
+                        pos_bias,
+                        scale_embed,
+                        null_key,
+                        null_bias,
+                        dout,
+                        lse,
+                        delta,
+                        dq,
+                        partial_null_key,
+                        partial_null_bias,
+                        offsets_dev,
                         log_valid_count,
-                        *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
-                        *lse.stride(), *delta.stride(), *dq.stride(),
-                        *pos_bias.stride(), *scale_embed.stride(), *null_key.stride(),
-                        BATCH=batch, H=heads, N=seq_len, HD=head_dim,
-                        BLOCK_N=block_n, BLOCK_HD=ctx.block_hd, J_ACTIVE=active,
+                        *q.stride(),
+                        *k.stride(),
+                        *v.stride(),
+                        *dout.stride(),
+                        *lse.stride(),
+                        *delta.stride(),
+                        *dq.stride(),
+                        *pos_bias.stride(),
+                        *scale_embed.stride(),
+                        *null_key.stride(),
+                        BATCH=batch,
+                        H=heads,
+                        N=seq_len,
+                        HD=head_dim,
+                        BLOCK_N=block_n,
+                        BLOCK_HD=ctx.block_hd,
+                        J_ACTIVE=active,
                         KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
-                        QUERY_START=band_start, QUERY_END=band_end,
-                        GRAD_BLOCKS=query_blocks, GRAD_BLOCK_OFFSET=query_block_offset,
-                        num_warps=warps, num_stages=stages,
+                        QUERY_START=band_start,
+                        QUERY_END=band_end,
+                        GRAD_BLOCKS=query_blocks,
+                        GRAD_BLOCK_OFFSET=query_block_offset,
+                        num_warps=warps,
+                        num_stages=stages,
                     )
                     query_block_offset += grid[1]
                 dnull_key = partial_null_key.sum(dim=(0, 2))
@@ -1121,9 +1715,13 @@ class _DSQGV23Fn(torch.autograd.Function):
             else:
                 # Autotuning may choose any tile: reserve and zero enough slots
                 # for the smallest tile, and reduce untouched slots as zeros.
-                query_blocks = triton.cdiv(seq_len - ctx.query_start, _DSQG_MIN_AUTOTUNE_BLOCK_N)
+                query_blocks = triton.cdiv(
+                    seq_len - ctx.query_start, _DSQG_MIN_AUTOTUNE_BLOCK_N
+                )
                 partial_null_key = torch.zeros(
-                    (batch, heads, query_blocks, head_dim), device=q.device, dtype=torch.float32
+                    (batch, heads, query_blocks, head_dim),
+                    device=q.device,
+                    dtype=torch.float32,
                 )
                 partial_null_bias = torch.zeros(
                     (batch, heads, query_blocks), device=q.device, dtype=torch.float32
@@ -1133,14 +1731,37 @@ class _DSQGV23Fn(torch.autograd.Function):
                     triton.cdiv(seq_len - ctx.query_start, meta["BLOCK_N"]),
                 )
                 _bwd_dq_v23[query_grid](
-                    q, k, v, pos_bias, scale_embed, null_key, null_bias,
-                    dout, lse, delta, dq, partial_null_key, partial_null_bias, offsets_dev,
+                    q,
+                    k,
+                    v,
+                    pos_bias,
+                    scale_embed,
+                    null_key,
+                    null_bias,
+                    dout,
+                    lse,
+                    delta,
+                    dq,
+                    partial_null_key,
+                    partial_null_bias,
+                    offsets_dev,
                     log_valid_count,
-                    *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
-                    *lse.stride(), *delta.stride(), *dq.stride(),
-                    *pos_bias.stride(), *scale_embed.stride(), *null_key.stride(),
-                    BATCH=batch, H=heads, N=seq_len, HD=head_dim,
-                    BLOCK_HD=ctx.block_hd, J_VAL=ctx.j_val,
+                    *q.stride(),
+                    *k.stride(),
+                    *v.stride(),
+                    *dout.stride(),
+                    *lse.stride(),
+                    *delta.stride(),
+                    *dq.stride(),
+                    *pos_bias.stride(),
+                    *scale_embed.stride(),
+                    *null_key.stride(),
+                    BATCH=batch,
+                    H=heads,
+                    N=seq_len,
+                    HD=head_dim,
+                    BLOCK_HD=ctx.block_hd,
+                    J_VAL=ctx.j_val,
                     KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
                     QUERY_START=ctx.query_start,
                     GRAD_BLOCKS=query_blocks,
@@ -1178,16 +1799,19 @@ class _DSQGV23Fn(torch.autograd.Function):
                     )
                     partial_scale_embed = torch.empty(
                         (batch, heads, entries, head_dim),
-                        device=q.device, dtype=torch.float32,
+                        device=q.device,
+                        dtype=torch.float32,
                     )
                 else:
                     partial_pos_bias = torch.zeros(
                         (batch, heads, source_blocks, ctx.j_val),
-                        device=q.device, dtype=torch.float32,
+                        device=q.device,
+                        dtype=torch.float32,
                     )
                     partial_scale_embed = torch.zeros(
                         (batch, heads, source_blocks, ctx.j_val, head_dim),
-                        device=q.device, dtype=torch.float32,
+                        device=q.device,
+                        dtype=torch.float32,
                     )
                 source_block_offset = 0
                 for source_start, source_stop, active in ctx.source_bands:
@@ -1197,66 +1821,140 @@ class _DSQGV23Fn(torch.autograd.Function):
                         triton.cdiv(source_stop - source_start, block_n),
                     )
                     _bwd_dkdv_v23_banded[grid](
-                        q, k, v, pos_bias, scale_embed, dout, lse, delta,
-                        dk_accum, dv_accum, partial_pos_bias, partial_scale_embed, offsets_dev,
-                        *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
-                        *lse.stride(), *delta.stride(),
-                        *dk_accum.stride(), *dv_accum.stride(),
-                        *pos_bias.stride(), *scale_embed.stride(),
-                        BATCH=batch, H=heads, N=seq_len, HD=head_dim,
-                        BLOCK_N=block_n, BLOCK_HD=ctx.block_hd, J_ACTIVE=active,
+                        q,
+                        k,
+                        v,
+                        pos_bias,
+                        scale_embed,
+                        dout,
+                        lse,
+                        delta,
+                        dk_accum,
+                        dv_accum,
+                        partial_pos_bias,
+                        partial_scale_embed,
+                        offsets_dev,
+                        *q.stride(),
+                        *k.stride(),
+                        *v.stride(),
+                        *dout.stride(),
+                        *lse.stride(),
+                        *delta.stride(),
+                        *dk_accum.stride(),
+                        *dv_accum.stride(),
+                        *pos_bias.stride(),
+                        *scale_embed.stride(),
+                        BATCH=batch,
+                        H=heads,
+                        N=seq_len,
+                        HD=head_dim,
+                        BLOCK_N=block_n,
+                        BLOCK_HD=ctx.block_hd,
+                        J_ACTIVE=active,
                         KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
                         QUERY_START=ctx.query_start,
-                        SOURCE_START=source_start, SOURCE_END=source_stop,
-                        GRAD_BLOCKS=source_blocks, GRAD_BLOCK_OFFSET=source_block_offset,
-                        GRAD_J=ctx.j_val, COMPACT_PARTIALS=compact,
-                        GRAD_ENTRIES=entries, num_warps=warps, num_stages=stages,
+                        SOURCE_START=source_start,
+                        SOURCE_END=source_stop,
+                        GRAD_BLOCKS=source_blocks,
+                        GRAD_BLOCK_OFFSET=source_block_offset,
+                        GRAD_J=ctx.j_val,
+                        COMPACT_PARTIALS=compact,
+                        GRAD_ENTRIES=entries,
+                        num_warps=warps,
+                        num_stages=stages,
                     )
                     source_block_offset += grid[1] * active if compact else grid[1]
                 if compact:
                     dpos_bias, dscale_embed = _reduce_compact_shared_gradients_v23(
-                        partial_pos_bias, partial_scale_embed,
-                        batch=batch, heads=heads, j_val=ctx.j_val, head_dim=head_dim,
-                        entries=entries, actives=compact_actives, blocks=compact_blocks,
+                        partial_pos_bias,
+                        partial_scale_embed,
+                        batch=batch,
+                        heads=heads,
+                        j_val=ctx.j_val,
+                        head_dim=head_dim,
+                        entries=entries,
+                        actives=compact_actives,
+                        blocks=compact_blocks,
                         starts=compact_starts,
                     )
                 else:
-                    dpos_bias = partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
+                    dpos_bias = (
+                        partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
+                    )
                     dscale_embed = partial_scale_embed.sum(dim=(0, 1, 2))
             else:
                 source_blocks = triton.cdiv(ctx.source_end, _DSQG_MIN_AUTOTUNE_BLOCK_N)
                 partial_pos_bias = torch.zeros(
-                    (batch, heads, source_blocks, ctx.j_val), device=q.device, dtype=torch.float32
+                    (batch, heads, source_blocks, ctx.j_val),
+                    device=q.device,
+                    dtype=torch.float32,
                 )
                 partial_scale_embed = torch.zeros(
-                    (batch, heads, source_blocks, ctx.j_val, head_dim), device=q.device, dtype=torch.float32
+                    (batch, heads, source_blocks, ctx.j_val, head_dim),
+                    device=q.device,
+                    dtype=torch.float32,
                 )
                 kv_grid = lambda meta: (
                     batch * kv_heads,
                     triton.cdiv(ctx.source_end, meta["BLOCK_N"]),
                 )
                 _bwd_dkdv_v23[kv_grid](
-                    q, k, v, pos_bias, scale_embed, dout, lse, delta,
-                    dk_accum, dv_accum, partial_pos_bias, partial_scale_embed, offsets_dev,
-                    *q.stride(), *k.stride(), *v.stride(), *dout.stride(),
-                    *lse.stride(), *delta.stride(),
-                    *dk_accum.stride(), *dv_accum.stride(),
-                    *pos_bias.stride(), *scale_embed.stride(),
-                    BATCH=batch, H=heads, N=seq_len, HD=head_dim,
-                    BLOCK_HD=ctx.block_hd, J_VAL=ctx.j_val,
+                    q,
+                    k,
+                    v,
+                    pos_bias,
+                    scale_embed,
+                    dout,
+                    lse,
+                    delta,
+                    dk_accum,
+                    dv_accum,
+                    partial_pos_bias,
+                    partial_scale_embed,
+                    offsets_dev,
+                    *q.stride(),
+                    *k.stride(),
+                    *v.stride(),
+                    *dout.stride(),
+                    *lse.stride(),
+                    *delta.stride(),
+                    *dk_accum.stride(),
+                    *dv_accum.stride(),
+                    *pos_bias.stride(),
+                    *scale_embed.stride(),
+                    BATCH=batch,
+                    H=heads,
+                    N=seq_len,
+                    HD=head_dim,
+                    BLOCK_HD=ctx.block_hd,
+                    J_VAL=ctx.j_val,
                     KV_HEAD_GROUP_SIZE=ctx.kv_head_group_size,
-                    QUERY_START=ctx.query_start, SOURCE_END=ctx.source_end,
+                    QUERY_START=ctx.query_start,
+                    SOURCE_END=ctx.source_end,
                     GRAD_BLOCKS=source_blocks,
                 )
-                dpos_bias = partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
+                dpos_bias = (
+                    partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
+                )
                 dscale_embed = partial_scale_embed.sum(dim=(0, 1, 2))
 
         gradients = (
-            dq, dk_accum, dv_accum, dpos_bias, dscale_embed,
-            dnull_key.to(null_key.dtype), dnull_bias.to(null_bias.dtype),
-            None, None, None, None, None, None, None,
+            dq,
+            dk_accum,
+            dv_accum,
+            dpos_bias,
+            dscale_embed,
+            dnull_key.to(null_key.dtype),
+            dnull_bias.to(null_bias.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
-        return gradients[:ctx.input_count]
+        return gradients[: ctx.input_count]
 
 
 def _eager_dsqg_attention(
@@ -1310,11 +2008,10 @@ def _eager_dsqg_attention(
         selected_key = key_expanded[:, :, safe_source, :]
         selected_value = value_expanded[:, :, safe_source, :]
         score = (
-            q.float()
-            * (selected_key.float() + scale_embed[logical_index].float())
+            q.float() * (selected_key.float() + scale_embed[logical_index].float())
         ).sum(-1) * scale
         score = score + pos_bias[logical_index].float().reshape(1, query_heads, 1)
-        score = score.masked_fill(~valid.reshape(1, 1, seq_len), float('-inf'))
+        score = score.masked_fill(~valid.reshape(1, 1, seq_len), float("-inf"))
         score_columns.append(score)
         value_columns.append(selected_value.float())
         valid_columns.append(valid)
@@ -1345,10 +2042,14 @@ def _eager_dsqg_attention(
     live_rows = positions >= int(query_start)
     valid_mask = valid_mask & live_rows.reshape(1, 1, seq_len, 1)
     any_valid = valid_mask.any(-1, keepdim=True)
-    safe_scores = torch.where(valid_mask, scores, torch.full_like(scores, float('-inf')))
+    safe_scores = torch.where(
+        valid_mask, scores, torch.full_like(scores, float("-inf"))
+    )
     safe_scores = torch.where(any_valid, safe_scores, torch.zeros_like(safe_scores))
     probabilities = torch.softmax(safe_scores, dim=-1)
-    probabilities = torch.where(valid_mask, probabilities, torch.zeros_like(probabilities))
+    probabilities = torch.where(
+        valid_mask, probabilities, torch.zeros_like(probabilities)
+    )
     return (probabilities.unsqueeze(-1) * values).sum(-2).to(q.dtype)
 
 
@@ -1394,8 +2095,16 @@ def _dsqg_attention_v23_dispatch(
     if not use_triton:
         eager_offsets = offsets_host if offsets_host is not None else offsets_dev
         return _eager_dsqg_attention(
-            q, k, v, pos_bias, scale_embed, null_key, null_bias, eager_offsets,
-            log_valid_count, query_start=int(query_start),
+            q,
+            k,
+            v,
+            pos_bias,
+            scale_embed,
+            null_key,
+            null_bias,
+            eager_offsets,
+            log_valid_count,
+            query_start=int(query_start),
         )
 
     original_dtype = q.dtype
@@ -1514,9 +2223,7 @@ class DSQGAttentionV23(nn.Module):
             or pos_bias_residual_limit <= 0
         ):
             raise ValueError("pos_bias_residual_limit must be finite and positive")
-        crop_min = _strict_int(
-            "support_crop_min_offset", support_crop_min_offset
-        )
+        crop_min = _strict_int("support_crop_min_offset", support_crop_min_offset)
         if not isinstance(support_crop_projections, bool):
             raise TypeError("support_crop_projections must be bool")
         if not isinstance(support_band_execution, bool):
@@ -1612,9 +2319,7 @@ class DSQGAttentionV23(nn.Module):
         unbounded_slopes = maximum * torch.atanh(
             (initial_slopes / maximum).clamp_max(1.0 - 1e-6)
         )
-        self.pos_bias_log_slope = nn.Parameter(
-            _inverse_softplus(unbounded_slopes)
-        )
+        self.pos_bias_log_slope = nn.Parameter(_inverse_softplus(unbounded_slopes))
         self.pos_bias_residual = nn.Parameter(torch.zeros(self.j_val, heads))
         self.scale_embed = nn.Parameter(
             torch.randn(self.j_val, self.head_dim) * self.scale_embed_init_std
@@ -1675,9 +2380,7 @@ class DSQGAttentionV23(nn.Module):
         bounded = centered * radial_scale
         bounded = bounded - bounded.mean(dim=0, keepdim=True)
         peak = bounded.norm(dim=-1).amax()
-        common_scale = torch.clamp(
-            maximum / peak.clamp_min(1e-12), max=1.0
-        )
+        common_scale = torch.clamp(maximum / peak.clamp_min(1e-12), max=1.0)
         return bounded * common_scale
 
     @property
@@ -1767,9 +2470,13 @@ class DSQGAttentionV23(nn.Module):
                 query_start, seq_len, device=query.device, dtype=torch.long
             )
         else:
-            sample_ids = torch.linspace(
-                query_start, seq_len - 1, sample_count, device=query.device
-            ).round().to(torch.long)
+            sample_ids = (
+                torch.linspace(
+                    query_start, seq_len - 1, sample_count, device=query.device
+                )
+                .round()
+                .to(torch.long)
+            )
         sampled_query = query[:, :, sample_ids].float()
         scale = 1.0 / math.sqrt(float(head_dim))
         virtual_keys = self.centered_scale_embed
@@ -1783,8 +2490,7 @@ class DSQGAttentionV23(nn.Module):
             valid = source >= 0
             selected_key = key[:, :, source.clamp_min(0)].float()
             score = (
-                sampled_query
-                * (selected_key + virtual_keys[logical_index].float())
+                sampled_query * (selected_key + virtual_keys[logical_index].float())
             ).sum(-1) * scale
             score = score + positional_bias[logical_index].float().reshape(1, heads, 1)
             score_columns.append(
@@ -1792,8 +2498,7 @@ class DSQGAttentionV23(nn.Module):
             )
             valid_columns.append(valid)
         null_score = (
-            sampled_query
-            * null_key.float().reshape(1, heads, 1, head_dim)
+            sampled_query * null_key.float().reshape(1, heads, 1, head_dim)
         ).sum(-1) * scale
         null_score = (
             null_score
@@ -1885,7 +2590,8 @@ class DSQGAttentionV23(nn.Module):
                 suffix, weight[3 * dimension :], bias[3 * dimension :]
             )
             kv_prefix = F.linear(
-                prefix, weight[dimension : 3 * dimension],
+                prefix,
+                weight[dimension : 3 * dimension],
                 bias[dimension : 3 * dimension],
             )
             k_prefix, v_prefix = kv_prefix.split(dimension, dim=-1)
@@ -1931,6 +2637,4 @@ class DSQGAttentionV23(nn.Module):
             }
         output = output * self.bounded_if_gain.reshape(1, heads, 1, 1)
         flattened = output.permute(0, 2, 1, 3).reshape(batch, seq_len, dimension)
-        return self.dropout(
-            self.out_proj(flattened * torch.sigmoid(content_gate))
-        )
+        return self.dropout(self.out_proj(flattened * torch.sigmoid(content_gate)))

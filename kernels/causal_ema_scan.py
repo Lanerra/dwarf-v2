@@ -60,7 +60,6 @@ def inverse_bounded_ema_factor(ema_factor: float) -> float:
 
 
 if _TRITON_AVAILABLE:
-
     _EMA_AUTOTUNE_CONFIGS = [
         triton.Config({"BD": 32}, num_warps=2, num_stages=1),
         triton.Config({"BD": 32}, num_warps=4, num_stages=1),
@@ -107,9 +106,7 @@ if _TRITON_AVAILABLE:
                 other=0.0,
             ).to(tl.float32)
             tl.store(Y + batch * syb + token * syn + dims * syd, s0, mask=dmask)
-            tl.store(
-                Y + batch * syb + token * syn + syk + dims * syd, s1, mask=dmask
-            )
+            tl.store(Y + batch * syb + token * syn + syk + dims * syd, s1, mask=dmask)
             tl.store(
                 Y + batch * syb + token * syn + 2 * syk + dims * syd,
                 s2,
@@ -227,7 +224,10 @@ if _TRITON_AVAILABLE:
 
     @triton.jit
     def _ema3_reduce_factor_gradients(
-        PARTIALS, DA, TOTAL: tl.constexpr, BLOCK: tl.constexpr,
+        PARTIALS,
+        DA,
+        TOTAL: tl.constexpr,
+        BLOCK: tl.constexpr,
     ):
         factor = tl.program_id(0)
         offsets = tl.arange(0, BLOCK)
@@ -236,7 +236,8 @@ if _TRITON_AVAILABLE:
             index = start * BLOCK + offsets
             accumulator += tl.load(
                 PARTIALS + factor * TOTAL + index,
-                mask=index < TOTAL, other=0.0,
+                mask=index < TOTAL,
+                other=0.0,
             )
         tl.store(DA + factor, tl.sum(accumulator, axis=0))
 
@@ -276,7 +277,8 @@ class _CausalEMA3Fn(torch.autograd.Function):
         da = torch.zeros_like(alpha)
         partials = (
             torch.empty((3, batch, width), device=x.device, dtype=torch.float32)
-            if need_da else da
+            if need_da
+            else da
         )
         grid = lambda meta: (batch * triton.cdiv(width, meta["BD"]),)
         _ema3_bwd_serial[grid](
@@ -298,7 +300,11 @@ class _CausalEMA3Fn(torch.autograd.Function):
         if not need_da:
             return dx, None
         _ema3_reduce_factor_gradients[(3,)](
-            partials, da, TOTAL=batch * width, BLOCK=1024, num_warps=4,
+            partials,
+            da,
+            TOTAL=batch * width,
+            BLOCK=1024,
+            num_warps=4,
         )
         return dx, da.to(ema_factors.dtype)
 

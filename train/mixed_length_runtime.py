@@ -4,6 +4,7 @@ This module owns the padded-row seam only.  Architecture, optimizer, schedule an
 HISA implementations remain in ``train_dwarf.py``.  It intentionally never rewrites
 builder-produced shard bytes.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -22,6 +23,8 @@ WIDTH = 2048
 MODEL_LENGTH = WIDTH - 1
 IGNORE_INDEX = -100
 MIXED_CHECKPOINT_KIND = "dwarf-canonical-mixed-length-resume-v2"
+
+
 def _json_object_no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -90,7 +93,9 @@ class MixedLengthShard:
         if file_signature(self.path) != self.signature or (
             full_hash and file_sha256(self.path) != self.sha256
         ):
-            raise RuntimeError(f"mixed-length shard changed after validation: {self.path}")
+            raise RuntimeError(
+                f"mixed-length shard changed after validation: {self.path}"
+            )
 
     @staticmethod
     def validate_tensors(
@@ -127,7 +132,9 @@ class MixedLengthShard:
                 or value.ndim != 1
                 or value.shape[0] != ids.shape[0]
             ):
-                raise ValueError(f"{path}: {name} has wrong dtype or is not aligned to input_ids")
+                raise ValueError(
+                    f"{path}: {name} has wrong dtype or is not aligned to input_ids"
+                )
         if ids.numel() == 0:
             raise ValueError(f"{path}: empty shard")
         if bool(((ids < 0) | (ids >= vocab_size)).any()):
@@ -143,17 +150,27 @@ class MixedLengthShard:
             row = ids[row_index]
             prefix = row[:length]
             if bool((prefix == pad_token_id).any()):
-                raise ValueError(f"{path}: row {row_index} has PAD before valid target boundary")
+                raise ValueError(
+                    f"{path}: row {row_index} has PAD before valid target boundary"
+                )
             if bool((prefix == eod_token_id).any()):
-                raise ValueError(f"{path}: row {row_index} has internal EOD before terminal target")
+                raise ValueError(
+                    f"{path}: row {row_index} has internal EOD before terminal target"
+                )
             terminal = int(row[length])
             if length < MODEL_LENGTH:
                 if terminal != eod_token_id:
-                    raise ValueError(f"{path}: row {row_index} lacks terminal EOD at valid_lengths")
+                    raise ValueError(
+                        f"{path}: row {row_index} lacks terminal EOD at valid_lengths"
+                    )
                 if not bool((row[length + 1 :] == pad_token_id).all()):
-                    raise ValueError(f"{path}: row {row_index} has non-PAD after terminal EOD")
+                    raise ValueError(
+                        f"{path}: row {row_index} has non-PAD after terminal EOD"
+                    )
             elif terminal == pad_token_id:
-                raise ValueError(f"{path}: row {row_index} has PAD at full-row terminal")
+                raise ValueError(
+                    f"{path}: row {row_index} has PAD at full-row terminal"
+                )
         return ids, lengths, source_ids, document_lengths
 
     @classmethod
@@ -180,8 +197,14 @@ class MixedLengthShard:
             or len(declared_sha256) != 64
             or any(character not in "0123456789abcdef" for character in declared_sha256)
         ):
-            raise ValueError("manifest shard sha256 must be 64 lowercase hexadecimal characters")
-        if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int) or declared_bytes < 1:
+            raise ValueError(
+                "manifest shard sha256 must be 64 lowercase hexadecimal characters"
+            )
+        if (
+            isinstance(declared_bytes, bool)
+            or not isinstance(declared_bytes, int)
+            or declared_bytes < 1
+        ):
             raise ValueError("manifest shard bytes must be a positive integer")
         relative = Path(str(item["path"]))
         if relative.is_absolute() or ".." in relative.parts:
@@ -259,7 +282,9 @@ class MixedLengthDataset:
     def _locate(self, index: int) -> tuple[MixedLengthShard, int]:
         if index < 0 or index >= self._rows:
             raise IndexError(index)
-        for offset, shard in reversed(tuple(zip(self._offsets, self.shards, strict=True))):
+        for offset, shard in reversed(
+            tuple(zip(self._offsets, self.shards, strict=True))
+        ):
             if index >= offset:
                 return shard, index - offset
         raise AssertionError("row lookup offset invariant")
@@ -279,9 +304,8 @@ class MixedLengthDataset:
     def assert_unchanged(self, *, full_hash: bool = True) -> None:
         """Use signatures per update; fully rehash at identity/checkpoint boundaries."""
         if self._manifest_signature is not None:
-            if (
-                file_signature(self.manifest_path) != self._manifest_signature
-                or (full_hash and file_sha256(self.manifest_path) != self._manifest_sha256)
+            if file_signature(self.manifest_path) != self._manifest_signature or (
+                full_hash and file_sha256(self.manifest_path) != self._manifest_sha256
             ):
                 raise RuntimeError("mixed-length manifest changed after validation")
         for shard in self.shards:
@@ -324,7 +348,9 @@ class MixedLengthDataset:
             None,
             "test",
         )
-        return cls((shard,), manifest={"format": "test"}, manifest_path=Path("<test-manifest>"))
+        return cls(
+            (shard,), manifest={"format": "test"}, manifest_path=Path("<test-manifest>")
+        )
 
 
 def load_mixed_length_dataset(
@@ -342,7 +368,9 @@ def load_mixed_length_dataset(
     if file_signature(manifest_file) != manifest_signature:
         raise RuntimeError("mixed-length manifest changed while it was loaded")
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-    manifest = json.loads(manifest_bytes, object_pairs_hook=_json_object_no_duplicate_keys)
+    manifest = json.loads(
+        manifest_bytes, object_pairs_hook=_json_object_no_duplicate_keys
+    )
     if not isinstance(manifest, Mapping):
         raise ValueError("mixed-length manifest must be a JSON object")
     if manifest.get("format") != "dwarf-mixed-length-v1":
@@ -377,7 +405,9 @@ def load_mixed_length_dataset(
         or len(tokenizer_hash) != 64
         or any(character not in "0123456789abcdef" for character in tokenizer_hash)
     ):
-        raise ValueError("manifest tokenizer_sha256 must be 64 lowercase hexadecimal characters")
+        raise ValueError(
+            "manifest tokenizer_sha256 must be 64 lowercase hexadecimal characters"
+        )
     train_shards = manifest["train_shards"]
     if not isinstance(train_shards, list) or not train_shards:
         raise ValueError("manifest train_shards must be a nonempty array")
@@ -392,7 +422,9 @@ def load_mixed_length_dataset(
         try:
             candidate.relative_to(manifest_file.parent.resolve())
         except ValueError as error:
-            raise ValueError("manifest shard path escapes manifest directory") from error
+            raise ValueError(
+                "manifest shard path escapes manifest directory"
+            ) from error
         signature = file_signature(candidate)
         key = (signature[0], signature[1])
         if key in seen_shards:
@@ -415,15 +447,24 @@ def load_mixed_length_dataset(
         manifest_signature=manifest_signature,
         manifest_sha256=manifest_sha256,
     )
-    if int(manifest["rows"]) != len(dataset) or int(manifest["loss_tokens"]) != dataset.total_targets:
-        raise ValueError("manifest aggregate rows/loss_tokens do not match train shards")
+    if (
+        int(manifest["rows"]) != len(dataset)
+        or int(manifest["loss_tokens"]) != dataset.total_targets
+    ):
+        raise ValueError(
+            "manifest aggregate rows/loss_tokens do not match train shards"
+        )
     target = int(manifest["target_loss_tokens"])
     if dataset.total_targets < target or dataset.total_targets - target > MODEL_LENGTH:
-        raise ValueError("manifest loss_tokens must meet target with at most one-row excess")
+        raise ValueError(
+            "manifest loss_tokens must meet target with at most one-row excess"
+        )
     return dataset
 
 
-def build_labels(input_ids: torch.Tensor, valid_lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def build_labels(
+    input_ids: torch.Tensor, valid_lengths: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     if input_ids.ndim != 2 or input_ids.shape[1] != WIDTH:
         raise ValueError(f"input_ids must have shape [B,{WIDTH}]")
     if valid_lengths.ndim != 1 or valid_lengths.shape[0] != input_ids.shape[0]:
@@ -433,7 +474,8 @@ def build_labels(input_ids: torch.Tensor, valid_lengths: torch.Tensor) -> tuple[
     labels = input_ids[:, 1:].to(dtype=torch.long).clone()
     positions = torch.arange(MODEL_LENGTH, device=input_ids.device).reshape(1, -1)
     labels.masked_fill_(
-        positions >= valid_lengths.to(device=input_ids.device, dtype=torch.long).reshape(-1, 1),
+        positions
+        >= valid_lengths.to(device=input_ids.device, dtype=torch.long).reshape(-1, 1),
         IGNORE_INDEX,
     )
     return input_ids[:, :-1].to(dtype=torch.long), labels
@@ -480,7 +522,9 @@ class TargetBudgetPlan:
         if target_budget < 1:
             raise ValueError("total target budget must be positive")
         if physical_batch_size < 1 or grad_accum_steps < 1:
-            raise ValueError("physical batch size and grad accumulation must be positive")
+            raise ValueError(
+                "physical batch size and grad accumulation must be positive"
+            )
         if target_budget > dataset.total_targets:
             raise ValueError("total target budget exceeds available active targets")
         achieved = 0
@@ -497,10 +541,17 @@ class TargetBudgetPlan:
         while before < count:
             active_rows = min(effective_rows, count - before)
             active_targets = sum(
-                dataset.target_count(index) for index in range(before, before + active_rows)
+                dataset.target_count(index)
+                for index in range(before, before + active_rows)
             )
             updates.append(
-                UpdatePlan(before, active_rows, physical_batch_size, grad_accum_steps, active_targets)
+                UpdatePlan(
+                    before,
+                    active_rows,
+                    physical_batch_size,
+                    grad_accum_steps,
+                    active_targets,
+                )
             )
             before += active_rows
         return cls(target_budget, achieved, excess, tuple(range(count)), tuple(updates))
@@ -569,7 +620,8 @@ def active_cross_entropy(
     hidden: torch.Tensor,
     labels: torch.Tensor,
     *,
-    fused_loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+    fused_loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+    | None = None,
 ) -> torch.Tensor:
     if hidden.ndim != 3 or labels.shape != hidden.shape[:2]:
         raise ValueError("hidden [B,T,D] and labels [B,T] must align")
@@ -580,7 +632,9 @@ def active_cross_entropy(
     active_labels = labels.reshape(-1)[active]
     if fused_loss is not None:
         return fused_loss(weight, active_hidden, active_labels)
-    return F.cross_entropy(F.linear(active_hidden.float(), weight.float()), active_labels, reduction="mean")
+    return F.cross_entropy(
+        F.linear(active_hidden.float(), weight.float()), active_labels, reduction="mean"
+    )
 
 
 def normalized_microbatch_loss(
@@ -594,7 +648,9 @@ def normalized_microbatch_loss(
         raise ValueError("invalid active-target normalization")
     if active_targets == 0:
         return language_loss * 0.0 + auxiliary_loss * 0.0
-    return (language_loss + auxiliary_loss) * (float(active_targets) / float(update_targets))
+    return (language_loss + auxiliary_loss) * (
+        float(active_targets) / float(update_targets)
+    )
 
 
 def mask_auxiliary_by_eligibility(
@@ -626,7 +682,11 @@ def _validate_rng_payload(payload: Mapping[str, Any], *, require_cuda: bool) -> 
     ):
         raise ValueError("mixed-length checkpoint RNG payload is invalid")
     cpu_state = payload.get("torch_cpu")
-    if not torch.is_tensor(cpu_state) or cpu_state.dtype != torch.uint8 or cpu_state.ndim != 1:
+    if (
+        not torch.is_tensor(cpu_state)
+        or cpu_state.dtype != torch.uint8
+        or cpu_state.ndim != 1
+    ):
         raise ValueError("mixed-length checkpoint CPU RNG state is invalid")
     cuda_states = payload.get("torch_cuda")
     if require_cuda:
@@ -672,7 +732,11 @@ def atomic_json_save(payload: Mapping[str, Any], path: str | Path) -> None:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
-        dir=output.parent, prefix=output.name + ".", suffix=".partial", mode="w", delete=False
+        dir=output.parent,
+        prefix=output.name + ".",
+        suffix=".partial",
+        mode="w",
+        delete=False,
     ) as handle:
         temporary = Path(handle.name)
         json.dump(payload, handle, indent=2, sort_keys=True)
@@ -744,7 +808,9 @@ def restore_mixed_checkpoint(
     if not isinstance(payload, Mapping) or set(payload) != required:
         raise ValueError("mixed-length checkpoint schema does not match")
     if payload["kind"] != MIXED_CHECKPOINT_KIND:
-        raise ValueError("checkpoint kind does not match canonical mixed-length runtime")
+        raise ValueError(
+            "checkpoint kind does not match canonical mixed-length runtime"
+        )
     for field, expected in (
         ("architecture", architecture),
         ("dataset", dataset_identity),
@@ -757,12 +823,18 @@ def restore_mixed_checkpoint(
             raise ValueError(f"checkpoint {field} does not match active runtime")
     step = int(payload["step"])
     targets_completed = int(payload["targets_completed"])
-    if step < 0 or step > len(plan.updates) or targets_completed != plan.targets_before_update(step):
+    if (
+        step < 0
+        or step > len(plan.updates)
+        or targets_completed != plan.targets_before_update(step)
+    ):
         raise ValueError("checkpoint target-budget cursor is invalid")
     # All identities above are checked before either model or optimizer mutation.
     model.load_state_dict(payload["model"], strict=True)
     optimizer.load_state_dict(
-        payload["optimizer"], expected_lr_factor=expected_lr_factor, require_complete_state=True
+        payload["optimizer"],
+        expected_lr_factor=expected_lr_factor,
+        require_complete_state=True,
     )
     restore_rng(payload["rng"])
     return step, targets_completed
