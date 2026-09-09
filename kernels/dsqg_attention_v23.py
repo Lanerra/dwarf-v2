@@ -759,6 +759,7 @@ def _bwd_dkdv_v23_banded(
     SOURCE_END: tl.constexpr,
     GRAD_BLOCKS: tl.constexpr,
     GRAD_BLOCK_OFFSET: tl.constexpr, GRAD_J: tl.constexpr,
+    COMPACT_PARTIALS: tl.constexpr = False, GRAD_ENTRIES: tl.constexpr = 0,
 ):
     bhkv = tl.program_id(0)
     block = tl.program_id(1)
@@ -821,7 +822,16 @@ def _bwd_dkdv_v23_banded(
             dscore = probability * (tl.sum(dout * value, axis=1) - delta_row)
             dk += dscore[:, None] * query * scale
             dv += probability[:, None] * dout
-            partial = ((batch * H + head) * GRAD_BLOCKS + GRAD_BLOCK_OFFSET + block) * GRAD_J + logical_index
+            if COMPACT_PARTIALS:
+                partial = (
+                    (batch * H + head) * GRAD_ENTRIES
+                    + GRAD_BLOCK_OFFSET + block * J_ACTIVE + logical_index
+                )
+            else:
+                partial = (
+                    ((batch * H + head) * GRAD_BLOCKS + GRAD_BLOCK_OFFSET + block)
+                    * GRAD_J + logical_index
+                )
             tl.store(
                 DPOS_BIAS + partial,
                 tl.sum(tl.where(valid, dscore, 0.0)),
@@ -841,6 +851,92 @@ def _bwd_dkdv_v23_banded(
         + source[:, None] * stride_dvn + dims[None, :] * stride_dvd,
         dv.to(tl.bfloat16), mask=smask[:, None] & dmask[None, :],
     )
+
+
+@triton.jit
+def _compact_scale_reduce_v23(
+    PARTIALS, OUT,
+    B: tl.constexpr, H: tl.constexpr, D: tl.constexpr, J: tl.constexpr,
+    ENTRIES: tl.constexpr, ACTIVES: tl.constexpr, BLOCKS: tl.constexpr,
+    STARTS: tl.constexpr, REDUCE_BLOCK: tl.constexpr,
+):
+    logical_index = tl.program_id(0)
+    rows, dims = tl.arange(0, REDUCE_BLOCK), tl.arange(0, D)
+    accumulator = tl.zeros((REDUCE_BLOCK, D), tl.float32)
+    for band in tl.static_range(len(ACTIVES)):
+        active = ACTIVES[band]
+        blocks = BLOCKS[band]
+        start = STARTS[band]
+        if logical_index < active:
+            for base in range(tl.cdiv(B * H * blocks, REDUCE_BLOCK)):
+                row = base * REDUCE_BLOCK + rows
+                batch_head = row // blocks
+                block = row % blocks
+                index = (
+                    batch_head * ENTRIES + start + block * active + logical_index
+                )
+                accumulator += tl.load(
+                    PARTIALS + index[:, None] * D + dims[None, :],
+                    mask=row[:, None] < B * H * blocks, other=0.0,
+                )
+    tl.store(OUT + logical_index * D + dims, tl.sum(accumulator, axis=0))
+
+
+@triton.jit
+def _compact_bias_reduce_v23(
+    PARTIALS, OUT,
+    B: tl.constexpr, H: tl.constexpr, J: tl.constexpr,
+    ENTRIES: tl.constexpr, ACTIVES: tl.constexpr, BLOCKS: tl.constexpr,
+    STARTS: tl.constexpr, REDUCE_BLOCK: tl.constexpr,
+):
+    head, logical_index = tl.program_id(0), tl.program_id(1)
+    rows = tl.arange(0, REDUCE_BLOCK)
+    accumulator = tl.zeros((REDUCE_BLOCK,), tl.float32)
+    for band in tl.static_range(len(ACTIVES)):
+        active = ACTIVES[band]
+        blocks = BLOCKS[band]
+        start = STARTS[band]
+        if logical_index < active:
+            for base in range(tl.cdiv(B * blocks, REDUCE_BLOCK)):
+                row = base * REDUCE_BLOCK + rows
+                batch = row // blocks
+                block = row % blocks
+                index = (
+                    (batch * H + head) * ENTRIES
+                    + start + block * active + logical_index
+                )
+                accumulator += tl.load(
+                    PARTIALS + index, mask=row < B * blocks, other=0.0
+                )
+    tl.store(OUT + logical_index * H + head, tl.sum(accumulator, axis=0))
+
+
+def _reduce_compact_shared_gradients_v23(
+    partial_pos_bias: torch.Tensor,
+    partial_scale_embed: torch.Tensor,
+    *,
+    batch: int, heads: int, j_val: int, head_dim: int, entries: int,
+    actives: tuple[int, ...], blocks: tuple[int, ...], starts: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dpos_bias = torch.empty(
+        (j_val, heads), device=partial_pos_bias.device, dtype=torch.float32
+    )
+    dscale_embed = torch.empty(
+        (j_val, head_dim), device=partial_scale_embed.device, dtype=torch.float32
+    )
+    _compact_bias_reduce_v23[(heads, j_val)](
+        partial_pos_bias, dpos_bias,
+        B=batch, H=heads, J=j_val, ENTRIES=entries,
+        ACTIVES=actives, BLOCKS=blocks, STARTS=starts, REDUCE_BLOCK=256,
+        num_warps=4,
+    )
+    _compact_scale_reduce_v23[(j_val,)](
+        partial_scale_embed, dscale_embed,
+        B=batch, H=heads, D=head_dim, J=j_val, ENTRIES=entries,
+        ACTIVES=actives, BLOCKS=blocks, STARTS=starts, REDUCE_BLOCK=64,
+        num_warps=4,
+    )
+    return dpos_bias, dscale_embed
 
 
 class _DSQGV23Fn(torch.autograd.Function):
@@ -1059,14 +1155,40 @@ class _DSQGV23Fn(torch.autograd.Function):
                     triton.cdiv(stop - start, _band_launch_geometry(active)[0])
                     for start, stop, active in ctx.source_bands
                 )
-                # Each CTA owns a partial slot. One fixed-order reduction after
-                # all bands avoids atomic rounding races and per-band launches.
-                partial_pos_bias = torch.zeros(
-                    (batch, heads, source_blocks, ctx.j_val), device=q.device, dtype=torch.float32
+                # Qualified combined-v4 path: allocate only live
+                # (band, block, active-offset) partials instead of the rectangular
+                # [all_blocks, J] workspace, then reduce them in a fixed order.
+                compact = bool(head_dim == ctx.block_hd)
+                compact_blocks = tuple(
+                    triton.cdiv(stop - start, _band_launch_geometry(active)[0])
+                    for start, stop, active in ctx.source_bands
                 )
-                partial_scale_embed = torch.zeros(
-                    (batch, heads, source_blocks, ctx.j_val, head_dim), device=q.device, dtype=torch.float32
-                )
+                compact_actives = tuple(active for _, _, active in ctx.source_bands)
+                compact_starts_list: list[int] = []
+                entries = 0
+                for block_count, active in zip(
+                    compact_blocks, compact_actives, strict=True
+                ):
+                    compact_starts_list.append(entries)
+                    entries += block_count * active
+                compact_starts = tuple(compact_starts_list)
+                if compact:
+                    partial_pos_bias = torch.empty(
+                        (batch, heads, entries), device=q.device, dtype=torch.float32
+                    )
+                    partial_scale_embed = torch.empty(
+                        (batch, heads, entries, head_dim),
+                        device=q.device, dtype=torch.float32,
+                    )
+                else:
+                    partial_pos_bias = torch.zeros(
+                        (batch, heads, source_blocks, ctx.j_val),
+                        device=q.device, dtype=torch.float32,
+                    )
+                    partial_scale_embed = torch.zeros(
+                        (batch, heads, source_blocks, ctx.j_val, head_dim),
+                        device=q.device, dtype=torch.float32,
+                    )
                 source_block_offset = 0
                 for source_start, source_stop, active in ctx.source_bands:
                     block_n, warps, stages = _band_launch_geometry(active)
@@ -1087,12 +1209,20 @@ class _DSQGV23Fn(torch.autograd.Function):
                         QUERY_START=ctx.query_start,
                         SOURCE_START=source_start, SOURCE_END=source_stop,
                         GRAD_BLOCKS=source_blocks, GRAD_BLOCK_OFFSET=source_block_offset,
-                        GRAD_J=ctx.j_val,
-                        num_warps=warps, num_stages=stages,
+                        GRAD_J=ctx.j_val, COMPACT_PARTIALS=compact,
+                        GRAD_ENTRIES=entries, num_warps=warps, num_stages=stages,
                     )
-                    source_block_offset += grid[1]
-                dpos_bias = partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
-                dscale_embed = partial_scale_embed.sum(dim=(0, 1, 2))
+                    source_block_offset += grid[1] * active if compact else grid[1]
+                if compact:
+                    dpos_bias, dscale_embed = _reduce_compact_shared_gradients_v23(
+                        partial_pos_bias, partial_scale_embed,
+                        batch=batch, heads=heads, j_val=ctx.j_val, head_dim=head_dim,
+                        entries=entries, actives=compact_actives, blocks=compact_blocks,
+                        starts=compact_starts,
+                    )
+                else:
+                    dpos_bias = partial_pos_bias.sum(dim=(0, 2)).transpose(0, 1).contiguous()
+                    dscale_embed = partial_scale_embed.sum(dim=(0, 1, 2))
             else:
                 source_blocks = triton.cdiv(ctx.source_end, _DSQG_MIN_AUTOTUNE_BLOCK_N)
                 partial_pos_bias = torch.zeros(
@@ -1710,6 +1840,7 @@ class DSQGAttentionV23(nn.Module):
                 else ("BLOCK_N", "num_warps", "num_stages")
             ),
             "support_band_execution": self.support_band_execution,
+            "compact_shared_gradient_partials": True,
             "support_band_boundaries": (64, 256, 512, 1024, 1536),
             "dkdv_schedule": "kv_head_owned",
             "query_support_start": self.minimum_offset,
