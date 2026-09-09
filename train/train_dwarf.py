@@ -2,7 +2,9 @@
 """Self-contained public trainer for the canonical DWARF-v2 architecture.
 
 The model is D512/H8/L24/FFN2048 with bounded-routing DSQG V23 blocks and
-strict-causal optimized HISA V19 global mixers at layers 3, 10, and 17.
+strict-causal optimized HISA V19 global mixers at layers 3, 10, and 17. The
+qualified throughput profile executes K=2/M=4 routed pages at all three HISA
+layers and uses 2048-token Liger fused-linear-CE chunks during training.
 Independent causal-EMA K/V packets live at L3 and L17; L10 is ordinary HISA.
 At L17, the frozen-base route stream owns coarse candidates, exact reranking, and
 route supervision; packet-rotated K/V remain the executed global attention stream.
@@ -21,7 +23,10 @@ import argparse
 import ast
 import copy
 import hashlib
+import importlib
 import importlib.metadata
+import importlib.util
+import inspect
 import json
 import math
 import os
@@ -30,6 +35,7 @@ import stat
 import sys
 import tempfile
 import threading
+import textwrap
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -42,6 +48,38 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _activation_checkpoint
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+MIXED_LENGTH_RUNTIME_PATH = SCRIPT_DIR / "mixed_length_runtime.py"
+_MIXED_LENGTH_RUNTIME_MODULE = "dwarf_canonical_mixed_length_runtime"
+_mixed_runtime_spec = importlib.util.spec_from_file_location(
+    _MIXED_LENGTH_RUNTIME_MODULE, MIXED_LENGTH_RUNTIME_PATH
+)
+if _mixed_runtime_spec is None or _mixed_runtime_spec.loader is None:
+    raise ImportError("could not load canonical mixed-length runtime")
+_cached_mixed_runtime = importlib.util.module_from_spec(_mixed_runtime_spec)
+sys.modules[_MIXED_LENGTH_RUNTIME_MODULE] = _cached_mixed_runtime
+try:
+    _mixed_runtime_spec.loader.exec_module(_cached_mixed_runtime)
+except BaseException:
+    sys.modules.pop(_MIXED_LENGTH_RUNTIME_MODULE, None)
+    raise
+
+MIXED_MODEL_LENGTH = _cached_mixed_runtime.MODEL_LENGTH
+TargetBudgetPlan = _cached_mixed_runtime.TargetBudgetPlan
+active_cross_entropy = _cached_mixed_runtime.active_cross_entropy
+atomic_mixed_json_save = _cached_mixed_runtime.atomic_json_save
+atomic_mixed_torch_save = _cached_mixed_runtime.atomic_torch_save
+collate_physical_batch = _cached_mixed_runtime.collate_physical_batch
+mixed_file_sha256 = _cached_mixed_runtime.file_sha256
+load_mixed_length_dataset = _cached_mixed_runtime.load_mixed_length_dataset
+mask_auxiliary_by_eligibility = _cached_mixed_runtime.mask_auxiliary_by_eligibility
+masked_target_count = _cached_mixed_runtime.masked_target_count
+mixed_checkpoint_payload = _cached_mixed_runtime.mixed_checkpoint_payload
+normalized_microbatch_loss = _cached_mixed_runtime.normalized_microbatch_loss
+restore_mixed_checkpoint = _cached_mixed_runtime.restore_mixed_checkpoint
+
 KERNEL_FILES = (
     "causal_ema_scan.py",
     "dsqg_attention_v23.py",
@@ -109,13 +147,14 @@ else:
 
 CHECKPOINT_KIND = (
     "dwarf-l24-l17-basek-routepolicy-single-document-"
-    "dsqgv23band-hisav19qv4-resume-v1"
+    "dsqgv23compact-hisav19qv4-k222-loss2048-resume-v1"
 )
 CANONICAL_PARENT_CHECKPOINT_KIND = (
     "dwarf-l24-l17-basek-route-appendable-prefix-stable-dsqgv23-hisav19-resume-v1"
 )
 RELEASE_KIND = (
-    "dwarf-l24-l17-basek-routepolicy-single-document-dsqgv23band-hisav19qv4-weights-v1"
+    "dwarf-l24-l17-basek-routepolicy-single-document-"
+    "dsqgv23compact-hisav19qv4-k222-loss2048-weights-v1"
 )
 LEGACY_HISA_CHECKPOINT_KINDS = frozenset(
     {
@@ -134,11 +173,12 @@ EXPECTED_TRAINABLE_PARAMETERS = 100_290_405
 EXPECTED_STATE_FINGERPRINT = "099c313d786bc6879926c842f479cf45c84954cf3612bac4a4b656578518960a"
 EXPECTED_SEEDED_RNG_FINGERPRINT = "ba02b103e767eb3ccc7420da1e82900f816843d5ac49aa42e82f87b7d7405f63"
 EXPECTED_SOURCE_AST_SHA256: dict[str, str] = {
-    'train/train_dwarf.py': '898201afda342ce262dd78cbe1232fdcc827464ee478796145f4bd8568c7783f',
-    'kernels/causal_ema_scan.py': 'd531c6f8a1ba23fb8fdcbb7bc36337c8922a245863f0140a880717d257a1d0ed',
-    'kernels/dsqg_attention_v23.py': '70cbcf568ee485247783581623ba040b1b6bf3479cf2654db7cf9a3accd72804',
-    'kernels/hierarchical_sparse_attn_v19_hisa.py': 'bfd831d3b7f5903e36bcca6e945ef0f2f70395bfa328b681149f1d85d6483b22',
+    "train/train_dwarf.py": "ead99fe174e00e8a7b70a8f8184bf3f4797a22a2085263d55b076f90a155f688",
+    "kernels/causal_ema_scan.py": "d531c6f8a1ba23fb8fdcbb7bc36337c8922a245863f0140a880717d257a1d0ed",
+    "kernels/dsqg_attention_v23.py": "df2e8b0476881c40ac0d8127ac1f07c1f35aab3e51fd0501e33b87857bda68fe",
+    "kernels/hierarchical_sparse_attn_v19_hisa.py": "dea70b1566e4986cf5e51a6f141c6fe04fb6f9a5e9bf94ea1a7cdf12384d4499",
 }
+EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256 = "581c5148d4845732c9e687937afef0236dc69896009f48e510de55027af37924"
 
 CANONICAL_TOKENIZER_SHA256 = (
     "c695c9831c1af101ea17e95e37d82e47f079b3813d97a44b422daa0d0369d579"
@@ -159,10 +199,16 @@ class TrainRecipe:
     weight_decay: float = 0.1
     grad_clip_muon: float = 1.0
     grad_clip_adamw: float = 1.0
+    # Qualified on complete B16/GA8 training at 350/400/450 W.
+    fused_ce_chunk_tokens: int = 2048
 
     def __post_init__(self) -> None:
         if self.warmup_steps + self.stable_steps + self.decay_steps != self.steps:
             raise ValueError("WSD phases must sum to the total update count")
+        if self.fused_ce_chunk_tokens != 2048:
+            raise ValueError(
+                "canonical DWARF training requires the qualified 2048-token CE chunks"
+            )
 
     @property
     def effective_batch(self) -> int:
@@ -190,7 +236,12 @@ class DwarfConfig:
     dsqg_backend: str = "triton"
     dsqg_support_band_execution: bool = True
     hisa_chunk_size: int = 32
-    top_k_chunks: int = 4
+    # Qualified K-budget result: execute K=2 pages; the existing 2x candidate
+    # multiplier therefore exact-reranks M=4 candidates at L3/L10/L17.
+    top_k_chunks: int = 2
+    # Preserve the route-teacher sampling threshold used by the qualified K222
+    # benchmark. K was runtime-patched there after the original K4 config loaded.
+    hisa_route_aux_competitive_slots: int = 4
     hisa_top_m_tokens: int = 32
     hisa_local_window: int = 64
     hisa_selector_tile: int = 16
@@ -316,8 +367,11 @@ class DwarfConfig:
             self.hisa_local_window,
             self.hisa_selector_tile,
             self.top_k_chunks,
+            self.hisa_route_aux_competitive_slots,
         ) < 1:
             raise ValueError("HISA chunk, local, selector, and route widths must be positive")
+        if self.hisa_route_aux_competitive_slots < self.top_k_chunks:
+            raise ValueError("HISA route-aux competitive slots must be >= executed top-K")
         if self.hisa_top_m_tokens != self.hisa_chunk_size:
             raise ValueError(
                 "canonical HISA enumerates complete chunks; top-M must equal chunk size"
@@ -556,7 +610,7 @@ def route_aux_tile_ids_for_update(
     if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 1:
         raise ValueError("global optimizer step must be a positive integer")
     first_competitive = (
-        (config.top_k_chunks + 1) * config.hisa_chunk_size
+        (config.hisa_route_aux_competitive_slots + 1) * config.hisa_chunk_size
         + config.hisa_local_window
     )
     candidate_count = config.model_length - first_competitive
@@ -626,9 +680,10 @@ class _CanonicalSourceNormalizer(ast.NodeTransformer):
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
         node = self.generic_visit(node)
-        if isinstance(node.target, ast.Name) and node.target.id == (
-            "EXPECTED_SOURCE_AST_SHA256"
-        ):
+        if isinstance(node.target, ast.Name) and node.target.id in {
+            "EXPECTED_SOURCE_AST_SHA256",
+            "EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256",
+        }:
             node.value = ast.Constant(value=None)
         return node
 
@@ -636,7 +691,11 @@ class _CanonicalSourceNormalizer(ast.NodeTransformer):
         node = self.generic_visit(node)
         if any(
             isinstance(target, ast.Name)
-            and target.id == "EXPECTED_SOURCE_AST_SHA256"
+            and target.id
+            in {
+                "EXPECTED_SOURCE_AST_SHA256",
+                "EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256",
+            }
             for target in node.targets
         ):
             node.value = ast.Constant(value=None)
@@ -708,6 +767,24 @@ def validate_canonical_kernel_sources(
     return source_manifest()
 
 
+def validate_mixed_length_runtime_source() -> str:
+    """Pin the train-local padded-data runtime before a new mixed run starts."""
+    observed = _semantic_ast_sha256(MIXED_LENGTH_RUNTIME_PATH)
+    if observed != EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256:
+        raise RuntimeError(
+            "mixed-length runtime source semantics do not match: "
+            + json.dumps(
+                {
+                    "expected": EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256,
+                    "observed": observed,
+                    "path": str(MIXED_LENGTH_RUNTIME_PATH),
+                },
+                sort_keys=True,
+            )
+        )
+    return observed
+
+
 def _package_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -725,6 +802,123 @@ def _load_liger_loss_class():
             "DWARF training requires Liger fused linear cross-entropy"
         ) from error
     return LigerFusedLinearCrossEntropyLoss
+
+
+QUALIFIED_LIGER_VERSION = "0.8.0"
+QUALIFIED_LIGER_FORWARD_SOURCE_SHA256 = (
+    "be91734ddcb4c35102ab7bc321c96690bf6c7a314d68ddf9145f57b7b8f03646"
+)
+QUALIFIED_LIGER_OPS_FILE_SHA256 = (
+    "f87945b3e392464a2246608eafefce1b062ea06d498a6eaa785505b297cc09c2"
+)
+_LIGER_CHUNK_EXPR = "triton.next_power_of_2(triton.cdiv(BT, inc_factor))"
+_LIGER_COUNT_EXPR = "triton.cdiv(BT, chunk_size)"
+
+
+def _liger_ast_key(node: Any) -> Any:
+    if isinstance(node, ast.AST):
+        return (
+            type(node).__name__,
+            tuple(
+                (name, _liger_ast_key(value))
+                for name, value in ast.iter_fields(node)
+                if value is not None and value != []
+            ),
+        )
+    if isinstance(node, list):
+        return tuple(_liger_ast_key(value) for value in node)
+    return node
+
+
+def _file_sha256_local(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _qualified_liger_ops() -> tuple[Any, Any, dict[str, Any]]:
+    version = importlib.metadata.version("liger-kernel")
+    if version != QUALIFIED_LIGER_VERSION:
+        raise RuntimeError(
+            f"canonical DWARF qualified Liger {QUALIFIED_LIGER_VERSION}, not {version}"
+        )
+    ops = importlib.import_module("liger_kernel.ops.fused_linear_cross_entropy")
+    original = ops.fused_linear_cross_entropy_forward
+    try:
+        source = inspect.getsource(original)
+    except (OSError, TypeError) as error:
+        raise RuntimeError("cannot inspect installed Liger fused CE source") from error
+    function_hash = hashlib.sha256(source.encode()).hexdigest()
+    file_hash = _file_sha256_local(Path(ops.__file__).resolve())
+    if function_hash != QUALIFIED_LIGER_FORWARD_SOURCE_SHA256:
+        raise RuntimeError(
+            "installed Liger fused CE function differs from the qualified 0.8.0 source"
+        )
+    if file_hash != QUALIFIED_LIGER_OPS_FILE_SHA256:
+        raise RuntimeError(
+            "installed Liger fused CE module differs from the qualified 0.8.0 source"
+        )
+    return ops, original, {
+        "version": version,
+        "function_source_sha256": function_hash,
+        "ops_file_sha256": file_hash,
+    }
+
+
+def _install_qualified_liger_chunk_planner(chunk_size: int) -> dict[str, Any]:
+    """Install the qualified host-side 2048-token planner without editing Liger."""
+    if chunk_size != 2048:
+        raise ValueError("only the qualified 2048-token Liger chunk planner is supported")
+    ops, original, receipt = _qualified_liger_ops()
+    source = textwrap.dedent(inspect.getsource(original))
+    tree = ast.parse(source)
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef):
+        raise RuntimeError("unexpected Liger fused CE source shape")
+    function = tree.body[0]
+    if function.decorator_list or function.name != "fused_linear_cross_entropy_forward":
+        raise RuntimeError("unexpected Liger fused CE function contract")
+    assignments: dict[str, list[ast.Assign]] = {}
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            assignments.setdefault(node.targets[0].id, []).append(node)
+    chunks = assignments.get("chunk_size", [])
+    counts = assignments.get("num_chunks", [])
+    if len(chunks) != 1 or len(counts) != 1:
+        raise RuntimeError("unexpected Liger chunk planner assignment structure")
+    expected_chunk = ast.parse(_LIGER_CHUNK_EXPR, mode="eval").body
+    expected_count = ast.parse(_LIGER_COUNT_EXPR, mode="eval").body
+    if _liger_ast_key(chunks[0].value) != _liger_ast_key(expected_chunk):
+        raise RuntimeError("Liger chunk-size expression differs from the qualified contract")
+    if _liger_ast_key(counts[0].value) != _liger_ast_key(expected_count):
+        raise RuntimeError("Liger chunk-count expression differs from the qualified contract")
+    if (
+        chunks[0] not in function.body
+        or counts[0] not in function.body
+        or function.body.index(chunks[0]) >= function.body.index(counts[0])
+    ):
+        raise RuntimeError("Liger chunk planner statement order changed")
+    chunks[0].value = ast.copy_location(ast.Constant(chunk_size), chunks[0].value)
+    ast.fix_missing_locations(tree)
+    namespace = dict(original.__globals__)
+    exec(
+        compile(tree, f"<DWARF-qualified-liger-chunk-{chunk_size}>", "exec"),
+        namespace,
+    )
+    clone = namespace[original.__name__]
+    ops.fused_linear_cross_entropy_forward = clone
+    return {
+        **receipt,
+        "token_chunk_override": chunk_size,
+        "changed_expression_count": 1,
+        "on_disk_files_modified": False,
+        "qualification": "B16_GA8_complete_training_350W_400W_450W",
+    }
 
 
 def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
@@ -745,6 +939,8 @@ def runtime_environment(device: torch.device | None = None) -> dict[str, Any]:
             "compile_dynamic": False,
             "compiled_backward_autocast": "off",
             "inductor_deterministic": True,
+            "qualified_execution_profile": "combined_v4_promoted_k222",
+            "liger_fused_ce_chunk_tokens": RECIPE.fused_ce_chunk_tokens,
         },
     }
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
@@ -853,6 +1049,7 @@ def validate_training_runtime(
     if config.hisa_backend != "eager" and not hisa["triton"]:
         raise RuntimeError("canonical CUDA HISA global execution requires Triton")
     loss_class = _load_liger_loss_class()
+    _qualified_liger_ops()
     return loss_class, runtime_environment(resolved)
 
 
@@ -1936,7 +2133,7 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
     ]
     l17_attention = global_mixers[-1][1].attn
     return {
-        "format": "dwarf-l24-l17-basek-routepolicy-dsqgv23band-hisav19qv4-v1",
+        "format": "dwarf-l24-l17-basek-routepolicy-dsqgv23compact-hisav19qv4-k222-v1",
         "config": asdict(model.config),
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameters": sum(
@@ -1963,8 +2160,16 @@ def model_metadata(model: DwarfForCausalLM) -> dict[str, Any]:
                 for index, block in global_mixers
             },
             "l17_route_contract": l17_attention.route_source_contract,
-            "dsqg": "v23-bounded-routing-support-banded-null-candidate",
-            "hisa": "v19-v4-captured-mass-router-adapter-binder",
+            "dsqg": "v23-bounded-routing-support-banded-compact-grad-null-candidate",
+            "hisa": "v19-v4-captured-mass-router-adapter-binder-k222-m444",
+            "qualified_k_budget": {
+                "hisa_layers": model.config.global_mixer_layers,
+                "k_by_layer": (2, 2, 2),
+                "candidate_m_by_layer": (4, 4, 4),
+                "route_aux_competitive_slots": (
+                    model.config.hisa_route_aux_competitive_slots
+                ),
+            },
             "offset_groups": model.offset_groups,
         },
         "complexity": {
@@ -4135,7 +4340,447 @@ def nonfinite_gradient_report(model: nn.Module) -> list[dict[str, Any]]:
     return report
 
 
-def train(args: argparse.Namespace) -> None:
+class _MixedLengthTrainingForwardCallable(nn.Module):
+    """Canonical compiled forward that makes per-row lengths visible to HISA."""
+
+    def __init__(self, model: nn.Module, *, exploration_disabled: bool) -> None:
+        super().__init__()
+        self.model = model
+        self.exploration_disabled = exploration_disabled
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        route_aux_tile_ids: torch.Tensor,
+        exploration_step: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden, auxiliary = self.model._forward_impl(
+            input_ids,
+            valid_lengths=valid_lengths.contiguous().to(dtype=torch.int32),
+            route_aux_tile_ids=route_aux_tile_ids,
+            exploration_step=exploration_step,
+            exploration_probability_override=(
+                0.0 if self.exploration_disabled else None
+            ),
+            collect_diagnostics=False,
+            return_hidden=True,
+            return_auxiliary=True,
+        )
+        return hidden, mask_auxiliary_by_eligibility(auxiliary, valid_lengths)
+
+
+@dataclass(frozen=True)
+class MixedLengthTrainingCallables:
+    exploration: nn.Module
+    no_exploration: nn.Module
+
+
+def compiled_mixed_length_callables(
+    model: DwarfForCausalLM,
+) -> MixedLengthTrainingCallables:
+    return MixedLengthTrainingCallables(
+        exploration=torch.compile(
+            _MixedLengthTrainingForwardCallable(model, exploration_disabled=False),
+            options={"deterministic": True},
+            dynamic=False,
+        ),
+        no_exploration=torch.compile(
+            _MixedLengthTrainingForwardCallable(model, exploration_disabled=True),
+            options={"deterministic": True},
+            dynamic=False,
+        ),
+    )
+
+
+def mixed_length_source_identity() -> dict[str, Any]:
+    """Strict source binding for the canonical mixed-length checkpoint kind."""
+    runtime_path = MIXED_LENGTH_RUNTIME_PATH
+    runtime_semantic_sha256 = validate_mixed_length_runtime_source()
+    return {
+        "format": "dwarf-canonical-mixed-length-source-identity-v1",
+        "entrypoint": str(Path(__file__).resolve()),
+        "canonical_sources": source_manifest(),
+        "mixed_length_runtime": {
+            "path": str(runtime_path.resolve()),
+            "sha256": mixed_file_sha256(runtime_path),
+            "semantic_ast_sha256": runtime_semantic_sha256,
+        },
+    }
+
+
+def _assert_mixed_length_model(model: DwarfForCausalLM) -> dict[str, Any]:
+    architecture = model_metadata(model)
+    if architecture["parameters"] != EXPECTED_PARAMETERS:
+        raise RuntimeError("canonical DWARF parameter count changed")
+    if architecture["trainable_parameters"] != EXPECTED_TRAINABLE_PARAMETERS:
+        raise RuntimeError("canonical DWARF trainable parameter count changed")
+    if _state_fingerprint(model) != EXPECTED_STATE_FINGERPRINT:
+        raise RuntimeError("canonical DWARF initial state fingerprint changed")
+    return architecture
+
+
+def _assert_mixed_fused_reference_ce_gradients(
+    loss_fn: nn.Module, model: DwarfForCausalLM, device: torch.device
+) -> dict[str, float]:
+    """Exercise the production compacted Liger CE against reference CUDA gradients."""
+    torch.manual_seed(20_260_907)
+    active = 7
+    hidden_a = torch.randn(
+        active,
+        model.config.embedding_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    weight_a = model.lm_head.weight.detach().clone().requires_grad_(True)
+    labels = torch.tensor([1, 7, 31, 63, 127, 255, 511], device=device, dtype=torch.long)
+    with amp_context():
+        fused = loss_fn(weight_a, hidden_a, labels)
+    fused.backward()
+    fused_hidden_grad = hidden_a.grad.detach().float().clone()
+    fused_weight_grad = weight_a.grad.detach().float().clone()
+    hidden_b = hidden_a.detach().clone().requires_grad_(True)
+    weight_b = model.lm_head.weight.detach().clone().requires_grad_(True)
+    reference = F.cross_entropy(
+        F.linear(hidden_b.float(), weight_b.float()), labels, reduction="mean"
+    )
+    reference.backward()
+    hidden_delta = float((fused_hidden_grad - hidden_b.grad.detach().float()).abs().max())
+    weight_delta = float((fused_weight_grad - weight_b.grad.detach().float()).abs().max())
+    if not torch.allclose(
+        fused.detach().float(), reference.detach().float(), atol=2e-3, rtol=2e-3
+    ):
+        raise RuntimeError("fused and reference mixed-length CE values diverge")
+    if not torch.allclose(
+        fused_hidden_grad, hidden_b.grad.detach().float(), atol=3e-3, rtol=3e-3
+    ):
+        raise RuntimeError(
+            f"fused and reference mixed-length CE hidden gradients diverge: max={hidden_delta}"
+        )
+    if not torch.allclose(
+        fused_weight_grad, weight_b.grad.detach().float(), atol=3e-3, rtol=3e-3
+    ):
+        raise RuntimeError(
+            f"fused and reference mixed-length CE weight gradients diverge: max={weight_delta}"
+        )
+    return {
+        "fused_loss": float(fused.detach().float()),
+        "reference_loss": float(reference.detach().float()),
+        "max_hidden_gradient_delta": hidden_delta,
+        "max_weight_gradient_delta": weight_delta,
+    }
+
+
+def _assert_mixed_empty_auxiliary_is_zero(
+    callable_module: nn.Module,
+    *,
+    model: DwarfForCausalLM,
+    device: torch.device,
+    config: DwarfConfig,
+) -> None:
+    """Synthetic final fill slots have neither language nor HISA auxiliary loss."""
+    state = _capture_rng_state(device)
+    try:
+        input_ids = torch.full(
+            (1, config.model_length), config.pad_token_id, device=device, dtype=torch.long
+        )
+        valid_lengths = torch.zeros(1, device=device, dtype=torch.int32)
+        route_aux_tile_ids = route_aux_tile_ids_for_update(1, device, config)
+        exploration_step = torch.tensor(1, device=device, dtype=torch.int64)
+        with torch.no_grad(), amp_context():
+            _, auxiliary = callable_module(
+                input_ids, valid_lengths, route_aux_tile_ids, exploration_step
+            )
+        if not bool(torch.isfinite(auxiliary)) or float(auxiliary) != 0.0:
+            raise RuntimeError(
+                "empty valid-length HISA auxiliary must be finite 0, "
+                f"got {float(auxiliary)}"
+            )
+    finally:
+        _restore_rng_state(state, device)
+
+
+def _mixed_length_run_config(
+    *, physical_batch_size: int, grad_accum_steps: int
+) -> dict[str, Any]:
+    return {
+        "format": "dwarf-canonical-mixed-length-runtime-v1",
+        "model_positions": MIXED_MODEL_LENGTH,
+        "physical_batch_size": physical_batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "fused_ce": "liger-active-target-compaction-v1",
+        "target_normalization": "per-update-active-target-mean-v1",
+        "synthetic_final_slots": "valid_length_zero_ignore_index_v1",
+        "compiled": True,
+        "schedule": "canonical_wsd_one_way_stable_lr",
+    }
+
+
+def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
+    """Train immutable padded shards without entering the fixed-row data path."""
+    if args.mixed_length_checkpoint_every < 0 or args.log_every < 1:
+        raise ValueError("invalid mixed-length checkpoint/log interval")
+    requested_device = torch.device(args.device)
+    if requested_device.type != "cuda":
+        raise ValueError("mixed-length DWARF training requires a CUDA device")
+    validate_canonical_kernel_sources(allow_mismatch=args.allow_source_mismatch)
+    validate_mixed_length_runtime_source()
+    config = DwarfConfig()
+    loss_class, environment = validate_training_runtime(requested_device, config)
+    device = _resolved_cuda_device(requested_device)
+    physical_batch_size = (
+        RECIPE.batch_size
+        if args.mixed_length_physical_batch_size is None
+        else int(args.mixed_length_physical_batch_size)
+    )
+    grad_accum_steps = (
+        RECIPE.grad_accum_steps
+        if args.mixed_length_grad_accum_steps is None
+        else int(args.mixed_length_grad_accum_steps)
+    )
+    production_geometry = (physical_batch_size, grad_accum_steps) == (
+        RECIPE.batch_size,
+        RECIPE.grad_accum_steps,
+    )
+    if not production_geometry and not args.allow_mixed_length_smoke_geometry:
+        raise ValueError(
+            "non-production mixed-length geometry requires --allow-mixed-length-smoke-geometry"
+        )
+    if not production_geometry and args.mixed_length_max_steps is None:
+        raise ValueError(
+            "non-production mixed-length geometry requires --mixed-length-max-steps"
+        )
+    random.seed(args.mixed_length_seed)
+    torch.manual_seed(args.mixed_length_seed)
+    torch.cuda.manual_seed_all(args.mixed_length_seed)
+    dataset = load_mixed_length_dataset(
+        args.mixed_length_manifest,
+        vocab_size=config.vocab_size,
+        pad_token_id=config.pad_token_id,
+        eod_token_id=config.eod_token_id,
+    )
+    tokenizer_path = Path(str(dataset.manifest["tokenizer"]))
+    if not tokenizer_path.is_absolute():
+        tokenizer_path = (dataset.manifest_path.parent / tokenizer_path).resolve()
+    manifest_tokenizer_hash = str(dataset.manifest["tokenizer_sha256"])
+    if not tokenizer_path.is_file() or mixed_file_sha256(tokenizer_path) != manifest_tokenizer_hash:
+        raise ValueError("manifest tokenizer path/SHA-256 does not match")
+    tokenizer = tokenizer_identity(tokenizer_path, config.vocab_size)
+    if tokenizer["sha256"] != manifest_tokenizer_hash:
+        raise ValueError("manifest tokenizer SHA-256 is not the active DWARF tokenizer")
+    plan = TargetBudgetPlan.build(
+        dataset,
+        target_budget=args.total_target_budget,
+        physical_batch_size=physical_batch_size,
+        grad_accum_steps=grad_accum_steps,
+    )
+    stop_step = (
+        len(plan.updates)
+        if args.mixed_length_max_steps is None
+        else min(int(args.mixed_length_max_steps), len(plan.updates))
+    )
+    if stop_step < 1:
+        raise ValueError("--mixed-length-max-steps must be positive")
+    configure_compiled_backward_autocast()
+    model = DwarfForCausalLM(config).to(device)
+    model.prepare_runtime(device)
+    architecture = _assert_mixed_length_model(model)
+    optimizer = build_optimizer(model)
+    dataset_identity = dataset.identity()
+    dataset_identity["tokenizer"] = tokenizer
+    run_config = _mixed_length_run_config(
+        physical_batch_size=physical_batch_size, grad_accum_steps=grad_accum_steps
+    )
+    source_identity = mixed_length_source_identity()
+    start_step = 0
+    targets_completed = 0
+    if args.resume:
+        saved = torch.load(args.resume, weights_only=False, map_location="cpu")
+        if not isinstance(saved, dict) or "step" not in saved:
+            raise ValueError("mixed-length checkpoint has no readable step")
+        start_step, targets_completed = restore_mixed_checkpoint(
+            args.resume,
+            model=model,
+            optimizer=optimizer,
+            architecture=architecture,
+            dataset_identity=dataset_identity,
+            plan=plan,
+            run_config=run_config,
+            source_identity=source_identity,
+            environment=environment,
+            expected_lr_factor=wsd_multiplier(int(saved["step"]) - 1),
+        )
+    if start_step >= stop_step:
+        raise ValueError("checkpoint is already at or beyond --mixed-length-max-steps")
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    warm_loss_fn = loss_class(accum_dtype=torch.float32)
+    callables = compiled_mixed_length_callables(model)
+    model.train()
+    fused_parity: dict[str, float] | None = None
+    if not args.mixed_length_skip_fused_ce_parity_check:
+        parity_rng_state = _capture_rng_state(device)
+        try:
+            fused_parity = _assert_mixed_fused_reference_ce_gradients(
+                warm_loss_fn, model, device
+            )
+        finally:
+            _restore_rng_state(parity_rng_state, device)
+    empty_aux_checked = False
+    if not args.mixed_length_skip_empty_aux_check:
+        _assert_mixed_empty_auxiliary_is_zero(
+            callables.no_exploration, model=model, device=device, config=config
+        )
+        empty_aux_checked = True
+    del warm_loss_fn
+    liger_chunk_planner = _install_qualified_liger_chunk_planner(
+        RECIPE.fused_ce_chunk_tokens
+    )
+    loss_fn = loss_class(accum_dtype=torch.float32)
+    events: list[dict[str, Any]] = []
+    run_started = time.perf_counter()
+    for update_index in range(start_step, stop_step):
+        dataset.assert_unchanged(full_hash=False)
+        update = plan.updates[update_index]
+        step = update_index + 1
+        lr_factor = wsd_multiplier(update_index)
+        set_learning_rates(optimizer, lr_factor)
+        optimizer.zero_grad()
+        language_accumulator = torch.zeros((), device=device, dtype=torch.float32)
+        auxiliary_accumulator = torch.zeros((), device=device, dtype=torch.float32)
+        loss_accumulator = torch.zeros((), device=device, dtype=torch.float32)
+        exploration_active = not (
+            config.hisa_exploration_final_probability == 0.0
+            and step >= config.hisa_exploration_anneal_steps
+        )
+        compiled = callables.exploration if exploration_active else callables.no_exploration
+        route_aux_tile_ids = route_aux_tile_ids_for_update(step, device, config)
+        exploration_step = torch.tensor(step, device=device, dtype=torch.int64)
+        started = time.perf_counter()
+        for microbatch_index in range(grad_accum_steps):
+            batch = collate_physical_batch(
+                dataset,
+                update,
+                microbatch_index=microbatch_index,
+                pad_token_id=config.pad_token_id,
+            )
+            input_ids = batch.input_ids.to(device=device, non_blocking=True).contiguous()
+            labels = batch.labels.to(device=device, non_blocking=True).contiguous()
+            valid_lengths = batch.valid_lengths.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+            active_targets = masked_target_count(labels)
+            if active_targets != int(valid_lengths.sum(dtype=torch.int64)):
+                raise RuntimeError("label mask and valid_lengths active-target accounting diverged")
+            with amp_context():
+                hidden, auxiliary = compiled(
+                    input_ids, valid_lengths, route_aux_tile_ids, exploration_step
+                )
+                language = active_cross_entropy(
+                    model.lm_head.weight, hidden, labels, fused_loss=loss_fn
+                )
+                loss = normalized_microbatch_loss(
+                    language,
+                    auxiliary.float(),
+                    active_targets=active_targets,
+                    update_targets=update.active_targets,
+                )
+            if not (
+                bool(torch.isfinite(language))
+                and bool(torch.isfinite(auxiliary))
+                and bool(torch.isfinite(loss))
+            ):
+                raise FloatingPointError("non-finite mixed-length language/auxiliary/total loss")
+            loss.backward()
+            scale = active_targets / update.active_targets if active_targets else 0.0
+            language_accumulator += language.detach().float() * scale
+            auxiliary_accumulator += auxiliary.detach().float() * scale
+            loss_accumulator += loss.detach().float()
+        norms = optimizer.clip(RECIPE)
+        _assert_finite(loss_accumulator, "non-finite mixed-length training loss")
+        for name in ("muon", "adamw"):
+            _assert_finite(norms[name]["norm"], f"non-finite {name} gradient norm")
+        optimizer.step()
+        torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - started
+        targets_completed = plan.targets_before_update(step)
+        event = {
+            "event": "optimizer_update",
+            "step": step,
+            "stop_step": stop_step,
+            "loss": float(loss_accumulator),
+            "language_loss": float(language_accumulator),
+            "hisa_auxiliary_loss": float(auxiliary_accumulator),
+            "active_targets_update": update.active_targets,
+            "cumulative_active_targets": targets_completed,
+            "target_budget": plan.target_budget,
+            "budget_excess_targets": plan.excess_targets,
+            "active_target_positions_per_second": update.active_targets / elapsed,
+            "stored_model_positions": physical_batch_size * grad_accum_steps * config.model_length,
+            "elapsed_seconds": elapsed,
+            "exploration_graph_active": exploration_active,
+            "lr_factor": lr_factor,
+            "grad_norm_muon": float(norms["muon"]["norm"]),
+            "grad_norm_adamw": float(norms["adamw"]["norm"]),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        }
+        events.append(event)
+        print(json.dumps(event, sort_keys=True), flush=True)
+        should_save = step == stop_step or (
+            args.mixed_length_checkpoint_every
+            and step % args.mixed_length_checkpoint_every == 0
+        )
+        if should_save:
+            dataset.assert_unchanged()
+            if mixed_length_source_identity() != source_identity:
+                raise RuntimeError("trainer, mixed runtime, or kernel source changed during training")
+            atomic_mixed_torch_save(
+                mixed_checkpoint_payload(
+                    step=step,
+                    targets_completed=targets_completed,
+                    model=model,
+                    optimizer=optimizer,
+                    architecture=architecture,
+                    dataset_identity=dataset_identity,
+                    plan=plan,
+                    run_config=run_config,
+                    source_identity=source_identity,
+                    environment=environment,
+                ),
+                output_dir / f"mixed_length_step_{step:07d}.pt",
+            )
+    dataset.assert_unchanged()
+    result = {
+        "status": "PASS_BOUNDED" if stop_step < len(plan.updates) else "PASS_COMPLETE_BUDGET",
+        "entrypoint": str(Path(__file__).resolve()),
+        "architecture": architecture,
+        "environment": environment,
+        "dataset": dataset_identity,
+        "target_plan": plan.identity(),
+        "runtime_config": run_config,
+        "source_identity": source_identity,
+        "start_step": start_step,
+        "stop_step": stop_step,
+        "targets_completed": targets_completed,
+        "fused_reference_ce_gradient": fused_parity,
+        "liger_chunk_planner": liger_chunk_planner,
+        "empty_auxiliary_checked": empty_aux_checked,
+        "events": events,
+        "wall_elapsed_seconds": time.perf_counter() - run_started,
+    }
+    atomic_mixed_json_save(result, output_dir / "run_result.json")
+    return result
+
+
+def train(args: argparse.Namespace) -> Any:
+    if args.mixed_length_manifest is not None:
+        return train_mixed_length(args)
+    return train_fixed_length(args)
+
+
+def train_fixed_length(args: argparse.Namespace) -> None:
     requested_device = torch.device(args.device)
     stop_step = RECIPE.steps if args.stop_after is None else int(args.stop_after)
     if not 0 < stop_step <= RECIPE.steps:
@@ -4226,7 +4871,10 @@ def train(args: argparse.Namespace) -> None:
         callables = compiled_training_callables(
             model, diagnostics_enabled=diagnostics_enabled
         )
-        loss_fn = loss_class(accum_dtype=torch.float32)
+        # Keep lazy model compilation/warmup under the installed Liger planner,
+        # matching the qualified compile-order experiment. Install 2048 only
+        # after both model graphs are warm, for actual training work.
+        warm_loss_fn = loss_class(accum_dtype=torch.float32)
         stager = BatchStager(dataset, batch_size=RECIPE.batch_size, device=device)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -4236,10 +4884,15 @@ def train(args: argparse.Namespace) -> None:
         auxiliary_gradient_contract = warm_compiled_training_step(
             model=model,
             callables=callables,
-            loss_fn=loss_fn,
+            loss_fn=warm_loss_fn,
             device=device,
             config=config,
         )
+        del warm_loss_fn
+        liger_chunk_planner = _install_qualified_liger_chunk_planner(
+            RECIPE.fused_ce_chunk_tokens
+        )
+        loss_fn = loss_class(accum_dtype=torch.float32)
 
         print(
             json.dumps(
@@ -4262,6 +4915,7 @@ def train(args: argparse.Namespace) -> None:
                         auxiliary_gradient_contract
                     ),
                     "liger_fused_cross_entropy": True,
+                    "liger_chunk_planner": liger_chunk_planner,
                 },
                 sort_keys=True,
             ),
@@ -4807,6 +5461,35 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--dataset")
+    parser.add_argument(
+        "--mixed-length-manifest",
+        help="builder-produced mixed-length manifest.json; mutually exclusive with --dataset",
+    )
+    parser.add_argument(
+        "--total-target-budget",
+        type=int,
+        help="active shifted-target budget required by --mixed-length-manifest",
+    )
+    parser.add_argument(
+        "--mixed-length-physical-batch-size",
+        type=int,
+        help="bounded smoke override; default is canonical B16",
+    )
+    parser.add_argument(
+        "--mixed-length-grad-accum-steps",
+        type=int,
+        help="bounded smoke override; default is canonical GA8",
+    )
+    parser.add_argument(
+        "--mixed-length-max-steps",
+        type=int,
+        help="optional bounded update cap for the mixed-length route",
+    )
+    parser.add_argument("--mixed-length-checkpoint-every", type=int, default=0)
+    parser.add_argument("--mixed-length-seed", type=int, default=42)
+    parser.add_argument("--allow-mixed-length-smoke-geometry", action="store_true")
+    parser.add_argument("--mixed-length-skip-fused-ce-parity-check", action="store_true")
+    parser.add_argument("--mixed-length-skip-empty-aux-check", action="store_true")
     parser.add_argument("--output-dir")
     parser.add_argument(
         "--tokenizer",
@@ -4864,8 +5547,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     args = parser.parse_args()
-    if not args.self_test and (not args.dataset or not args.output_dir):
-        parser.error("--dataset and --output-dir are required for training")
+    if not args.self_test:
+        if bool(args.dataset) == bool(args.mixed_length_manifest):
+            parser.error("pass exactly one of --dataset or --mixed-length-manifest")
+        if not args.output_dir:
+            parser.error("--output-dir is required for training")
+        if args.mixed_length_manifest and args.total_target_budget is None:
+            parser.error("--mixed-length-manifest requires --total-target-budget")
+        if not args.mixed_length_manifest and args.total_target_budget is not None:
+            parser.error("--total-target-budget requires --mixed-length-manifest")
+        mixed_only_controls = any(
+            (
+                args.mixed_length_physical_batch_size is not None,
+                args.mixed_length_grad_accum_steps is not None,
+                args.mixed_length_max_steps is not None,
+                args.mixed_length_checkpoint_every != 0,
+                args.mixed_length_seed != 42,
+                args.allow_mixed_length_smoke_geometry,
+                args.mixed_length_skip_fused_ce_parity_check,
+                args.mixed_length_skip_empty_aux_check,
+            )
+        )
+        if not args.mixed_length_manifest and mixed_only_controls:
+            parser.error("mixed-length controls require --mixed-length-manifest")
     if args.trust_dataset_sha256 and not args.dataset_sha256:
         parser.error("--trust-dataset-sha256 requires --dataset-sha256")
     if args.resume_prefix_extension and not args.prefix_extension_contract:
@@ -4878,6 +5582,15 @@ def parse_args() -> argparse.Namespace:
         args.resume or args.resume_prefix_extension
     ):
         parser.error("--allow-environment-mismatch requires a resume mode")
+    if args.mixed_length_manifest and (
+        args.allow_source_mismatch or args.allow_environment_mismatch
+    ):
+        parser.error(
+            "mixed-length checkpoints require exact source and runtime identity; "
+            "mismatch overrides are not supported"
+        )
+    if args.mixed_length_manifest and args.resume_prefix_extension:
+        parser.error("mixed-length route does not support fixed-row prefix-extension resumes")
     return args
 
 
