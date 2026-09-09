@@ -8,10 +8,10 @@ import torch
 
 __all__ = (
     "bounded_ema_factor",
-    "causal_ema_scan3",
-    "inverse_bounded_ema_factor",
-    "causal_ema_triton_available",
     "causal_ema_execution_config",
+    "causal_ema_scan3",
+    "causal_ema_triton_available",
+    "inverse_bounded_ema_factor",
 )
 
 try:

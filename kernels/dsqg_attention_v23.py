@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import bisect
 import math
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 try:
     import triton
@@ -789,8 +790,7 @@ def _support_band_ranges(
             active = bisect.bisect_left(offsets, band_end)
             if active > 0:
                 query_bands.append((band_start, band_end, active))
-        if band_end > start:
-            start = band_end
+        start = max(start, band_end)
     if start < seq_len:
         query_bands.append((start, seq_len, len(offsets)))
 

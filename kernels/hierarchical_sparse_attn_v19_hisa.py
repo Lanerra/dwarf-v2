@@ -48,8 +48,8 @@ def _install_repo_module_aliases() -> None:
 _install_repo_module_aliases()
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 try:
     from torch.nn.attention.flex_attention import create_block_mask, flex_attention

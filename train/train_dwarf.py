@@ -34,17 +34,18 @@ import random
 import stat
 import sys
 import tempfile
-import threading
 import textwrap
+import threading
 import time
+from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.utils.checkpoint import checkpoint as _activation_checkpoint
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -112,36 +113,36 @@ for directory in kernel_import_directories:
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-from causal_ema_scan import (  # noqa: E402
+from causal_ema_scan import (
     bounded_ema_factor,
-    causal_ema_scan3,
     causal_ema_execution_config,
+    causal_ema_scan3,
     causal_ema_triton_available,
     inverse_bounded_ema_factor,
 )
-from dsqg_attention_v23 import (  # noqa: E402
+from dsqg_attention_v23 import (
     ALL_OFFSETS,
     DSQGAttentionV23,
     dsqg_triton_available,
 )
 
 if REPO_KERNEL_LAYOUT:
-    from kernels.hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
+    from kernels.hierarchical_sparse_attn_v19_hisa import (
         HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
         HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE,
         HISA_ROUTE_SOURCE_POLICY_POST_PACKET,
-        HierarchicalSparseAttentionV19HISACausal,
         TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
+        HierarchicalSparseAttentionV19HISACausal,
         hisa_integration_contract,
         hisa_runtime_capabilities,
     )
 else:
-    from hierarchical_sparse_attn_v19_hisa import (  # noqa: E402
+    from hierarchical_sparse_attn_v19_hisa import (
         HISA_ROUTE_SOURCE_POLICY_FROZEN_BASE,
         HISA_ROUTE_SOURCE_POLICY_HYBRID_DUAL_SOURCE,
         HISA_ROUTE_SOURCE_POLICY_POST_PACKET,
-        HierarchicalSparseAttentionV19HISACausal,
         TRITON_DOT_MINIMUM_QUERY_BLOCK_SPECIALIZATION,
+        HierarchicalSparseAttentionV19HISACausal,
         hisa_integration_contract,
         hisa_runtime_capabilities,
     )

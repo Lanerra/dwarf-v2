@@ -12,9 +12,10 @@ import json
 import os
 import random
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -182,7 +183,7 @@ class MixedLengthShard:
         vocab_size: int,
         pad_token_id: int,
         eod_token_id: int,
-    ) -> "MixedLengthShard":
+    ) -> MixedLengthShard:
         allowed = {"path", "rows", "loss_tokens", "sha256", "bytes"}
         unknown = set(item) - allowed
         if unknown:
@@ -333,7 +334,7 @@ class MixedLengthDataset:
     @classmethod
     def from_rows_for_test(
         cls, rows: Sequence[torch.Tensor], lengths: Sequence[int]
-    ) -> "MixedLengthDataset":
+    ) -> MixedLengthDataset:
         ids = torch.stack(tuple(rows)).to(dtype=torch.int32)
         valid_lengths = torch.tensor(tuple(lengths), dtype=torch.int32)
         source_ids = torch.zeros(len(rows), dtype=torch.int16)
@@ -518,7 +519,7 @@ class TargetBudgetPlan:
         target_budget: int,
         physical_batch_size: int,
         grad_accum_steps: int,
-    ) -> "TargetBudgetPlan":
+    ) -> TargetBudgetPlan:
         if target_budget < 1:
             raise ValueError("total target budget must be positive")
         if physical_batch_size < 1 or grad_accum_steps < 1:
@@ -707,9 +708,7 @@ def restore_rng(payload: Mapping[str, Any], *, require_cuda: bool = False) -> No
     _validate_rng_payload(payload, require_cuda=require_cuda)
     random.setstate(payload["python"])
     torch.random.set_rng_state(payload["torch_cpu"])
-    if require_cuda:
-        torch.cuda.set_rng_state_all(list(payload["torch_cuda"]))
-    elif "torch_cuda" in payload:
+    if require_cuda or "torch_cuda" in payload:
         torch.cuda.set_rng_state_all(list(payload["torch_cuda"]))
 
 
