@@ -3,7 +3,7 @@
 
 The model is D512/H8/L24/FFN2048 with bounded-routing DSQG V23 blocks and
 strict-causal optimized HISA V19 global mixers at layers 3, 10, and 17. The
-qualified throughput profile executes K=2/M=4 routed pages at all three HISA
+promoted research profile executes K=3/M=6 routed pages at all three HISA
 layers and uses 2048-token Liger fused-linear-CE chunks during training.
 Independent causal-EMA K/V packets live at L3 and L17; L10 is ordinary HISA.
 At L17, the frozen-base route stream owns coarse candidates, exact reranking, and
@@ -149,14 +149,14 @@ else:
 
 CHECKPOINT_KIND = (
     "dwarf-l24-l17-basek-routepolicy-single-document-"
-    "dsqgv23compact-hisav19qv4-k222-loss2048-resume-v1"
+    "dsqgv23compact-hisav19qv4-k333-loss2048-resume-v1"
 )
 CANONICAL_PARENT_CHECKPOINT_KIND = (
     "dwarf-l24-l17-basek-route-appendable-prefix-stable-dsqgv23-hisav19-resume-v1"
 )
 RELEASE_KIND = (
     "dwarf-l24-l17-basek-routepolicy-single-document-"
-    "dsqgv23compact-hisav19qv4-k222-loss2048-weights-v1"
+    "dsqgv23compact-hisav19qv4-k333-loss2048-weights-v1"
 )
 LEGACY_HISA_CHECKPOINT_KINDS = frozenset(
     {
@@ -179,13 +179,13 @@ EXPECTED_SEEDED_RNG_FINGERPRINT = (
     "ba02b103e767eb3ccc7420da1e82900f816843d5ac49aa42e82f87b7d7405f63"
 )
 EXPECTED_SOURCE_AST_SHA256: dict[str, str] = {
-    "train/train_dwarf.py": "ead99fe174e00e8a7b70a8f8184bf3f4797a22a2085263d55b076f90a155f688",
-    "kernels/causal_ema_scan.py": "d531c6f8a1ba23fb8fdcbb7bc36337c8922a245863f0140a880717d257a1d0ed",
-    "kernels/dsqg_attention_v23.py": "df2e8b0476881c40ac0d8127ac1f07c1f35aab3e51fd0501e33b87857bda68fe",
-    "kernels/hierarchical_sparse_attn_v19_hisa.py": "dea70b1566e4986cf5e51a6f141c6fe04fb6f9a5e9bf94ea1a7cdf12384d4499",
+    "train/train_dwarf.py": "5efa5122ff7fe70474d598f0125698e018f21f7d33ca0511036b91c7679197c6",
+    "kernels/causal_ema_scan.py": "3f713335ddcb94b8f80a08d20c4d575920bf1de59980f0ddf71085af1cb075d0",
+    "kernels/dsqg_attention_v23.py": "ca015d4ce03780cb82494e2ce2757dda73c517a26bcca33c0e55cfa3b304edc9",
+    "kernels/hierarchical_sparse_attn_v19_hisa.py": "9dfa0ce63cfad53261c069b49d7f8f7fa0f4860ba28cf32f56c5912ced952db3",
 }
 EXPECTED_MIXED_LENGTH_RUNTIME_AST_SHA256 = (
-    "581c5148d4845732c9e687937afef0236dc69896009f48e510de55027af37924"
+    "b32aaa9edd8c5792a0c1de8c062491e267b6ce4ea6d8549a4fe4ba8f31231b32"
 )
 
 CANONICAL_TOKENIZER_SHA256 = (
@@ -195,22 +195,30 @@ CANONICAL_TOKENIZER_SHA256 = (
 
 @dataclass(frozen=True)
 class TrainRecipe:
-    learning_rate: float = 3.0e-4
+    learning_rate: float = 0.00135
     batch_size: int = 16
     grad_accum_steps: int = 8
-    # One schedule identity spans the complete appendable 20B stable-LR trunk.
+    # t00042 WSD ratios on the legacy fixed-row horizon. Mixed-length runs
+    # resolve these phases from their complete target-budget plan instead.
     steps: int = 76_331
-    warmup_steps: int = 1_527
-    stable_steps: int = 74_804
-    decay_steps: int = 0
-    min_lr_ratio: float = 1.0
-    weight_decay: float = 0.1
-    grad_clip_muon: float = 1.0
+    warmup_steps: int = 2_385
+    stable_steps: int = 54_863
+    decay_steps: int = 19_083
+    min_lr_ratio: float = 0.1
+    weight_decay: float = 0.2
+    grad_clip_muon: float = 0.25
     grad_clip_adamw: float = 1.0
     # Qualified on complete B16/GA8 training at 350/400/450 W.
     fused_ce_chunk_tokens: int = 2048
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.steps, bool)
+            or not isinstance(self.steps, int)
+            or self.steps < 1
+            or min(self.warmup_steps, self.stable_steps, self.decay_steps) < 0
+        ):
+            raise ValueError("WSD requires a positive update count and nonnegative phases")
         if self.warmup_steps + self.stable_steps + self.decay_steps != self.steps:
             raise ValueError("WSD phases must sum to the total update count")
         if self.fused_ce_chunk_tokens != 2048:
@@ -222,9 +230,31 @@ class TrainRecipe:
     def effective_batch(self) -> int:
         return self.batch_size * self.grad_accum_steps
 
+    @classmethod
+    def for_steps(cls, steps: int) -> TrainRecipe:
+        """Size the promoted schedule to the full run, never a temporary stop cap."""
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError("schedule horizon must be a positive integer")
+        warmup = max(1, round(steps * 0.03125))
+        decay = min(steps - warmup, max(1, round(steps * 0.25)))
+        return cls(
+            steps=steps,
+            warmup_steps=warmup,
+            stable_steps=steps - warmup - decay,
+            decay_steps=decay,
+        )
+
+    @property
+    def pre_decay_step(self) -> int | None:
+        """Completed updates at the last full-LR state, before any decay update."""
+        return self.warmup_steps + self.stable_steps if self.decay_steps else None
+
     @property
     def checkpoint_steps(self) -> set[int]:
-        return {1_909, 3_817, 5_725, 7_633, 19_083, 38_166, 76_331}
+        steps = {1_909, 3_817, 5_725, 7_633, 19_083, 38_166, self.steps}
+        if self.pre_decay_step is not None:
+            steps.add(self.pre_decay_step)
+        return {step for step in steps if 0 < step <= self.steps}
 
 
 @dataclass(frozen=True)
@@ -244,9 +274,9 @@ class DwarfConfig:
     dsqg_backend: str = "triton"
     dsqg_support_band_execution: bool = True
     hisa_chunk_size: int = 32
-    # Qualified K-budget result: execute K=2 pages; the existing 2x candidate
-    # multiplier therefore exact-reranks M=4 candidates at L3/L10/L17.
-    top_k_chunks: int = 2
+    # AutoDWARF t00042: execute K=3 pages and exact-rerank M=6 candidates
+    # through the unchanged 2x candidate multiplier at L3/L10/L17.
+    top_k_chunks: int = 3
     # Preserve the route-teacher sampling threshold used by the qualified K222
     # benchmark. K was runtime-patched there after the original K4 config loaded.
     hisa_route_aux_competitive_slots: int = 4
@@ -2776,14 +2806,14 @@ def build_optimizer(
     groups = make_parameter_groups(model, recipe)
     muon = torch.optim.Muon(
         groups["muon"],
-        momentum=0.95,
+        momentum=0.9,
         nesterov=True,
         ns_steps=5,
         adjust_lr_fn="match_rms_adamw",
     )
     adamw = torch.optim.AdamW(
         groups["adamw"],
-        betas=(0.9, 0.95),
+        betas=(0.95, 0.97625),
         eps=1e-8,
         fused=next(model.parameters()).is_cuda,
     )
@@ -3587,6 +3617,12 @@ class AsyncCheckpointWriter:
         finally:
             self.executor.shutdown(wait=True)
 
+    def flush(self) -> None:
+        """Require the current atomic checkpoint to finish before proceeding."""
+        with self.lock:
+            if self.future is not None:
+                self.future.result()
+
 
 def _resolved_cuda_device(device: torch.device | str) -> torch.device:
     value = torch.device(device)
@@ -3606,7 +3642,9 @@ def checkpoint_payload(
     dataset: dict[str, Any],
     device: torch.device,
     environment: dict[str, Any],
+    recipe: TrainRecipe | None = None,
 ) -> dict[str, Any]:
+    recipe = RECIPE if recipe is None else recipe
     resolved = _resolved_cuda_device(device)
     return {
         "kind": CHECKPOINT_KIND,
@@ -3614,7 +3652,7 @@ def checkpoint_payload(
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "architecture": architecture,
-        "recipe": asdict(RECIPE),
+        "recipe": asdict(recipe),
         "dataset": dataset,
         "environment": copy.deepcopy(environment),
         "python_rng": random.getstate(),
@@ -3792,7 +3830,9 @@ def restore_checkpoint(
     environment: dict[str, Any] | None = None,
     allow_source_mismatch: bool = False,
     allow_environment_mismatch: bool = False,
+    recipe: TrainRecipe | None = None,
 ) -> int:
+    recipe = RECIPE if recipe is None else recipe
     checkpoint = torch.load(Path(path), map_location="cpu", weights_only=True)
     if not isinstance(checkpoint, dict):
         raise ValueError("not a canonical DWARF resumable checkpoint")
@@ -3814,19 +3854,19 @@ def restore_checkpoint(
         runtime_environment(device) if environment is None else environment,
         allow_mismatch=allow_environment_mismatch,
     )
-    if checkpoint.get("recipe") != asdict(RECIPE):
+    if checkpoint.get("recipe") != asdict(recipe):
         raise ValueError("checkpoint recipe does not match")
     step = checkpoint.get("step")
     if (
         isinstance(step, bool)
         or not isinstance(step, int)
-        or not 0 < step <= RECIPE.steps
+        or not 0 < step <= recipe.steps
     ):
         raise ValueError("checkpoint step is invalid")
     validate_dataset_identity(
         checkpoint.get("dataset"),
         dataset,
-        consumed_rows=step * RECIPE.effective_batch,
+        consumed_rows=step * recipe.effective_batch,
     )
     saved_model = checkpoint.get("model")
     expected_model = model.state_dict()
@@ -3851,7 +3891,7 @@ def restore_checkpoint(
     model.load_state_dict(saved_model, strict=True)
     optimizer.load_state_dict(
         checkpoint["optimizer"],
-        expected_lr_factor=wsd_multiplier(step - 1),
+        expected_lr_factor=wsd_multiplier(step - 1, recipe),
         require_complete_state=True,
     )
     random.setstate(checkpoint["python_rng"])
@@ -3874,7 +3914,9 @@ def restore_prefix_extension_checkpoint(
     environment: dict[str, Any] | None = None,
     allow_source_mismatch: bool = False,
     allow_environment_mismatch: bool = False,
+    recipe: TrainRecipe | None = None,
 ) -> tuple[int, dict[str, Any]]:
+    recipe = RECIPE if recipe is None else recipe
     checkpoint_path = Path(path)
     contract_path = Path(transition_contract_path)
     checkpoint_sha256 = _sha256(checkpoint_path)
@@ -3895,7 +3937,7 @@ def restore_prefix_extension_checkpoint(
         runtime_environment(device) if environment is None else environment,
         allow_mismatch=allow_environment_mismatch,
     )
-    if checkpoint.get("recipe") != asdict(RECIPE):
+    if checkpoint.get("recipe") != asdict(recipe):
         raise ValueError("checkpoint recipe does not match")
     step = checkpoint.get("step")
     if isinstance(step, bool) or not isinstance(step, int) or not 0 < step < stop_step:
@@ -3909,7 +3951,7 @@ def restore_prefix_extension_checkpoint(
         current_dataset=dataset,
         current_tensor=dataset_tensor,
         stop_step=stop_step,
-        effective_batch=RECIPE.effective_batch,
+        effective_batch=recipe.effective_batch,
     )
 
     saved_model = checkpoint.get("model")
@@ -3936,7 +3978,7 @@ def restore_prefix_extension_checkpoint(
     model.load_state_dict(saved_model, strict=True)
     optimizer.load_state_dict(
         checkpoint["optimizer"],
-        expected_lr_factor=wsd_multiplier(step - 1, RECIPE),
+        expected_lr_factor=wsd_multiplier(step - 1, recipe),
         require_complete_state=True,
     )
     random.setstate(checkpoint["python_rng"])
@@ -4610,8 +4652,9 @@ def _assert_mixed_empty_auxiliary_is_zero(
 
 
 def _mixed_length_run_config(
-    *, physical_batch_size: int, grad_accum_steps: int
+    *, physical_batch_size: int, grad_accum_steps: int, recipe: TrainRecipe | None = None
 ) -> dict[str, Any]:
+    recipe = RECIPE if recipe is None else recipe
     return {
         "format": "dwarf-canonical-mixed-length-runtime-v1",
         "model_positions": MIXED_MODEL_LENGTH,
@@ -4621,7 +4664,9 @@ def _mixed_length_run_config(
         "target_normalization": "per-update-active-target-mean-v1",
         "synthetic_final_slots": "valid_length_zero_ignore_index_v1",
         "compiled": True,
-        "schedule": "canonical_wsd_one_way_stable_lr",
+        "schedule": "canonical_budget_sized_wsd_v1",
+        "recipe": asdict(recipe),
+        "pre_decay_step": recipe.pre_decay_step,
     }
 
 
@@ -4686,6 +4731,7 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
         physical_batch_size=physical_batch_size,
         grad_accum_steps=grad_accum_steps,
     )
+    recipe = TrainRecipe.for_steps(len(plan.updates))
     stop_step = (
         len(plan.updates)
         if args.mixed_length_max_steps is None
@@ -4697,11 +4743,13 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
     model = DwarfForCausalLM(config).to(device)
     model.prepare_runtime(device)
     architecture = _assert_mixed_length_model(model)
-    optimizer = build_optimizer(model)
+    optimizer = build_optimizer(model, recipe)
     dataset_identity = dataset.identity()
     dataset_identity["tokenizer"] = tokenizer
     run_config = _mixed_length_run_config(
-        physical_batch_size=physical_batch_size, grad_accum_steps=grad_accum_steps
+        physical_batch_size=physical_batch_size,
+        grad_accum_steps=grad_accum_steps,
+        recipe=recipe,
     )
     source_identity = mixed_length_source_identity()
     start_step = 0
@@ -4720,7 +4768,7 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
             run_config=run_config,
             source_identity=source_identity,
             environment=environment,
-            expected_lr_factor=wsd_multiplier(int(saved["step"]) - 1),
+            expected_lr_factor=wsd_multiplier(int(saved["step"]) - 1, recipe),
         )
     if start_step >= stop_step:
         raise ValueError("checkpoint is already at or beyond --mixed-length-max-steps")
@@ -4755,7 +4803,7 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
         dataset.assert_unchanged(full_hash=False)
         update = plan.updates[update_index]
         step = update_index + 1
-        lr_factor = wsd_multiplier(update_index)
+        lr_factor = wsd_multiplier(update_index, recipe)
         set_learning_rates(optimizer, lr_factor)
         optimizer.zero_grad()
         language_accumulator = torch.zeros((), device=device, dtype=torch.float32)
@@ -4816,7 +4864,7 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
             language_accumulator += language.detach().float() * scale
             auxiliary_accumulator += auxiliary.detach().float() * scale
             loss_accumulator += loss.detach().float()
-        norms = optimizer.clip(RECIPE)
+        norms = optimizer.clip(recipe)
         _assert_finite(loss_accumulator, "non-finite mixed-length training loss")
         for name in ("muon", "adamw"):
             _assert_finite(norms[name]["norm"], f"non-finite {name} gradient norm")
@@ -4849,7 +4897,7 @@ def train_mixed_length(args: argparse.Namespace) -> dict[str, Any]:
         }
         events.append(event)
         print(json.dumps(event, sort_keys=True), flush=True)
-        should_save = step == stop_step or (
+        should_save = step == stop_step or step == recipe.pre_decay_step or (
             args.mixed_length_checkpoint_every
             and step % args.mixed_length_checkpoint_every == 0
         )
@@ -4907,9 +4955,11 @@ def train(args: argparse.Namespace) -> Any:
 
 def train_fixed_length(args: argparse.Namespace) -> None:
     requested_device = torch.device(args.device)
-    stop_step = RECIPE.steps if args.stop_after is None else int(args.stop_after)
-    if not 0 < stop_step <= RECIPE.steps:
-        raise ValueError(f"--stop-after must be between 1 and {RECIPE.steps}")
+    schedule_steps = getattr(args, "schedule_steps", None)
+    recipe = RECIPE if schedule_steps is None else TrainRecipe.for_steps(schedule_steps)
+    stop_step = recipe.steps if args.stop_after is None else int(args.stop_after)
+    if not 0 < stop_step <= recipe.steps:
+        raise ValueError(f"--stop-after must be between 1 and {recipe.steps}")
     if args.save_every < 0 or args.log_every < 1:
         raise ValueError("invalid save/log interval")
 
@@ -4934,7 +4984,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
     try:
         dataset = source.load(seq_len=config.seq_len)
         order, selection = build_training_row_order(
-            dataset_rows=len(dataset), stop_step=stop_step
+            dataset_rows=len(dataset), stop_step=stop_step, recipe=recipe
         )
         preflight = preflight_training_rows(
             dataset,
@@ -4958,7 +5008,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
         if _state_fingerprint(model) != EXPECTED_STATE_FINGERPRINT:
             raise RuntimeError("canonical DWARF initial state fingerprint changed")
 
-        optimizer = build_optimizer(model)
+        optimizer = build_optimizer(model, recipe)
         start_step = 0
         transition_receipt: dict[str, Any] | None = None
         if args.resume:
@@ -4972,6 +5022,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                 environment=environment,
                 allow_source_mismatch=args.allow_source_mismatch,
                 allow_environment_mismatch=args.allow_environment_mismatch,
+                recipe=recipe,
             )
         elif args.resume_prefix_extension:
             start_step, transition_receipt = restore_prefix_extension_checkpoint(
@@ -4987,6 +5038,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                 environment=environment,
                 allow_source_mismatch=args.allow_source_mismatch,
                 allow_environment_mismatch=args.allow_environment_mismatch,
+                recipe=recipe,
             )
         if start_step >= stop_step:
             raise ValueError("checkpoint is already at or beyond --stop-after")
@@ -5021,7 +5073,8 @@ def train_fixed_length(args: argparse.Namespace) -> None:
             json.dumps(
                 {
                     "architecture": architecture,
-                    "recipe": asdict(RECIPE),
+                    "recipe": asdict(recipe),
+                    "pre_decay_step": recipe.pre_decay_step,
                     "dataset": identity,
                     "dataset_preflight": preflight,
                     "environment": environment,
@@ -5054,7 +5107,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
 
         for step_index in range(start_step, stop_step):
             step = step_index + 1
-            factor = wsd_multiplier(step_index)
+            factor = wsd_multiplier(step_index, recipe)
             set_learning_rates(optimizer, factor)
             optimizer.zero_grad()
             begin = step_index * RECIPE.effective_batch
@@ -5194,7 +5247,7 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                 event.update(diagnostics)
                 print(json.dumps(event, sort_keys=True), flush=True)
 
-            should_save = step in RECIPE.checkpoint_steps or step == stop_step
+            should_save = step in recipe.checkpoint_steps or step == stop_step
             should_save |= args.save_every > 0 and step % args.save_every == 0
             if should_save:
                 source.assert_unchanged()
@@ -5211,10 +5264,15 @@ def train_fixed_length(args: argparse.Namespace) -> None:
                         dataset=identity,
                         device=device,
                         environment=environment,
+                        recipe=recipe,
                     ),
                     output_dir / f"dwarf_step_{step:07d}.pt",
                     producer_streams={device: torch.cuda.current_stream(device)},
                 )
+                if step == recipe.pre_decay_step:
+                    # No decayed update may run until the full-state branch
+                    # point is durable; propagate storage failures immediately.
+                    writer.flush()
 
             if logged:
                 torch.cuda.reset_peak_memory_stats(device)
@@ -5318,11 +5376,13 @@ def self_test() -> None:
     _require(
         RECIPE.steps == 76_331
         and RECIPE.effective_batch == 128
-        and RECIPE.warmup_steps == 1_527
-        and RECIPE.stable_steps == 74_804
-        and RECIPE.decay_steps == 0
+        and RECIPE.warmup_steps == 2_385
+        and RECIPE.stable_steps == 54_863
+        and RECIPE.decay_steps == 19_083
+        and RECIPE.min_lr_ratio == 0.1
+        and RECIPE.pre_decay_step in RECIPE.checkpoint_steps
         and {1_909, 3_817, 5_725, 7_633}.issubset(RECIPE.checkpoint_steps),
-        "canonical 20B stable-LR trunk schedule contract changed",
+        "canonical promoted WSD schedule contract changed",
     )
     _require(global_mixers[1].packet is None, "L10 HISA gained an EMA packet")
     _require(
@@ -5662,10 +5722,23 @@ def parse_args() -> argparse.Namespace:
         help="write a weights-only release artifact after the requested final step",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--schedule-steps",
+        type=int,
+        help=(
+            "full fixed-row run horizon for 3.125%% warmup / 25%% cooldown; "
+            "independent of --stop-after; mixed-length uses its target-budget plan"
+        ),
+    )
     parser.add_argument("--stop-after", type=int)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     args = parser.parse_args()
+    if args.schedule_steps is not None:
+        if args.schedule_steps < 1:
+            parser.error("--schedule-steps must be positive")
+        if args.mixed_length_manifest:
+            parser.error("mixed-length schedule is derived from --total-target-budget")
     if not args.self_test:
         if bool(args.dataset) == bool(args.mixed_length_manifest):
             parser.error("pass exactly one of --dataset or --mixed-length-manifest")
