@@ -18,7 +18,7 @@ DWARF interleaves two kinds of blocks:
 - **HISA** combines a causal local window with a small set of routed chunks from earlier in the sequence.
 - **Causal EMA packets** give selected HISA layers a compressed view of prior state. In the final mixer, base keys decide where to look while packet-adjusted keys and values determine how the selected content is read.
 
-All routing and mixing paths are autoregressive. The reference profile is D512/H8/L24 with 21 DSQG blocks, 3 HISA mixers, a 2,048-wide FFN, a 2,047-token training context, a 32,768-token vocabulary, and about 100 million parameters.
+All routing and mixing paths are autoregressive. The reference profile is D512/H8/L24 with 21 DSQG blocks, 3 HISA mixers executing K=3 routed pages from M=6 exact-reranked candidates, a 1,344-wide SwiGLU FFN (legacy `ffn_dim=2048`), a 2,047-token training context, a 32,768-token vocabulary, and about 100 million parameters.
 
 ## Quick start
 
@@ -60,7 +60,13 @@ python train/train_dwarf.py \
   --stop-after 1
 ```
 
-The default recipe uses Muon and AdamW, an effective batch of 128 rows, and a 20-billion-target horizon. Smaller runs can use `--stop-after`; `--save-every N` adds checkpoint intervals.
+The canonical recipe adopts the AutoDWARF `09102026/t00042` optimization bundle while retaining **B16/GA8 (128 rows/update)**, not the research run's B4/GA1. It uses peak LR **0.00135**, weight decay **0.2** on decay-enabled groups, Muon momentum **0.9** and clipping **0.25**, and AdamW betas **(0.95, 0.97625)** with clipping **1.0**. Compiled BF16 training and 2,048-token fused-CE chunks remain enabled. The canonical seed remains 42; the winning research replicate used 137. The short-budget result is not a long-run quality qualification of this batch geometry.
+
+The WSD schedule uses **3.125% warmup, 25% terminal cosine cooldown, and a 10% LR floor**, rounded to whole optimizer updates. For fixed rows, the default horizon remains 76,331 updates (approximately 20 billion targets); use `--schedule-steps N` to size a different full run. `--stop-after` is only a temporary stopping cap and does **not** resize that schedule. `--save-every N` adds checkpoint intervals.
+
+The mixed-length route uses `--mixed-length-manifest` and `--total-target-budget` instead of `--dataset`. It resolves the schedule from the complete manifest-backed target-budget plan, independently of `--mixed-length-max-steps`. The resolved recipe is recorded in checkpoints and checked on resume; changing the horizon is not a strict resume.
+
+Both routes always save a **full-state pre-decay checkpoint** after the last full-LR update, before the first decayed update, regardless of periodic save settings. Decay cannot proceed if that atomic save fails. Its step is reported as `pre_decay_step`; the file is `dwarf_step_<step:07d>.pt` or `mixed_length_step_<step:07d>.pt`. The endpoint is saved separately, preserving the model, optimizer, RNG, and data cursor at the branch point for a future explicitly configured continuation.
 
 Checkpoints contain the model, optimizer, RNG state, source hashes, tokenizer identity, and dataset identity. Resume with the same dataset and output directory:
 
